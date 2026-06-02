@@ -14,10 +14,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact: redial-linux-x86_64
+            artifact: boil-linux-x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            artifact: redial-linux-aarch64
+            artifact: boil-linux-aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/redial ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/boil ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

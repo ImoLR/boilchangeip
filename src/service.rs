@@ -23,7 +23,7 @@ Description=Boil IP Bot
 After=network.target
 
 [Service]
-ExecStart={exe_str}
+ExecStart={exe_str} bot
 WorkingDirectory={CONFIG_DIR}
 Restart=always
 RestartSec=5

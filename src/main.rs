@@ -8,6 +8,7 @@ mod streaming;
 mod timer;
 
 use clap::{Parser, Subcommand};
+use dialoguer::Select;
 
 #[derive(Parser)]
 #[command(name = "boil", about = "Boil.network 换 IP 工具", version)]
@@ -61,12 +62,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("启动 Telegram 机器人...");
                 bot::run(config).await?;
             } else {
-                println!("提示: 未配置 Telegram，可直接使用以下命令：");
-                println!("  boil status        查看当前 IP");
-                println!("  boil check         检查 IP 质量");
-                println!("  boil change        换 IP");
-                println!("  boil timer         查看/设置定时换 IP");
-                println!("  boil setup         重新配置（含 TG）");
+                interactive_menu(&config).await?;
             }
         }
         Some(Commands::Status) => {
@@ -96,6 +92,39 @@ async fn main() -> anyhow::Result<()> {
             ServiceAction::Install => service::install()?,
             ServiceAction::Uninstall => service::uninstall()?,
         },
+    }
+
+    Ok(())
+}
+
+async fn interactive_menu(config: &config::Config) -> anyhow::Result<()> {
+    let items = vec![
+        "📡  status   查看当前 IP",
+        "🔍  check    检查 IP 质量和流媒体解锁",
+        "🔄  change   换 IP",
+        "⏰  timer    查看/设置定时换 IP",
+        "⚙️   setup    重新配置",
+        "❌  退出",
+    ];
+
+    loop {
+        let idx = Select::new()
+            .with_prompt("Boil — 选择操作")
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        match idx {
+            0 => cli::cmd_status(config).await?,
+            1 => cli::cmd_check(config).await?,
+            2 => cli::cmd_change(config).await?,
+            3 => cli::cmd_timer(config, "")?,
+            4 => {
+                config::run_setup_wizard().await?;
+                break;
+            }
+            _ => break,
+        }
     }
 
     Ok(())

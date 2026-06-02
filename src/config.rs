@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Input, Password, Select};
 use std::{io::BufRead as _, path::PathBuf};
 
 #[derive(Clone, Debug)]
@@ -107,10 +107,11 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
     println!();
 
     // TG 可选
-    let want_tg = Confirm::new()
-        .with_prompt("配置 Telegram Bot（用于远程控制，可选）")
-        .default(true)
-        .interact()?;
+    let want_tg = Select::new()
+        .with_prompt("配置 Telegram Bot（用于远程控制）")
+        .items(&["是，现在配置", "否，跳过（之后可用 redial setup 补充）"])
+        .default(0)
+        .interact()? == 0;
 
     let (tg_token, tg_chat_id) = if want_tg {
         let token: String = Input::new()

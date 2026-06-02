@@ -140,8 +140,9 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
         content.push_str(&format!("TG_TOKEN='{}'\nTG_CHAT_ID='{}'\n", token, chat_id));
     }
 
-    std::fs::write("config.env", content)?;
-    println!("✅ 配置已保存到 config.env\n");
+    let save_path = PathBuf::from("config.env");
+    std::fs::write(&save_path, content)?;
+    println!("✅ 配置已保存到 {}\n", save_path.display());
     println!("常用命令:");
     println!("  boil status    查看当前 IP");
     println!("  boil check     检查 IP 质量和流媒体解锁");

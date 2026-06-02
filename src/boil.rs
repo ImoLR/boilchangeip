@@ -143,10 +143,17 @@ impl BoilClient {
             .with_context(|| format!("query_all 响应解析失败: {}", &body[..body.len().min(200)]))
     }
 
-    /// session 失效后强制重新登录（删除缓存 cookie 后重试）
-    pub async fn relogin(&self, account: &str, password: &str) -> anyhow::Result<()> {
-        let _ = std::fs::remove_file(cookie_path());
-        self.do_login(account, password).await
+    /// 自动重登录版 query_all：session 失效时删除旧 cookie 重新登录后重试一次
+    pub async fn query_all_authed(&self, account: &str, password: &str) -> anyhow::Result<QueryAllResponse> {
+        match self.query_all().await {
+            Ok(d) => Ok(d),
+            Err(_) => {
+                // session 过期或无效，强制重新登录
+                let _ = std::fs::remove_file(cookie_path());
+                self.do_login(account, password).await?;
+                self.query_all().await
+            }
+        }
     }
 
     pub async fn reconnect(&self, router_id: &str, interface: &str) -> anyhow::Result<()> {
@@ -158,7 +165,9 @@ impl BoilClient {
             }))
             .send()
             .await
-            .context("reconnect 请求失败")?;
+            .context("reconnect 请求失败")?
+            .error_for_status()
+            .context("reconnect 返回错误状态")?;
         Ok(())
     }
 }

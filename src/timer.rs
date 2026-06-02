@@ -77,7 +77,7 @@ async fn run_auto_change(config: &Config) {
 async fn get_first_changeable(config: &Config) -> anyhow::Result<Option<(String, String)>> {
     let c = BoilClient::new()?;
     c.login(&config.boil_account, &config.boil_password).await?;
-    let data = c.query_all().await?;
+    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
     Ok(data.changeable().first().map(|r| (r.router_id.clone(), r.interface.clone())))
 }
 

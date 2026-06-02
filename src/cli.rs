@@ -4,8 +4,7 @@ use crate::{boil::BoilClient, config::{save_cron, validate_cron, Config}, core::
 
 pub async fn cmd_status(config: &Config) -> anyhow::Result<()> {
     let c = BoilClient::new()?;
-    c.login(&config.boil_account, &config.boil_password).await?;
-    let data = c.query_all().await?;
+    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
 
     println!("📡 服务器状态 | 今日换 IP {}/{} 次\n", data.daily_used, data.daily_limit);
     for item in &data.zone_items {
@@ -18,8 +17,7 @@ pub async fn cmd_status(config: &Config) -> anyhow::Result<()> {
 
 pub async fn cmd_check(config: &Config) -> anyhow::Result<()> {
     let c = BoilClient::new()?;
-    c.login(&config.boil_account, &config.boil_password).await?;
-    let data = c.query_all().await?;
+    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
 
     for item in data.changeable() {
         let ip = match data.get_ip(&item.router_id, &item.interface) {
@@ -49,8 +47,7 @@ pub async fn cmd_check(config: &Config) -> anyhow::Result<()> {
 
 pub async fn cmd_change(config: &Config) -> anyhow::Result<()> {
     let c = BoilClient::new()?;
-    c.login(&config.boil_account, &config.boil_password).await?;
-    let data = c.query_all().await?;
+    let data = c.query_all_authed(&config.boil_account, &config.boil_password).await?;
 
     let changeable = data.changeable();
     if changeable.is_empty() {

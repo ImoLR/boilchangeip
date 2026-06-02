@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod core;
 mod service;
+mod timer;
 
 use clap::{Parser, Subcommand};
 
@@ -18,12 +19,19 @@ struct Cli {
 enum Commands {
     /// 查看当前 IP 和今日剩余额度
     Status,
+    /// 检查当前 IP 质量
+    Check,
     /// 换 IP（重拨）
     Change,
     /// 启动 Telegram 机器人（需配置 TG）
     Bot,
     /// 重新运行配置向导
     Setup,
+    /// 定时换 IP 设置，如: redial timer "0 */6 * * *" 或 redial timer off
+    Timer {
+        /// cron 表达式（5字段）或 "off"，留空查看当前设置
+        expr: Option<String>,
+    },
     /// 系统服务管理
     Service {
         #[command(subcommand)]
@@ -53,14 +61,20 @@ async fn main() -> anyhow::Result<()> {
                 bot::run(config).await?;
             } else {
                 println!("提示: 未配置 Telegram，可直接使用以下命令：");
-                println!("  redial status   查看当前 IP");
-                println!("  redial change   换 IP");
-                println!("  redial setup    重新配置（含 TG）");
+                println!("  redial status        查看当前 IP");
+                println!("  redial check         检查 IP 质量");
+                println!("  redial change        换 IP");
+                println!("  redial timer         查看/设置定时换 IP");
+                println!("  redial setup         重新配置（含 TG）");
             }
         }
         Some(Commands::Status) => {
             let config = config::load_or_setup().await?;
             cli::cmd_status(&config).await?;
+        }
+        Some(Commands::Check) => {
+            let config = config::load_or_setup().await?;
+            cli::cmd_check(&config).await?;
         }
         Some(Commands::Change) => {
             let config = config::load_or_setup().await?;
@@ -72,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Setup) => {
             config::run_setup_wizard().await?;
+        }
+        Some(Commands::Timer { expr }) => {
+            let config = config::load_or_setup().await?;
+            cli::cmd_timer(&config, expr.as_deref().unwrap_or(""))?;
         }
         Some(Commands::Service { action }) => match action {
             ServiceAction::Install => service::install()?,

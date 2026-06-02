@@ -6,7 +6,11 @@ use teloxide::{
     utils::command::BotCommands,
 };
 
-use crate::{boil::BoilClient, config::Config, core::do_reconnect};
+use crate::{
+    boil::BoilClient,
+    config::{save_cron, validate_cron, Config},
+    core::{check_ip_quality, do_reconnect},
+};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "命令列表:")]
@@ -15,8 +19,12 @@ enum Command {
     Start,
     #[command(description = "查看当前 IP 和今日剩余次数")]
     Status,
+    #[command(description = "检查当前 IP 质量")]
+    Check,
     #[command(description = "换 IP（重拨）")]
     Change,
+    #[command(description = "设置定时换 IP，如 /timer 0 */6 * * * 或 /timer off")]
+    Timer(String),
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -26,11 +34,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("未配置 TG_TOKEN，请运行 redial setup"))?;
 
     let bot = Bot::new(token);
-
-    // 注册命令菜单，输入 / 时显示
     bot.set_my_commands(Command::bot_commands()).await?;
 
     let config = Arc::new(config);
+
+    // 若配置了 cron，启动定时调度器
+    if config.change_cron.is_some() {
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::timer::start(cfg).await {
+                log::error!("定时器启动失败: {e}");
+            } else {
+                // 保持调度器存活
+                loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
+            }
+        });
+    }
 
     let handler = dptree::entry()
         .branch(
@@ -70,7 +89,9 @@ async fn handle_command(
             .await?;
         }
         Command::Status => tg_status(&bot, msg.chat.id, &config).await,
+        Command::Check => tg_check(&bot, msg.chat.id, &config).await,
         Command::Change => tg_change(&bot, msg.chat.id, &config).await,
+        Command::Timer(arg) => tg_timer(&bot, msg.chat.id, &config, arg.trim()).await,
     }
     Ok(())
 }
@@ -129,6 +150,92 @@ async fn tg_status(bot: &Bot, chat_id: ChatId, config: &Config) {
         }
         Err(e) => {
             let _ = bot.send_message(chat_id, format!("❌ 查询失败: {e}")).await;
+        }
+    }
+}
+
+async fn tg_check(bot: &Bot, chat_id: ChatId, config: &Config) {
+    let result = async {
+        let c = BoilClient::new()?;
+        c.login(&config.boil_account, &config.boil_password).await?;
+        c.query_all().await
+    }
+    .await;
+
+    let data = match result {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = bot.send_message(chat_id, format!("❌ 查询失败: {e}")).await;
+            return;
+        }
+    };
+
+    let changeable = data.changeable();
+    if changeable.is_empty() {
+        let _ = bot.send_message(chat_id, "⚠️ 没有可检测的服务器").await;
+        return;
+    }
+
+    let _ = bot.send_message(chat_id, "🔍 检测 IP 质量中...").await;
+
+    let mut lines = Vec::new();
+    for r in &changeable {
+        let ip = match data.get_ip(&r.router_id, &r.interface) {
+            Some(ip) => ip.to_string(),
+            None => continue,
+        };
+        let quality = check_ip_quality(&ip).await;
+        let line = match quality {
+            Some(q) => format!(
+                "📍 <b>{}</b>\nIP: <code>{}</code>\n地区: {} | ISP: {}\n类型: {} | CF 风险: {}",
+                r.label, ip, q.country, q.isp, q.ip_type(), q.cf_risk()
+            ),
+            None => format!("📍 <b>{}</b>\nIP: <code>{}</code>\n质量检测失败", r.label, ip),
+        };
+        lines.push(line);
+    }
+
+    let _ = bot
+        .send_message(chat_id, lines.join("\n\n"))
+        .parse_mode(ParseMode::Html)
+        .await;
+}
+
+async fn tg_timer(bot: &Bot, chat_id: ChatId, config: &Config, arg: &str) {
+    // 无参数：显示当前设置
+    if arg.is_empty() {
+        let msg = match &config.change_cron {
+            Some(cron) => format!("⏰ 当前定时换 IP: <code>{cron}</code>\n\n关闭: /timer off\n修改示例:\n  每6小时: /timer 0 */6 * * *\n  每天3点: /timer 0 3 * * *"),
+            None => "⏰ 定时换 IP 未启用\n\n设置示例:\n  每6小时: /timer 0 */6 * * *\n  每天3点: /timer 0 3 * * *".to_string(),
+        };
+        let _ = bot.send_message(chat_id, msg).parse_mode(ParseMode::Html).await;
+        return;
+    }
+
+    // off：关闭定时
+    if arg.eq_ignore_ascii_case("off") {
+        match save_cron(None) {
+            Ok(_) => { let _ = bot.send_message(chat_id, "✅ 定时换 IP 已关闭（重启后生效）").await; }
+            Err(e) => { let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await; }
+        }
+        return;
+    }
+
+    // 验证并保存 cron 表达式
+    match validate_cron(arg) {
+        Ok(_) => match save_cron(Some(arg)) {
+            Ok(_) => {
+                let _ = bot.send_message(
+                    chat_id,
+                    format!("✅ 定时换 IP 已设置: <code>{arg}</code>\n重启 redial 后生效"),
+                )
+                .parse_mode(ParseMode::Html)
+                .await;
+            }
+            Err(e) => { let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await; }
+        },
+        Err(e) => {
+            let _ = bot.send_message(chat_id, format!("❌ {e}\n\n示例:\n  每6小时: 0 */6 * * *\n  每天3点: 0 3 * * *")).await;
         }
     }
 }

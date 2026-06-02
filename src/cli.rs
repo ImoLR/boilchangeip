@@ -1,6 +1,6 @@
 use dialoguer::Select;
 
-use crate::{boil::BoilClient, config::Config, core::do_reconnect};
+use crate::{boil::BoilClient, config::{save_cron, validate_cron, Config}, core::{check_ip_quality, check_reachable, do_reconnect}};
 
 pub async fn cmd_status(config: &Config) -> anyhow::Result<()> {
     let c = BoilClient::new()?;
@@ -12,6 +12,32 @@ pub async fn cmd_status(config: &Config) -> anyhow::Result<()> {
         let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
         let tag = if item.nat_no_change { "🔒 NAT" } else { "✅ 可换" };
         println!("  {}\n  IP: {}  {}\n", item.label, ip, tag);
+    }
+    Ok(())
+}
+
+pub async fn cmd_check(config: &Config) -> anyhow::Result<()> {
+    let c = BoilClient::new()?;
+    c.login(&config.boil_account, &config.boil_password).await?;
+    let data = c.query_all().await?;
+
+    for item in data.changeable() {
+        let ip = match data.get_ip(&item.router_id, &item.interface) {
+            Some(ip) => ip.to_string(),
+            None => continue,
+        };
+        let (reachable, quality) = tokio::join!(check_reachable(&ip), check_ip_quality(&ip));
+        let reach = if reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
+        println!("📍 {}\n   IP: {}  {}", item.label, ip, reach);
+        if let Some(q) = quality {
+            println!(
+                "   地区: {} | ISP: {}\n   类型: {} | CF 风险: {}",
+                q.country, q.isp, q.ip_type(), q.cf_risk()
+            );
+        } else {
+            println!("   质量检测失败");
+        }
+        println!();
     }
     Ok(())
 }
@@ -71,5 +97,27 @@ pub async fn cmd_change(config: &Config) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// arg: cron 表达式 / "off" / "" (查看)
+pub fn cmd_timer(config: &Config, arg: &str) -> anyhow::Result<()> {
+    if arg.is_empty() {
+        match &config.change_cron {
+            Some(cron) => println!("⏰ 当前定时换 IP: {cron}\n\n关闭: redial timer off"),
+            None => println!("⏰ 定时换 IP 未启用\n\n设置示例:\n  每6小时: redial timer \"0 */6 * * *\"\n  每天3点: redial timer \"0 3 * * *\""),
+        }
+        return Ok(());
+    }
+
+    if arg.eq_ignore_ascii_case("off") {
+        save_cron(None)?;
+        println!("✅ 定时换 IP 已关闭");
+        return Ok(());
+    }
+
+    validate_cron(arg)?;
+    save_cron(Some(arg))?;
+    println!("✅ 定时换 IP 已设置: {arg}\n重启 redial 后生效");
     Ok(())
 }

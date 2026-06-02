@@ -8,12 +8,42 @@ pub struct Config {
     pub boil_password: String,
     pub tg_token: Option<String>,
     pub tg_chat_id: Option<String>,
+    /// 定时换 IP 的 cron 表达式（5字段），None 表示不启用
+    pub change_cron: Option<String>,
 }
 
 impl Config {
     pub fn has_tg(&self) -> bool {
         self.tg_token.is_some() && self.tg_chat_id.is_some()
     }
+}
+
+/// 验证 cron 表达式是否合法（5字段：min hour day month weekday）
+pub fn validate_cron(expr: &str) -> anyhow::Result<()> {
+    use tokio_cron_scheduler::Job;
+    // tokio-cron-scheduler 用 6字段（加秒），我们在前面补 0 秒
+    let full = format!("0 {}", expr.trim());
+    Job::new(&full, |_, _| {}).map_err(|e| anyhow::anyhow!("cron 表达式无效: {e}"))?;
+    Ok(())
+}
+
+/// 将 cron 表达式写入 config.env（None 表示清除）
+pub fn save_cron(cron: Option<&str>) -> anyhow::Result<()> {
+    let path = config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let filtered: String = content
+        .lines()
+        .filter(|l| !l.starts_with("CHANGE_CRON="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+
+    let new_content = match cron {
+        Some(expr) => format!("{filtered}CHANGE_CRON='{expr}'\n"),
+        None => filtered,
+    };
+    std::fs::write(&path, new_content)?;
+    Ok(())
 }
 
 fn config_path() -> PathBuf {
@@ -36,6 +66,7 @@ pub fn load() -> anyhow::Result<Config> {
         boil_password: std::env::var("BOIL_PASSWORD").context("缺少 BOIL_PASSWORD 配置")?,
         tg_token: std::env::var("TG_TOKEN").ok(),
         tg_chat_id: std::env::var("TG_CHAT_ID").ok(),
+        change_cron: std::env::var("CHANGE_CRON").ok(),
     })
 }
 

@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use dialoguer::{Input, Password, Select};
-use std::{io::BufRead as _, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -118,13 +118,23 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
             .with_prompt("Bot Token（从 @BotFather 获取）")
             .interact_text()?;
 
-        println!("\n请向你的机器人发送任意消息，然后按回车继续...");
-        std::io::stdin().lock().lines().next();
+        // 循环重试，直到检测到 chat_id
+        let chat_id = loop {
+            let _: String = Input::new()
+                .with_prompt("先向机器人发任意消息，然后按回车检测")
+                .allow_empty(true)
+                .interact_text()?;
 
-        let chat_id = detect_chat_id(&token)
-            .await
-            .context("未检测到 chat_id，请确认已向机器人发送消息")?;
-        println!("✅ 检测到 chat_id: {chat_id}\n");
+            match detect_chat_id(&token).await {
+                Ok(id) => {
+                    println!("✅ 检测到 chat_id: {id}\n");
+                    break id;
+                }
+                Err(_) => {
+                    println!("⚠️  未检测到消息，请先在 Telegram 向机器人发一条消息，然后再按回车");
+                }
+            }
+        };
         (Some(token), Some(chat_id))
     } else {
         println!("已跳过 Telegram 配置，可使用 boil status/change 命令行操作\n");

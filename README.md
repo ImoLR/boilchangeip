@@ -1,12 +1,14 @@
 # redial
 
-通过 Telegram 机器人一键换 IP，专为拨号服务器设计。
+为拨号服务器设计的换 IP 工具，支持命令行直接操作和 Telegram 机器人远程控制。
 
 ## 功能
 
-- `/status` — 查看所有服务器当前 IP 和今日剩余换 IP 次数
-- `/change` — 触发换 IP（重拨），多台服务器时弹出选择菜单
-- 换完自动验证连通性并回复新 IP
+- `status` — 查看所有服务器当前 IP 和今日剩余次数
+- `check` — 检查当前 IP 质量（类型/ISP/CF 风险）
+- `change` — 换 IP（重拨），多台服务器时交互选择
+- `timer` — 设置 cron 定时自动换 IP
+- Telegram Bot 可选，支持远程控制和换 IP 结果推送
 
 ## 安装
 
@@ -23,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/0xUnixIO/redial/main/install.sh | b
 ```
 $ redial
 
-首次运行，开始配置向导...
+未找到配置，启动首次配置向导...
 
 Boil 账号（邮箱）: you@example.com
 Boil 密码: ********
@@ -33,54 +35,62 @@ Boil 密码: ********
   服务器 A | IP: 1.2.3.xxx | 可换 IP ✅
   服务器 B | IP: 5.6.7.xxx | NAT 不可换
 
-Telegram Bot Token: 123456:AAFxxx...
-请向你的机器人发送任意消息，然后按回车继续...
-✅ 检测到 chat_id: 392068270
+配置 Telegram Bot（用于远程控制，可选）[Y/n]: n
+已跳过 Telegram 配置，可使用 redial status/change 命令行操作
 
 ✅ 配置已保存到 config.env
-配置加载成功，启动 Telegram 机器人...
 ```
 
-TG Bot 通过 [@BotFather](https://t.me/BotFather) 创建，发送 `/newbot` 获取 Token。
+Telegram Bot 通过 [@BotFather](https://t.me/BotFather) 创建，发送 `/newbot` 获取 Token。
 
-## 手动配置
-
-也可以直接复制模板填写：
+## 命令
 
 ```bash
-cp config.env.example config.env
-# 编辑 config.env，填入账号密码和 TG 配置
-redial
+redial                  # 有 TG 配置则启动机器人，否则显示帮助
+redial status           # 查看当前 IP 和今日剩余次数
+redial check            # 检查当前 IP 质量
+redial change           # 换 IP
+redial timer            # 查看定时设置
+redial timer "0 */6 * * *"   # 设置定时：每6小时
+redial timer "0 3 * * *"     # 设置定时：每天凌晨3点
+redial timer off        # 关闭定时
+redial bot              # 启动 Telegram 机器人
+redial setup            # 重新运行配置向导
+redial service install  # 安装 systemd 服务（开机自启）
+redial service uninstall # 卸载服务
 ```
 
-## 后台运行（Linux 服务器）
+## Telegram 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/status` | 查看当前 IP 和今日剩余次数 |
+| `/check` | 检查当前 IP 质量 |
+| `/change` | 换 IP，多台时弹出选择 |
+| `/timer` | 查看定时设置 |
+| `/timer 0 */6 * * *` | 设置定时（cron 5字段） |
+| `/timer off` | 关闭定时 |
+
+## 常驻运行
+
+**systemd（推荐）：**
+
+```bash
+redial service install
+```
+
+安装后开机自启，崩溃自动重启。常用命令：
+
+```bash
+systemctl status  redial
+systemctl restart redial
+journalctl -fu    redial
+```
+
+**后台运行：**
 
 ```bash
 nohup redial >> bot.log 2>&1 &
-```
-
-用 systemd 常驻（推荐）：
-
-```ini
-# /etc/systemd/system/redial.service
-[Unit]
-Description=Boil IP Bot
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/redial
-WorkingDirectory=/etc/redial
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo mkdir /etc/redial
-sudo cp config.env /etc/redial/
-sudo systemctl enable --now redial
 ```
 
 ## 从源码编译

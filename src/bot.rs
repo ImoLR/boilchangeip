@@ -223,17 +223,25 @@ async fn do_reconnect(
 
     match result {
         Ok((old_ip, Some(new_ip))) => {
-            let reachable = check_reachable(&new_ip).await;
-            let (icon, reach) = if reachable {
-                ("✅", "TCP 可达")
-            } else {
-                ("⚠️", "TCP 未通(可能有防火墙)")
+            let (reachable, quality) = tokio::join!(
+                check_reachable(&new_ip),
+                check_ip_quality(&new_ip),
+            );
+            let reach = if reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
+
+            let quality_line = match &quality {
+                Some(q) => format!(
+                    "\n\n📊 <b>IP 质量</b>\n地区: {}\nISP: {}\n类型: {}\nCF 风险: {}",
+                    q.country, q.isp, q.ip_type(), q.cf_risk()
+                ),
+                None => String::new(),
             };
+
             let _ = bot
                 .send_message(
                     chat_id,
                     format!(
-                        "{icon} <b>换 IP 完成</b>\n旧 IP: <code>{}</code>\n新 IP: <code>{new_ip}</code> <i>{reach}</i>",
+                        "✅ <b>换 IP 完成</b>\n旧 IP: <code>{}</code>\n新 IP: <code>{new_ip}</code> <i>{reach}</i>{quality_line}",
                         old_ip.as_deref().unwrap_or("未知"),
                     ),
                 )
@@ -258,6 +266,60 @@ async fn do_reconnect(
                 .await;
         }
     }
+}
+
+struct IpQuality {
+    country: String,
+    isp: String,
+    is_proxy: bool,
+    is_hosting: bool,
+}
+
+impl IpQuality {
+    fn cf_risk(&self) -> &'static str {
+        if self.is_proxy || self.is_hosting {
+            "高 ⚠️"
+        } else {
+            "低 ✅"
+        }
+    }
+
+    fn ip_type(&self) -> &'static str {
+        if self.is_proxy {
+            "代理 ❌"
+        } else if self.is_hosting {
+            "机房 ⚠️"
+        } else {
+            "住宅 ✅"
+        }
+    }
+}
+
+async fn check_ip_quality(ip: &str) -> Option<IpQuality> {
+    // ip-api.com 免费接口，HTTP only（HTTPS 需付费）
+    let url = format!(
+        "http://ip-api.com/json/{ip}?fields=status,country,isp,proxy,hosting"
+    );
+    let resp: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    if resp["status"].as_str() != Some("success") {
+        return None;
+    }
+
+    Some(IpQuality {
+        country: resp["country"].as_str().unwrap_or("未知").to_string(),
+        isp: resp["isp"].as_str().unwrap_or("未知").to_string(),
+        is_proxy: resp["proxy"].as_bool().unwrap_or(false),
+        is_hosting: resp["hosting"].as_bool().unwrap_or(false),
+    })
 }
 
 async fn check_reachable(ip: &str) -> bool {

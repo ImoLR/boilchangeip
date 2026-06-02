@@ -47,11 +47,29 @@ pub fn save_cron(cron: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn config_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("config.env")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("config.env"))
+    // 优先级：/etc/boil/ > exe 同目录 > 当前目录
+    let candidates = [
+        PathBuf::from("/etc/boil/config.env"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("config.env")))
+            .unwrap_or_else(|| PathBuf::from("config.env")),
+        PathBuf::from("config.env"),
+    ];
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("/etc/boil/config.env"))
+}
+
+/// setup 向导写入配置的目标路径（优先写到 /etc/boil/，不存在则写当前目录）
+fn setup_save_path() -> PathBuf {
+    let etc = PathBuf::from("/etc/boil");
+    if etc.exists() || std::fs::create_dir_all(&etc).is_ok() {
+        etc.join("config.env")
+    } else {
+        PathBuf::from("config.env")
+    }
 }
 
 pub fn load() -> anyhow::Result<Config> {
@@ -150,8 +168,8 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
         content.push_str(&format!("TG_TOKEN='{}'\nTG_CHAT_ID='{}'\n", token, chat_id));
     }
 
-    let save_path = PathBuf::from("config.env");
-    std::fs::write(&save_path, content)?;
+    let save_path = setup_save_path();
+    std::fs::write(&save_path, &content)?;
     println!("✅ 配置已保存到 {}\n", save_path.display());
     println!("常用命令:");
     println!("  boil status    查看当前 IP");

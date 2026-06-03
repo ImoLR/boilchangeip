@@ -34,7 +34,8 @@ impl TimerManager {
         // tokio-cron-scheduler 用 6字段（秒 分 时 日 月 周），我们在前面补 "0 "
         let full_expr = format!("0 {}", expr.trim());
         let cfg = self.config.clone();
-        let job = Job::new_async(&full_expr, move |_uuid, _lock| {
+        // 按北京时间（Asia/Shanghai）解析 cron，否则默认走 UTC，"3 点" 会变成北京 11 点
+        let job = Job::new_async_tz(&full_expr, chrono_tz::Asia::Shanghai, move |_uuid, _lock| {
             let cfg = cfg.clone();
             Box::pin(async move {
                 run_auto_change(&cfg).await;

@@ -151,11 +151,6 @@ pub fn print_reconnect_result(result: &ReconnectResult) {
     if let Some(next_allowed_at) = result.next_allowed_at {
         println!("  下次允许时间: {next_allowed_at} (Unix)");
     }
-    if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
-        println!(
-            "  提示: 换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 `boil status` 或 Telegram `/status` 查看。"
-        );
-    }
     if let Some(message) = &result.message {
         println!("  信息: {message}");
     }

@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     boil::BoilClient,
     config::{AppConfig, ServerSelection},
-    reconnect::{reconnect_one, ReconnectPolicy, ReconnectStatus},
+    reconnect::{reconnect_one, ReconnectPolicy},
 };
 
 /// 定时换 IP 管理器：每个任务绑定明确 server_id。
@@ -157,12 +157,6 @@ fn format_timer_result(result: &crate::reconnect::ReconnectResult) -> String {
     }
     if let Some(next_allowed_at) = result.next_allowed_at {
         lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
-    }
-    if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
-        lines.push(
-            "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 `boil status` 或 Telegram `/status` 查看。"
-                .to_string(),
-        );
     }
     if let Some(message) = &result.message {
         lines.push(format!("信息: {message}"));

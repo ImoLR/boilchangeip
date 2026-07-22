@@ -17,7 +17,7 @@ use crate::{
     boil::BoilClient,
     config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
     core::check_ip_quality,
-    reconnect::{reconnect_one, ReconnectPolicy, ReconnectResult, ReconnectStatus},
+    reconnect::{reconnect_one, ReconnectPolicy, ReconnectResult},
     timer::TimerManager,
 };
 
@@ -544,12 +544,6 @@ async fn send_reconnect_result(bot: &Bot, chat_id: ChatId, result: &ReconnectRes
     }
     if let Some(next_allowed_at) = result.next_allowed_at {
         lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
-    }
-    if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
-        lines.push(
-            "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 `boil status` 或 Telegram `/status` 查看。"
-                .to_string(),
-        );
     }
     if let Some(message) = &result.message {
         lines.push(format!("信息: {}", html_escape(message)));

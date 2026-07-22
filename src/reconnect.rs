@@ -13,6 +13,10 @@ use crate::{
 static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
+const SUCCESS_MESSAGE: &str = "换 IP 已完成";
+const UNCONFIRMED_MESSAGE: &str =
+    "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 boil status 或 Telegram /status 查看。";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconnectPolicy {
     pub initial_delay: Duration,
@@ -150,7 +154,7 @@ async fn reconnect_one_locked(
     let mut result = base_result(
         server,
         ReconnectStatus::ChangeAcceptedButUnconfirmed,
-        Some(&change.message),
+        Some(UNCONFIRMED_MESSAGE),
     );
     result.old_ip = Some(old_ip);
     result.uses_left = change.uses_left;
@@ -165,6 +169,7 @@ async fn reconnect_one_locked(
                 result.new_ip = Some(response.ip);
                 result.changed = true;
                 result.status = ReconnectStatus::Success;
+                result.message = Some(SUCCESS_MESSAGE.to_string());
                 return result;
             }
             Ok(_) => {}
@@ -182,12 +187,6 @@ async fn reconnect_one_locked(
         }
     }
 
-    if policy.max_poll_attempts == 0 {
-        result.message = Some(redact_for_result(
-            &format!("{}; no verification attempts configured", change.message),
-            server,
-        ));
-    }
     result
 }
 
@@ -494,6 +493,7 @@ mod tests {
         assert!(result.changed);
         assert_eq!(result.poll_attempts, 1);
         assert_eq!(result.uses_left, Some(2));
+        assert_eq!(result.message.as_deref(), Some(SUCCESS_MESSAGE));
         assert_eq!(mock.change_count(), 1);
     }
 
@@ -571,11 +571,7 @@ mod tests {
         assert_eq!(result.poll_attempts, 3);
         assert_eq!(mock.change_count(), 1);
         assert_eq!(mock.request_count(), 5);
-        assert!(!result
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("HTTP 400"));
+        assert_eq!(result.message.as_deref(), Some(UNCONFIRMED_MESSAGE));
     }
 
     #[tokio::test]
@@ -604,6 +600,11 @@ mod tests {
         assert_eq!(result.poll_attempts, 0);
         assert_eq!(mock.change_count(), 1);
         assert_eq!(mock.records().len(), 2);
+        assert!(result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("quota exhausted"));
     }
 
     #[tokio::test]

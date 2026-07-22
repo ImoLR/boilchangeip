@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqwest::{Client, redirect::Policy};
+use reqwest::{redirect::Policy, Client};
 
 pub struct StreamingResult {
     pub service: &'static str,
@@ -53,8 +53,13 @@ pub async fn check_all() -> Vec<StreamingResult> {
 }
 
 async fn check_netflix() -> StreamingResult {
-    let status = check_netflix_inner().await.unwrap_or(StreamingStatus::Failed);
-    StreamingResult { service: "Netflix", status }
+    let status = check_netflix_inner()
+        .await
+        .unwrap_or(StreamingStatus::Failed);
+    StreamingResult {
+        service: "Netflix",
+        status,
+    }
 }
 
 async fn check_netflix_inner() -> Option<StreamingStatus> {
@@ -92,7 +97,11 @@ async fn check_netflix_inner() -> Option<StreamingStatus> {
 
 fn extract_netflix_region(body: &str) -> Option<String> {
     // 从 HTML 中找 "requestCountry":"XX" 或 "country":"XX"
-    for pattern in &[r#""requestCountry":""#, r#""country":""#, r#""geolocation":{"country":""#] {
+    for pattern in &[
+        r#""requestCountry":""#,
+        r#""country":""#,
+        r#""geolocation":{"country":""#,
+    ] {
         if let Some(pos) = body.find(pattern) {
             let start = pos + pattern.len();
             let end = body[start..].find('"')? + start;
@@ -119,8 +128,13 @@ fn extract_region_from_html(body: &str) -> Option<String> {
 }
 
 async fn check_youtube() -> StreamingResult {
-    let status = check_youtube_inner().await.unwrap_or(StreamingStatus::Failed);
-    StreamingResult { service: "YouTube Premium", status }
+    let status = check_youtube_inner()
+        .await
+        .unwrap_or(StreamingStatus::Failed);
+    StreamingResult {
+        service: "YouTube Premium",
+        status,
+    }
 }
 
 async fn check_youtube_inner() -> Option<StreamingStatus> {
@@ -143,8 +157,7 @@ async fn check_youtube_inner() -> Option<StreamingStatus> {
     }
 
     // 提取地区
-    let region = extract_youtube_region(&body)
-        .unwrap_or_else(|| "?".to_string());
+    let region = extract_youtube_region(&body).unwrap_or_else(|| "?".to_string());
 
     Some(StreamingStatus::Unlocked(region))
 }
@@ -163,8 +176,13 @@ fn extract_youtube_region(body: &str) -> Option<String> {
 }
 
 async fn check_disney_plus() -> StreamingResult {
-    let status = check_disney_inner().await.unwrap_or(StreamingStatus::Failed);
-    StreamingResult { service: "Disney+", status }
+    let status = check_disney_inner()
+        .await
+        .unwrap_or(StreamingStatus::Failed);
+    StreamingResult {
+        service: "Disney+",
+        status,
+    }
 }
 
 async fn check_disney_inner() -> Option<StreamingStatus> {
@@ -194,8 +212,13 @@ async fn check_disney_inner() -> Option<StreamingStatus> {
 }
 
 async fn check_spotify() -> StreamingResult {
-    let status = check_spotify_inner().await.unwrap_or(StreamingStatus::Failed);
-    StreamingResult { service: "Spotify", status }
+    let status = check_spotify_inner()
+        .await
+        .unwrap_or(StreamingStatus::Failed);
+    StreamingResult {
+        service: "Spotify",
+        status,
+    }
 }
 
 async fn check_spotify_inner() -> Option<StreamingStatus> {
@@ -209,8 +232,7 @@ async fn check_spotify_inner() -> Option<StreamingStatus> {
 
     if resp.status().is_success() {
         let body = resp.text().await.ok()?;
-        let region = extract_spotify_region(&body)
-            .unwrap_or_else(|| "?".to_string());
+        let region = extract_spotify_region(&body).unwrap_or_else(|| "?".to_string());
         return Some(StreamingStatus::Unlocked(region));
     }
 
@@ -231,8 +253,13 @@ fn extract_spotify_region(body: &str) -> Option<String> {
 }
 
 async fn check_openai() -> StreamingResult {
-    let status = check_openai_inner().await.unwrap_or(StreamingStatus::Failed);
-    StreamingResult { service: "ChatGPT", status }
+    let status = check_openai_inner()
+        .await
+        .unwrap_or(StreamingStatus::Failed);
+    StreamingResult {
+        service: "ChatGPT",
+        status,
+    }
 }
 
 async fn check_openai_inner() -> Option<StreamingStatus> {

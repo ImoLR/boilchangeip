@@ -1,53 +1,241 @@
 use anyhow::Context as _;
-use dialoguer::{Input, Password, Select};
+use dialoguer::{Confirm, Input};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::fmt;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub boil_account: String,
-    pub boil_password: String,
-    pub tg_token: Option<String>,
-    pub tg_chat_id: Option<String>,
-    /// 定时换 IP 的 cron 表达式（5字段），None 表示不启用
-    pub change_cron: Option<String>,
+const BOIL_SERVERS_ENV: &str = "BOIL_SERVERS";
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_value(value: &str) -> Self {
+        Self(value.to_string())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
 }
 
-impl Config {
+impl fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ServerTimerConfig {
+    pub enabled: bool,
+    pub cron: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub id: String,
+    pub name: String,
+    pub token: SecretToken,
+    pub enabled: bool,
+    #[serde(default)]
+    pub timer: Option<ServerTimerConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AppConfig {
+    pub servers: Vec<ServerConfig>,
+    pub tg_token: Option<String>,
+    pub tg_chat_id: Option<String>,
+    pub migration_notice: Option<String>,
+}
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("servers", &self.servers)
+            .field("tg_token", &self.tg_token.as_ref().map(|_| "<redacted>"))
+            .field("tg_chat_id", &self.tg_chat_id)
+            .field("migration_notice", &self.migration_notice)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerSelection<'a> {
+    Unspecified,
+    Id(&'a str),
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedSelection<'a> {
+    One(&'a ServerConfig),
+    All(Vec<&'a ServerConfig>),
+}
+
+impl AppConfig {
+    pub fn from_env_vars<'a, I>(vars: I) -> anyhow::Result<Self>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let vars: Vec<(&str, &str)> = vars.into_iter().collect();
+        let servers_json = vars
+            .iter()
+            .find_map(|(key, value)| (*key == BOIL_SERVERS_ENV).then_some(*value));
+
+        let Some(servers_json) = servers_json else {
+            if has_legacy_boil_config(&vars) {
+                return Ok(Self {
+                    servers: Vec::new(),
+                    tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
+                    tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
+                    migration_notice: Some(legacy_config_migration_notice().to_string()),
+                });
+            }
+            anyhow::bail!("缺少 BOIL_SERVERS 配置");
+        };
+
+        let servers: Vec<ServerConfig> = serde_json::from_str(servers_json)
+            .context("BOIL_SERVERS JSON 解析失败，请检查多 VPS 配置格式")?;
+        validate_servers(&servers)?;
+
+        Ok(Self {
+            servers,
+            tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
+            tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
+            migration_notice: None,
+        })
+    }
+
+    pub fn resolve_servers<'a>(
+        &'a self,
+        selection: ServerSelection<'_>,
+    ) -> anyhow::Result<ResolvedSelection<'a>> {
+        resolve_servers(&self.servers, selection)
+    }
+
     pub fn has_tg(&self) -> bool {
         self.tg_token.is_some() && self.tg_chat_id.is_some()
     }
 }
 
-/// 验证 cron 表达式是否合法（5字段：min hour day month weekday）
-pub fn validate_cron(expr: &str) -> anyhow::Result<()> {
-    use tokio_cron_scheduler::Job;
-    // tokio-cron-scheduler 用 6字段（加秒），我们在前面补 0 秒
-    let full = format!("0 {}", expr.trim());
-    Job::new(&full, |_, _| {}).map_err(|e| anyhow::anyhow!("cron 表达式无效: {e}"))?;
+pub fn load_app_config() -> anyhow::Result<AppConfig> {
+    let path = config_path();
+    if path.exists() {
+        dotenvy::from_path(&path).ok();
+    }
+    dotenvy::dotenv().ok();
+
+    let owned_vars: Vec<(String, String)> = std::env::vars().collect();
+    let borrowed_vars: Vec<(&str, &str)> = owned_vars
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    AppConfig::from_env_vars(borrowed_vars)
+}
+
+pub fn resolve_servers<'a>(
+    servers: &'a [ServerConfig],
+    selection: ServerSelection<'_>,
+) -> anyhow::Result<ResolvedSelection<'a>> {
+    match selection {
+        ServerSelection::Id(id) => {
+            let server = servers
+                .iter()
+                .find(|server| server.id == id)
+                .with_context(|| format!("未找到 server id: {id}"))?;
+            anyhow::ensure!(server.enabled, "server id '{id}' 已禁用");
+            Ok(ResolvedSelection::One(server))
+        }
+        ServerSelection::All => {
+            let enabled = enabled_servers(servers);
+            anyhow::ensure!(!enabled.is_empty(), "没有已启用的 VPS");
+            Ok(ResolvedSelection::All(enabled))
+        }
+        ServerSelection::Unspecified => {
+            let enabled = enabled_servers(servers);
+            match enabled.as_slice() {
+                [] => anyhow::bail!("没有已启用的 VPS"),
+                [server] => Ok(ResolvedSelection::One(server)),
+                [_, _, ..] => {
+                    anyhow::bail!("检测到多台已启用 VPS，必须明确指定 server id 或使用 --all")
+                }
+            }
+        }
+    }
+}
+
+fn enabled_servers(servers: &[ServerConfig]) -> Vec<&ServerConfig> {
+    servers.iter().filter(|server| server.enabled).collect()
+}
+
+fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
+    let mut ids = HashSet::new();
+
+    for server in servers {
+        validate_server_id(&server.id)?;
+        anyhow::ensure!(
+            !server.name.trim().is_empty(),
+            "server id '{}' 的 name 不能为空",
+            server.id
+        );
+        anyhow::ensure!(
+            !server.token.is_empty(),
+            "server id '{}' 的 token 不能为空",
+            server.id
+        );
+        anyhow::ensure!(
+            !server.id.contains(server.token.expose_secret()),
+            "server id '{}' 不得包含 token",
+            server.id
+        );
+        anyhow::ensure!(ids.insert(&server.id), "server id '{}' 重复", server.id);
+    }
+
     Ok(())
 }
 
-/// 将 cron 表达式写入 config.env（None 表示清除）
-pub fn save_cron(cron: Option<&str>) -> anyhow::Result<()> {
-    let path = config_path();
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-
-    let filtered: String = content
-        .lines()
-        .filter(|l| !l.starts_with("CHANGE_CRON="))
-        .map(|l| format!("{l}\n"))
-        .collect();
-
-    let new_content = match cron {
-        Some(expr) => format!("{filtered}CHANGE_CRON='{expr}'\n"),
-        None => filtered,
-    };
-    // 兜底路径可能是尚不存在的 /etc/boil/，先确保父目录存在再写
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&path, new_content)?;
+fn validate_server_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!id.is_empty(), "server id 不能为空");
+    anyhow::ensure!(
+        id.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "server id '{id}' 含非法字符，只允许字母、数字、短横线、下划线"
+    );
     Ok(())
+}
+
+fn has_legacy_boil_config(vars: &[(&str, &str)]) -> bool {
+    [
+        "BOIL_ACCOUNT",
+        "BOIL_PASSWORD",
+        "BOIL_ROUTER_ID",
+        "BOIL_INTERFACE",
+    ]
+    .iter()
+    .any(|legacy_key| find_var(vars, legacy_key).is_some())
+}
+
+fn legacy_config_migration_notice() -> &'static str {
+    "检测到旧版 Boil 配置（BOIL_ACCOUNT/BOIL_PASSWORD/BOIL_ROUTER_ID/BOIL_INTERFACE）。当前版本已迁移到新版 Token API，不再使用旧账号密码、router_id 或 interface 调用旧 API。请从 Boil 面板获取新版 Token，并为每台 VPS 手动配置 BOIL_SERVERS；不会自动使用旧凭据获取 token。"
+}
+
+fn find_var<'a>(vars: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
+    vars.iter()
+        .find_map(|(candidate, value)| (*candidate == key).then_some(*value))
 }
 
 fn config_path() -> PathBuf {
@@ -76,29 +264,34 @@ fn setup_save_path() -> PathBuf {
     }
 }
 
-/// 构建配置文件内容：始终用新账密，保留已有 CHANGE_CRON；
-/// tg 为 Some 时写入新 TG 配置（覆盖旧的），为 None 时保留已有 TG 配置。
-/// 关键：旧 TG 行不会与新行并存，避免 dotenvy「同名 key 取第一个」导致新配置失效。
-fn build_config_content(existing: &str, account: &str, password: &str, tg: Option<(&str, &str)>) -> String {
-    let cron_line: String = existing
-        .lines()
-        .find(|l| l.starts_with("CHANGE_CRON="))
-        .map(|l| format!("{l}\n"))
-        .unwrap_or_default();
+/// 构建新版配置内容：只写 BOIL_SERVERS 和 TG 配置，不写旧账号密码。
+fn build_config_content(
+    existing: &str,
+    server_id: &str,
+    server_name: &str,
+    token: &str,
+    tg: Option<(&str, &str)>,
+) -> anyhow::Result<String> {
+    validate_server_id(server_id)?;
+    anyhow::ensure!(!server_name.trim().is_empty(), "server name 不能为空");
+    anyhow::ensure!(!token.trim().is_empty(), "token 不能为空");
 
-    let mut content = format!(
-        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\n{}",
-        account,
-        password.replace('\'', "'\\''"),
-        cron_line,
-    );
+    let servers = serde_json::json!([
+        {
+            "id": server_id,
+            "name": server_name,
+            "token": token,
+            "enabled": true
+        }
+    ]);
+    let servers_json = serde_json::to_string_pretty(&servers)?;
+
+    let mut content = format!("BOIL_SERVERS='{}'\n", servers_json.replace('\'', "'\\''"));
 
     match tg {
-        // 写入新 TG 配置，旧的丢弃
         Some((token, chat_id)) => {
             content.push_str(&format!("TG_TOKEN='{token}'\nTG_CHAT_ID='{chat_id}'\n"));
         }
-        // 未配置 TG：原样保留已有 TG 行
         None => {
             let tg_lines: String = existing
                 .lines()
@@ -108,169 +301,339 @@ fn build_config_content(existing: &str, account: &str, password: &str, tg: Optio
             content.push_str(&tg_lines);
         }
     }
-    content
-}
-
-pub fn load() -> anyhow::Result<Config> {
-    let path = config_path();
-    if path.exists() {
-        dotenvy::from_path(&path).ok();
-    }
-    dotenvy::dotenv().ok();
-
-    Ok(Config {
-        boil_account: std::env::var("BOIL_ACCOUNT").context("缺少 BOIL_ACCOUNT 配置")?,
-        boil_password: std::env::var("BOIL_PASSWORD").context("缺少 BOIL_PASSWORD 配置")?,
-        tg_token: std::env::var("TG_TOKEN").ok(),
-        tg_chat_id: std::env::var("TG_CHAT_ID").ok(),
-        change_cron: std::env::var("CHANGE_CRON").ok(),
-    })
-}
-
-pub async fn load_or_setup() -> anyhow::Result<Config> {
-    match load() {
-        Ok(cfg) => Ok(cfg),
-        Err(_) => {
-            println!("未找到配置，启动首次配置向导...\n");
-            run_setup_wizard().await?;
-            load()
-        }
-    }
+    Ok(content)
 }
 
 pub async fn run_setup_wizard() -> anyhow::Result<()> {
-    let account: String = Input::new()
-        .with_prompt("Boil 账号（邮箱）")
+    println!("新版 Boil API 使用 Token 配置，一个 Token 对应一台 VPS。");
+    println!("请先从 Boil 面板获取该 VPS 的新版 Token。\n");
+
+    let server_id: String = Input::new()
+        .with_prompt("server id（字母/数字/-/_，不含敏感信息）")
         .interact_text()?;
 
-    let password: String = Password::new()
-        .with_prompt("Boil 密码")
+    let server_name: String = Input::new().with_prompt("显示名称").interact_text()?;
+
+    let token: String = Input::new()
+        .with_prompt("Boil 新版 Token")
+        .interact_text()?;
+
+    validate_server_id(&server_id)?;
+
+    let want_tg = Confirm::new()
+        .with_prompt("配置 Telegram Bot（用于远程控制）")
+        .default(false)
         .interact()?;
 
-    println!("\n测试登录中...");
-    let client = crate::boil::BoilClient::new()?;
-    client
-        .login(&account, &password)
-        .await
-        .context("登录失败，请检查账号密码")?;
-
-    let data = client.query_all_authed(&account, &password).await?;
-    println!("✅ 登录成功，找到以下服务器：\n");
-    for item in &data.zone_items {
-        let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
-        let tag = if item.nat_no_change { "NAT 不可换" } else { "可换 IP ✅" };
-        println!("  {} | IP: {} | {}", item.label, ip, tag);
-    }
-    println!();
-
-    // 登录成功后立即保存 Boil 账密（保留已有的 CHANGE_CRON 与 TG 配置）
-    let save_path = setup_save_path();
-    let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
-    std::fs::write(
-        &save_path,
-        build_config_content(&existing, &account, &password, None),
-    )?;
-    println!("✅ 账号已保存到 {}\n", save_path.display());
-
-    // TG 可选
-    let want_tg = Select::new()
-        .with_prompt("配置 Telegram Bot（用于远程控制）")
-        .items(&["是，现在配置", "否，跳过（之后可用 boil setup 补充）"])
-        .default(0)
-        .interact()? == 0;
-
-    if want_tg {
-        let token: String = Input::new()
+    let tg = if want_tg {
+        let tg_token: String = Input::new()
             .with_prompt("Bot Token（从 @BotFather 获取）")
             .interact_text()?;
-
-        let chat_id = loop {
-            let _: String = Input::new()
-                .with_prompt("先向机器人发任意消息，然后按回车检测")
-                .allow_empty(true)
-                .interact_text()?;
-
-            match detect_chat_id(&token).await {
-                Ok(id) => {
-                    println!("✅ 检测到 chat_id: {id}\n");
-                    break id;
-                }
-                Err(_) => {
-                    println!("⚠️  未检测到消息，请先在 Telegram 向机器人发一条消息，然后再按回车");
-                }
-            }
-        };
-
-        // 用新 TG 配置覆盖写入（替换旧的，避免重复 key 导致新配置不生效）
-        std::fs::write(
-            &save_path,
-            build_config_content(&existing, &account, &password, Some((token.as_str(), chat_id.as_str()))),
-        )?;
-        println!("✅ TG 配置已保存\n");
+        let chat_id: String = Input::new().with_prompt("TG_CHAT_ID").interact_text()?;
+        Some((tg_token, chat_id))
     } else {
-        println!("已跳过 Telegram 配置，可使用 boil status/change 命令行操作\n");
-    }
+        None
+    };
+
+    let save_path = setup_save_path();
+    let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
+    let tg_refs = tg
+        .as_ref()
+        .map(|(token, chat_id)| (token.as_str(), chat_id.as_str()));
+    let content = build_config_content(&existing, &server_id, &server_name, &token, tg_refs)?;
+    std::fs::write(&save_path, content)?;
+    println!("✅ 新版配置已保存到 {}\n", save_path.display());
+
     println!("常用命令:");
-    println!("  boil status    查看当前 IP");
-    println!("  boil check     检查 IP 质量和流媒体解锁");
-    println!("  boil change    换 IP");
+    println!("  boil servers list          查看 VPS");
+    println!("  boil status --server ID    查看当前 IP");
+    println!("  boil check --server ID     检查 IP 质量");
+    println!("  boil change --server ID    换 IP");
     println!();
     Ok(())
-}
-
-async fn detect_chat_id(token: &str) -> anyhow::Result<String> {
-    let url = format!(
-        "https://api.telegram.org/bot{}/getUpdates?offset=-1&limit=1",
-        token
-    );
-    let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
-    resp["result"][0]["message"]["from"]["id"]
-        .as_i64()
-        .map(|id| id.to_string())
-        .context("未检测到消息")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ONE_SERVER: &str = r#"[
+        {
+            "id": "primary",
+            "name": "Primary VPS",
+            "token": "secret-token-primary",
+            "enabled": true
+        }
+    ]"#;
+
+    const TWO_ENABLED_SERVERS: &str = r#"[
+        {
+            "id": "hk-01",
+            "name": "Hong Kong 01",
+            "token": "secret-token-hk",
+            "enabled": true
+        },
+        {
+            "id": "jp_02",
+            "name": "Japan 02",
+            "token": "secret-token-jp",
+            "enabled": true
+        }
+    ]"#;
+
+    const MIXED_SERVERS: &str = r#"[
+        {
+            "id": "hk-01",
+            "name": "Hong Kong 01",
+            "token": "secret-token-hk",
+            "enabled": true
+        },
+        {
+            "id": "disabled",
+            "name": "Disabled VPS",
+            "token": "secret-token-disabled",
+            "enabled": false
+        },
+        {
+            "id": "jp_02",
+            "name": "Japan 02",
+            "token": "secret-token-jp",
+            "enabled": true
+        }
+    ]"#;
+
+    fn app_from_servers_json(servers_json: &str) -> anyhow::Result<AppConfig> {
+        AppConfig::from_env_vars([("BOIL_SERVERS", servers_json)])
+    }
+
+    fn selected_one_id(selection: ResolvedSelection<'_>) -> String {
+        match selection {
+            ResolvedSelection::One(server) => server.id.clone(),
+            ResolvedSelection::All(_) => panic!("expected one selected server"),
+        }
+    }
+
     /// 复现并验证修复：重新配置 TG 时不应产生重复的 TG_ 行，且新值生效。
     #[test]
     fn reconfigure_tg_no_duplicate() {
-        let existing = "BOIL_ACCOUNT='old@x.com'\nBOIL_PASSWORD='oldpw'\nTG_TOKEN='oldtoken'\nTG_CHAT_ID='111'\n";
-        let out = build_config_content(existing, "new@x.com", "newpw", Some(("newtoken", "222")));
+        let existing = "BOIL_SERVERS='[]'\nTG_TOKEN='oldtoken'\nTG_CHAT_ID='111'\n";
+        let out = build_config_content(
+            existing,
+            "primary",
+            "Primary VPS",
+            "new-server-token",
+            Some(("newtoken", "222")),
+        )
+        .unwrap();
 
-        // 修复前：旧 TG 行被保留 + 新 TG 行被追加 → 各出现两次，dotenvy 取旧值
         assert_eq!(out.matches("TG_TOKEN=").count(), 1, "TG_TOKEN 应只出现一次");
-        assert_eq!(out.matches("TG_CHAT_ID=").count(), 1, "TG_CHAT_ID 应只出现一次");
+        assert_eq!(
+            out.matches("TG_CHAT_ID=").count(),
+            1,
+            "TG_CHAT_ID 应只出现一次"
+        );
         assert!(out.contains("TG_TOKEN='newtoken'"));
         assert!(out.contains("TG_CHAT_ID='222'"));
         assert!(!out.contains("oldtoken"), "旧 token 不应残留");
-        assert!(out.contains("BOIL_ACCOUNT='new@x.com'"));
+        assert!(out.contains("BOIL_SERVERS="));
     }
 
     /// 跳过 TG 配置时，应保留已有的 TG 配置。
     #[test]
     fn skip_tg_keeps_existing() {
-        let existing = "BOIL_ACCOUNT='o'\nBOIL_PASSWORD='p'\nTG_TOKEN='keep'\nTG_CHAT_ID='1'\n";
-        let out = build_config_content(existing, "a", "b", None);
+        let existing = "BOIL_SERVERS='[]'\nTG_TOKEN='keep'\nTG_CHAT_ID='1'\n";
+        let out = build_config_content(existing, "primary", "Primary VPS", "token", None).unwrap();
         assert!(out.contains("TG_TOKEN='keep'"));
         assert_eq!(out.matches("TG_TOKEN=").count(), 1);
     }
 
-    /// 重配账密/TG 时，已有的 CHANGE_CRON 定时设置应被保留。
+    /// 新版 timer 已进入 BOIL_SERVERS，全局 CHANGE_CRON 不再写入新配置。
     #[test]
-    fn keeps_cron_when_configuring_tg() {
-        let existing = "BOIL_ACCOUNT='o'\nBOIL_PASSWORD='p'\nCHANGE_CRON='0 */6 * * *'\n";
-        let out = build_config_content(existing, "a", "b", Some(("t", "c")));
-        assert!(out.contains("CHANGE_CRON='0 */6 * * *'"));
-        assert_eq!(out.matches("CHANGE_CRON=").count(), 1);
+    fn does_not_keep_global_cron_when_configuring_new_servers() {
+        let existing = "BOIL_SERVERS='[]'\nCHANGE_CRON='0 */6 * * *'\n";
+        let out = build_config_content(
+            existing,
+            "primary",
+            "Primary VPS",
+            "token",
+            Some(("t", "c")),
+        )
+        .unwrap();
+        assert!(!out.contains("CHANGE_CRON="));
     }
 
-    /// 密码含单引号时应被正确转义。
+    /// token 含单引号时应被正确转义。
     #[test]
-    fn escapes_single_quote_in_password() {
-        let out = build_config_content("", "a@b.com", "pa'ss", None);
-        assert!(out.contains(r"BOIL_PASSWORD='pa'\''ss'"));
+    fn escapes_single_quote_in_token() {
+        let out = build_config_content("", "primary", "Primary VPS", "to'ken", None).unwrap();
+        assert!(out.contains(r"to'\''ken"));
+    }
+
+    #[test]
+    fn one_enabled_server_can_be_selected_implicitly() {
+        let app = app_from_servers_json(ONE_SERVER).unwrap();
+        let selected = app.resolve_servers(ServerSelection::Unspecified).unwrap();
+        assert_eq!(selected_one_id(selected), "primary");
+    }
+
+    #[test]
+    fn multiple_enabled_servers_require_explicit_selection() {
+        let app = app_from_servers_json(TWO_ENABLED_SERVERS).unwrap();
+        let err = app
+            .resolve_servers(ServerSelection::Unspecified)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("多台已启用 VPS"));
+        assert!(msg.contains("--all"));
+        assert!(!msg.contains("secret-token-hk"));
+        assert!(!msg.contains("secret-token-jp"));
+    }
+
+    #[test]
+    fn explicit_server_id_selects_matching_enabled_server() {
+        let app = app_from_servers_json(TWO_ENABLED_SERVERS).unwrap();
+        let selected = app.resolve_servers(ServerSelection::Id("jp_02")).unwrap();
+        assert_eq!(selected_one_id(selected), "jp_02");
+    }
+
+    #[test]
+    fn unknown_server_id_is_rejected() {
+        let app = app_from_servers_json(TWO_ENABLED_SERVERS).unwrap();
+        let err = app
+            .resolve_servers(ServerSelection::Id("missing"))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("未找到 server id: missing"));
+        assert!(!msg.contains("secret-token"));
+    }
+
+    #[test]
+    fn disabled_server_id_is_rejected() {
+        let app = app_from_servers_json(MIXED_SERVERS).unwrap();
+        let err = app
+            .resolve_servers(ServerSelection::Id("disabled"))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("已禁用"));
+        assert!(!msg.contains("secret-token-disabled"));
+    }
+
+    #[test]
+    fn all_selection_returns_only_enabled_servers() {
+        let app = app_from_servers_json(MIXED_SERVERS).unwrap();
+        let selected = app.resolve_servers(ServerSelection::All).unwrap();
+        let ResolvedSelection::All(servers) = selected else {
+            panic!("expected all selected servers");
+        };
+        let ids: Vec<&str> = servers.iter().map(|server| server.id.as_str()).collect();
+        assert_eq!(ids, vec!["hk-01", "jp_02"]);
+    }
+
+    #[test]
+    fn all_selection_preserves_config_order() {
+        let servers = r#"[
+            {
+                "id": "third",
+                "name": "Third",
+                "token": "secret-token-third",
+                "enabled": true
+            },
+            {
+                "id": "first",
+                "name": "First",
+                "token": "secret-token-first",
+                "enabled": true
+            },
+            {
+                "id": "second",
+                "name": "Second",
+                "token": "secret-token-second",
+                "enabled": true
+            }
+        ]"#;
+        let app = app_from_servers_json(servers).unwrap();
+        let selected = app.resolve_servers(ServerSelection::All).unwrap();
+        let ResolvedSelection::All(servers) = selected else {
+            panic!("expected all selected servers");
+        };
+        let ids: Vec<&str> = servers.iter().map(|server| server.id.as_str()).collect();
+        assert_eq!(ids, vec!["third", "first", "second"]);
+    }
+
+    #[test]
+    fn duplicate_server_id_fails_validation() {
+        let servers = r#"[
+            {
+                "id": "dup",
+                "name": "One",
+                "token": "secret-token-one",
+                "enabled": true
+            },
+            {
+                "id": "dup",
+                "name": "Two",
+                "token": "secret-token-two",
+                "enabled": true
+            }
+        ]"#;
+        let err = app_from_servers_json(servers).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server id 'dup' 重复"));
+        assert!(!msg.contains("secret-token-one"));
+        assert!(!msg.contains("secret-token-two"));
+    }
+
+    #[test]
+    fn illegal_server_id_fails_validation() {
+        let servers = r#"[
+            {
+                "id": "bad.id",
+                "name": "Bad",
+                "token": "secret-token-bad",
+                "enabled": true
+            }
+        ]"#;
+        let err = app_from_servers_json(servers).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("含非法字符"));
+        assert!(!msg.contains("secret-token-bad"));
+    }
+
+    #[test]
+    fn debug_and_errors_do_not_include_server_tokens() {
+        let app = app_from_servers_json(TWO_ENABLED_SERVERS).unwrap();
+        let debug = format!("{app:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-token-hk"));
+        assert!(!debug.contains("secret-token-jp"));
+
+        let err = app
+            .resolve_servers(ServerSelection::Unspecified)
+            .unwrap_err();
+        let error = format!("{err:?}");
+        assert!(!error.contains("secret-token-hk"));
+        assert!(!error.contains("secret-token-jp"));
+    }
+
+    #[test]
+    fn legacy_config_gets_migration_prompt_without_using_credentials() {
+        let app = AppConfig::from_env_vars([
+            ("BOIL_ACCOUNT", "legacy@example.com"),
+            ("BOIL_PASSWORD", "legacy-password"),
+            ("BOIL_ROUTER_ID", "182"),
+            ("BOIL_INTERFACE", "adsl3"),
+        ])
+        .unwrap();
+        assert!(app.servers.is_empty());
+
+        let msg = app.migration_notice.unwrap();
+        assert!(msg.contains("旧版 Boil 配置"));
+        assert!(msg.contains("当前版本已迁移到新版 Token API"));
+        assert!(msg.contains("BOIL_SERVERS"));
+        assert!(msg.contains("不会自动使用旧凭据获取 token"));
+        assert!(!msg.contains("legacy@example.com"));
+        assert!(!msg.contains("legacy-password"));
+        assert!(!msg.contains("182"));
+        assert!(!msg.contains("adsl3"));
     }
 }

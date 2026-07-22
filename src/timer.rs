@@ -1,127 +1,254 @@
 use std::sync::Arc;
 
+use teloxide::prelude::*;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
-use crate::{boil::BoilClient, config::Config, core::do_reconnect};
+use crate::{
+    boil::BoilClient,
+    config::{AppConfig, ServerSelection},
+    reconnect::{reconnect_one, ReconnectPolicy, ReconnectStatus},
+};
 
-/// 定时换 IP 管理器：持有运行中的调度器，支持运行时动态增删任务（无需重启进程）。
+/// 定时换 IP 管理器：每个任务绑定明确 server_id。
 pub struct TimerManager {
     sched: JobScheduler,
-    config: Arc<Config>,
-    job_id: Option<Uuid>,
-    /// 当前生效的 cron 表达式（None 表示未启用），供查询展示
-    current: Option<String>,
+    config: Arc<AppConfig>,
+    job_ids: Vec<Uuid>,
 }
 
 impl TimerManager {
-    /// 创建并启动一个空调度器（尚无任务）
-    pub async fn new(config: Arc<Config>) -> anyhow::Result<Self> {
+    pub async fn new(config: Arc<AppConfig>) -> anyhow::Result<Self> {
         let sched = JobScheduler::new().await?;
         sched.start().await?;
-        Ok(Self { sched, config, job_id: None, current: None })
+        let mut manager = Self {
+            sched,
+            config,
+            job_ids: Vec::new(),
+        };
+        manager.reload().await?;
+        Ok(manager)
     }
 
-    /// 当前生效的 cron 表达式
-    pub fn current(&self) -> Option<String> {
-        self.current.clone()
+    pub fn current(&self) -> Vec<(String, String, Option<String>)> {
+        self.config
+            .servers
+            .iter()
+            .filter_map(|server| {
+                if !server.enabled {
+                    return None;
+                }
+                let timer = server.timer.as_ref()?;
+                timer
+                    .enabled
+                    .then(|| (server.id.clone(), server.name.clone(), timer.cron.clone()))
+            })
+            .collect()
     }
 
-    /// 设置/替换定时任务，立即生效（先移除旧任务再添加新任务）
-    pub async fn set(&mut self, expr: &str) -> anyhow::Result<()> {
+    pub async fn reload(&mut self) -> anyhow::Result<()> {
         self.clear().await?;
 
-        // tokio-cron-scheduler 用 6字段（秒 分 时 日 月 周），我们在前面补 "0 "
-        let full_expr = format!("0 {}", expr.trim());
-        let cfg = self.config.clone();
-        // 按北京时间（Asia/Shanghai）解析 cron，否则默认走 UTC，"3 点" 会变成北京 11 点
-        let job = Job::new_async_tz(&full_expr, chrono_tz::Asia::Shanghai, move |_uuid, _lock| {
-            let cfg = cfg.clone();
-            Box::pin(async move {
-                run_auto_change(&cfg).await;
-            })
-        })?;
-
-        self.job_id = Some(self.sched.add(job).await?);
-        self.current = Some(expr.trim().to_string());
-        log::info!("定时换 IP 已生效，cron: {expr}");
-        Ok(())
-    }
-
-    /// 清除当前定时任务，立即生效
-    pub async fn clear(&mut self) -> anyhow::Result<()> {
-        if let Some(id) = self.job_id.take() {
-            self.sched.remove(&id).await?;
-            log::info!("定时换 IP 已清除");
-        }
-        self.current = None;
-        Ok(())
-    }
-}
-
-/// 纯定时守护模式入口（无 TG）：按配置的 cron 启动一个长驻调度器
-pub async fn start(config: Arc<Config>) -> anyhow::Result<TimerManager> {
-    let expr = match &config.change_cron {
-        Some(e) => e.clone(),
-        None => anyhow::bail!("未配置 CHANGE_CRON"),
-    };
-    let mut mgr = TimerManager::new(config).await?;
-    mgr.set(&expr).await?;
-    Ok(mgr)
-}
-
-async fn run_auto_change(config: &Config) {
-    let c = match BoilClient::new() {
-        Ok(c) => c,
-        Err(e) => { log::error!("定时换 IP 失败: {e}"); return; }
-    };
-    let data = match c.query_all_authed(&config.boil_account, &config.boil_password).await {
-        Ok(d) => d,
-        Err(e) => { log::error!("定时换 IP 查询失败: {e}"); return; }
-    };
-    let target = match data.changeable().first().map(|r| (r.router_id.clone(), r.interface.clone())) {
-        Some(t) => t,
-        None => { log::warn!("定时换 IP：没有可换 IP 的服务器"); return; }
-    };
-
-    log::info!("定时换 IP 触发: {}/{}", target.0, target.1);
-
-    match do_reconnect(config, &target.0, &target.1, Some(data)).await {
-        Ok(res) => {
-            let msg = match &res.new_ip {
-                Some(new_ip) => {
-                    let quality_info = res.quality.as_ref().map(|q| {
-                        format!("\n类型: {} | CF 风险: {}", q.ip_type(), q.cf_risk())
-                    }).unwrap_or_default();
-                    format!(
-                        "⏰ 定时换 IP 完成\n旧 IP: {}\n新 IP: {}{}",
-                        res.old_ip.as_deref().unwrap_or("未知"),
-                        new_ip,
-                        quality_info,
-                    )
-                }
-                None => format!(
-                    "⚠️ 定时换 IP：重拨触发但 IP 未变化（旧 IP: {}）",
-                    res.old_ip.as_deref().unwrap_or("未知")
-                ),
+        for server in &self.config.servers {
+            if !server.enabled {
+                continue;
+            }
+            let Some(timer) = &server.timer else {
+                continue;
             };
-            tg_notify(config, &msg).await;
+            if !timer.enabled {
+                continue;
+            }
+            let Some(cron) = timer.cron.as_deref() else {
+                log::warn!("定时换 IP 跳过 {}: cron 未设置", server.id);
+                continue;
+            };
+
+            let full_expr = format!("0 {}", cron.trim());
+            let server_id = server.id.clone();
+            let config = Arc::clone(&self.config);
+            let job = Job::new_async_tz(
+                &full_expr,
+                chrono_tz::Asia::Shanghai,
+                move |_uuid, _lock| {
+                    let config = Arc::clone(&config);
+                    let server_id = server_id.clone();
+                    Box::pin(async move {
+                        run_auto_change(&config, &server_id).await;
+                    })
+                },
+            )?;
+
+            self.job_ids.push(self.sched.add(job).await?);
+            log::info!("定时换 IP 已生效，server_id: {}, cron: {}", server.id, cron);
+        }
+
+        Ok(())
+    }
+
+    pub async fn clear(&mut self) -> anyhow::Result<()> {
+        for id in self.job_ids.drain(..) {
+            self.sched.remove(&id).await?;
+        }
+        Ok(())
+    }
+}
+
+/// 纯定时守护模式入口（无 TG）。
+pub async fn start(config: Arc<AppConfig>) -> anyhow::Result<TimerManager> {
+    let has_timer = config.servers.iter().any(|server| {
+        server.enabled
+            && server
+                .timer
+                .as_ref()
+                .map(|timer| timer.enabled && timer.cron.is_some())
+                .unwrap_or(false)
+    });
+    anyhow::ensure!(has_timer, "未配置任何已启用 VPS 的 timer");
+    TimerManager::new(config).await
+}
+
+async fn run_auto_change(config: &AppConfig, server_id: &str) {
+    let selected = match config.resolve_servers(ServerSelection::Id(server_id)) {
+        Ok(crate::config::ResolvedSelection::One(server)) => server,
+        Ok(crate::config::ResolvedSelection::All(_)) => {
+            log::error!("定时换 IP 配置错误: server_id 解析为批量选择");
+            return;
         }
         Err(e) => {
-            tg_notify(config, &format!("❌ 定时换 IP 失败: {e}")).await;
+            log::warn!("定时换 IP 跳过 server_id={server_id}: {e}");
+            return;
         }
-    }
+    };
+
+    let client = match BoilClient::new() {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("定时换 IP 初始化客户端失败: {e}");
+            return;
+        }
+    };
+
+    let result = reconnect_one(&client, selected, &ReconnectPolicy::default()).await;
+    log::info!(
+        "定时换 IP 完成: server_id={} status={:?} changed={}",
+        result.server_id,
+        result.status,
+        result.changed
+    );
+
+    let message = format_timer_result(&result);
+    tg_notify(config, &message).await;
 }
 
-async fn tg_notify(config: &Config, msg: &str) {
+fn format_timer_result(result: &crate::reconnect::ReconnectResult) -> String {
+    let mut lines = vec![
+        format!("⏰ 定时换 IP: {}", result.server_name),
+        format!("状态: {:?}", result.status),
+    ];
+    if let Some(old_ip) = result.old_ip {
+        lines.push(format!("旧 IP: {old_ip}"));
+    }
+    if let Some(new_ip) = result.new_ip {
+        lines.push(format!("新 IP: {new_ip}"));
+    }
+    if let Some(uses_left) = result.uses_left {
+        lines.push(format!("剩余次数: {uses_left}"));
+    }
+    if let Some(next_allowed_at) = result.next_allowed_at {
+        lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
+    }
+    if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
+        lines.push("换 IP 请求已接受，但最终 IP 尚未确认".to_string());
+    }
+    if let Some(message) = &result.message {
+        lines.push(format!("信息: {message}"));
+    }
+    lines.join("\n")
+}
+
+async fn tg_notify(config: &AppConfig, msg: &str) {
     let (token, chat_id) = match (&config.tg_token, &config.tg_chat_id) {
-        (Some(t), Some(c)) => (t, c),
+        (Some(token), Some(chat_id)) => (token, chat_id),
         _ => return,
     };
-    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-    let _ = reqwest::Client::new()
-        .post(&url)
-        .json(&serde_json::json!({ "chat_id": chat_id, "text": msg }))
-        .send()
-        .await;
+
+    let bot = Bot::new(token);
+    let Ok(chat_id) = chat_id.parse::<i64>() else {
+        log::warn!("TG_CHAT_ID 无效，跳过定时通知");
+        return;
+    };
+    let _ = bot.send_message(ChatId(chat_id), msg).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{SecretToken, ServerConfig, ServerTimerConfig};
+
+    fn app_config() -> AppConfig {
+        AppConfig {
+            servers: vec![
+                ServerConfig {
+                    id: "a".to_string(),
+                    name: "A".to_string(),
+                    token: SecretToken::from_test_value("token-a"),
+                    enabled: true,
+                    timer: Some(ServerTimerConfig {
+                        enabled: true,
+                        cron: Some("0 */6 * * *".to_string()),
+                    }),
+                },
+                ServerConfig {
+                    id: "b".to_string(),
+                    name: "B".to_string(),
+                    token: SecretToken::from_test_value("token-b"),
+                    enabled: false,
+                    timer: Some(ServerTimerConfig {
+                        enabled: true,
+                        cron: Some("0 */6 * * *".to_string()),
+                    }),
+                },
+            ],
+            tg_token: None,
+            tg_chat_id: None,
+            migration_notice: None,
+        }
+    }
+
+    #[test]
+    fn current_lists_only_enabled_timer_entries() {
+        let config = Arc::new(app_config());
+        let sched = futures_test_scheduler_placeholder(config);
+        assert_eq!(sched.len(), 1);
+        assert_eq!(
+            sched.iter().map(|item| item.0.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    fn futures_test_scheduler_placeholder(
+        config: Arc<AppConfig>,
+    ) -> Vec<(String, String, Option<String>)> {
+        config
+            .servers
+            .iter()
+            .filter_map(|server| {
+                let timer = server.timer.as_ref()?;
+                (server.enabled && timer.enabled)
+                    .then(|| (server.id.clone(), server.name.clone(), timer.cron.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_timer_server_does_not_fallback() {
+        let config = app_config();
+        let error = config
+            .resolve_servers(ServerSelection::Id("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("未找到 server id"));
+        assert!(!error.contains("token-a"));
+    }
 }

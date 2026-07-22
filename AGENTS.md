@@ -63,12 +63,13 @@ quota. Any code touching reconnect must be reviewed as quota-sensitive.
 
 Protected paths include:
 
-- `BoilClient::reconnect`
-- `core::do_reconnect`
+- `BoilClient::change_ip`
+- `reconnect::reconnect_one`
+- `reconnect::reconnect_selected`
 - CLI `change`
 - Telegram `/change` and callback handlers
 - Timer-triggered auto change
-- Legacy shell scripts that call `/api/reconnect`
+- Legacy shell scripts that are disabled to avoid quota-sensitive API calls
 
 When changing these areas, use mocks, dry-run behavior, or static analysis only.
 Do not execute them against the real Boil service.

@@ -13,7 +13,7 @@
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0xUnixIO/boil/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/install.sh | bash
 ```
 
 支持平台：Linux x86_64 / aarch64
@@ -55,8 +55,12 @@ boil setup                   # 重新运行配置向导
 ## 从源码编译
 
 ```bash
-git clone https://github.com/0xUnixIO/boil.git
-cd boil
+git clone https://github.com/ImoLR/boilchangeip.git
+cd boilchangeip
 cargo build --release
 ./target/release/boil
 ```
+
+## 来源
+
+本项目 fork 自 [0xUnixIO/boil](https://github.com/0xUnixIO/boil)，感谢原作者的实现与开源贡献。

@@ -1,71 +1,65 @@
 #!/usr/bin/env bash
-# boil 一键安装脚本
+# boilchangeip 源码安装入口。
 # 用法: curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/install.sh | bash
 
-set -euo pipefail
+set -Eeuo pipefail
 
-REPO="ImoLR/boilchangeip"
-BIN_NAME="boil"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+REPO_URL="${BOIL_REPO_URL:-https://github.com/ImoLR/boilchangeip.git}"
+BRANCH="${BOIL_BRANCH:-main}"
+DATA_DIR="${BOIL_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/boilchangeip}"
+SOURCE_DIR="${BOIL_SOURCE_DIR:-$DATA_DIR/source}"
 
-OS="$(uname -s)"
-ARCH="$(uname -m)"
+die() {
+  echo "错误: $*" >&2
+  exit 1
+}
 
-case "$OS" in
-  Linux)
-    case "$ARCH" in
-      x86_64)        ARTIFACT="boil-linux-x86_64" ;;
-      aarch64|arm64) ARTIFACT="boil-linux-aarch64" ;;
-      *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
-    esac
-    ;;
-  *)
-    echo "仅支持 Linux 系统" >&2; exit 1 ;;
-esac
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+}
 
-echo "获取最新版本..."
-TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')"
+check_environment() {
+  [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux 系统"
+  require_command git
+  require_command cargo
+}
 
-[ -z "$TAG" ] && { echo "无法获取最新版本: https://github.com/$REPO/releases" >&2; exit 1; }
+prepare_source() {
+  if [[ -d "$SOURCE_DIR/.git" ]]; then
+    local current_branch
+    local origin_url
 
-echo "版本: $TAG | 平台: $OS/$ARCH"
+    origin_url="$(git -C "$SOURCE_DIR" remote get-url origin)"
+    [[ "$origin_url" == "$REPO_URL" ]] ||
+      die "源码目录 origin 为 $origin_url，预期为 $REPO_URL"
+    current_branch="$(git -C "$SOURCE_DIR" branch --show-current)"
+    [[ "$current_branch" == "$BRANCH" ]] ||
+      die "源码目录当前分支为 $current_branch，预期为 $BRANCH"
 
-URL="https://github.com/$REPO/releases/download/$TAG/$ARTIFACT"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-
-echo "下载中..."
-curl -fsSL "$URL" -o "$TMP" || { echo "下载失败: $URL" >&2; exit 1; }
-chmod +x "$TMP"
-
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$TMP" "$INSTALL_DIR/$BIN_NAME"
-else
-  sudo mv "$TMP" "$INSTALL_DIR/$BIN_NAME"
-fi
-
-echo ""
-echo "✅ 安装完成: $INSTALL_DIR/$BIN_NAME"
-echo ""
-
-# 已有配置则跳过向导，仅首次安装时运行
-if [ ! -f "/etc/boil/config.env" ] && [ ! -f "$INSTALL_DIR/config.env" ]; then
-  "$INSTALL_DIR/$BIN_NAME" setup
-else
-  echo "检测到已有配置，跳过配置向导"
-fi
-
-# 安装 systemd 服务（已安装则重启以加载新版本）
-if command -v systemctl >/dev/null 2>&1; then
-  echo ""
-  if systemctl is-active --quiet boil 2>/dev/null; then
-    systemctl restart boil
-    echo "✅ 服务已重启（新版本生效）"
-  else
-    "$INSTALL_DIR/$BIN_NAME" service install
+    echo "更新源码: $SOURCE_DIR"
+    git -C "$SOURCE_DIR" fetch origin "$BRANCH"
+    git -C "$SOURCE_DIR" merge --ff-only "origin/$BRANCH"
+    return
   fi
-else
-  echo "未检测到 systemd，手动启动："
-  echo "  nohup $BIN_NAME >> bot.log 2>&1 &"
-fi
+
+  [[ ! -e "$SOURCE_DIR" ]] || die "源码目录已存在但不是 Git 仓库: $SOURCE_DIR"
+  mkdir -p "$(dirname "$SOURCE_DIR")"
+  echo "克隆源码: $REPO_URL ($BRANCH)"
+  git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$SOURCE_DIR"
+}
+
+main() {
+  check_environment
+  prepare_source
+
+  # 公共函数来自刚刚更新的仓库，安装和更新使用同一套构建安装流程。
+  # shellcheck source=install-common.sh
+  source "$SOURCE_DIR/install-common.sh"
+  install_from_source "$SOURCE_DIR"
+
+  echo
+  echo "安装完成。"
+  print_install_summary "$SOURCE_DIR"
+}
+
+main "$@"

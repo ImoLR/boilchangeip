@@ -23,9 +23,9 @@ pub struct ReconnectPolicy {
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
-            initial_delay: Duration::from_secs(5),
-            poll_interval: Duration::from_secs(5),
-            max_poll_attempts: 12,
+            initial_delay: Duration::from_secs(2),
+            poll_interval: Duration::from_secs(2),
+            max_poll_attempts: 3,
         }
     }
 }
@@ -37,7 +37,6 @@ pub enum ReconnectStatus {
     PreflightFailed,
     ApiRejected,
     ChangeAcceptedButUnconfirmed,
-    IpUnchanged,
     InvalidResponse,
     NetworkError,
 }
@@ -72,12 +71,7 @@ impl BatchReconnectResult {
     pub fn unconfirmed_count(&self) -> usize {
         self.results
             .iter()
-            .filter(|result| {
-                matches!(
-                    result.status,
-                    ReconnectStatus::ChangeAcceptedButUnconfirmed | ReconnectStatus::IpUnchanged
-                )
-            })
+            .filter(|result| result.status == ReconnectStatus::ChangeAcceptedButUnconfirmed)
             .count()
     }
 
@@ -153,7 +147,11 @@ async fn reconnect_one_locked(
         }
     };
 
-    let mut result = base_result(server, ReconnectStatus::IpUnchanged, Some(&change.message));
+    let mut result = base_result(
+        server,
+        ReconnectStatus::ChangeAcceptedButUnconfirmed,
+        Some(&change.message),
+    );
     result.old_ip = Some(old_ip);
     result.uses_left = change.uses_left;
     result.next_allowed_at = change.next_allowed_at.filter(|timestamp| *timestamp >= 0);
@@ -171,15 +169,11 @@ async fn reconnect_one_locked(
             }
             Ok(_) => {}
             Err(error) => {
-                result.status = ReconnectStatus::ChangeAcceptedButUnconfirmed;
-                result.message = Some(redact_for_result(
-                    &format!(
-                        "{}; post-change verification failed: {error}",
-                        change.message
-                    ),
-                    server,
-                ));
-                return result;
+                log::debug!(
+                    "换 IP 后验证暂时失败: server_id={} attempt={attempt}: {}",
+                    result.server_id,
+                    redact_for_result(&error.to_string(), server)
+                );
             }
         }
 
@@ -189,7 +183,6 @@ async fn reconnect_one_locked(
     }
 
     if policy.max_poll_attempts == 0 {
-        result.status = ReconnectStatus::ChangeAcceptedButUnconfirmed;
         result.message = Some(redact_for_result(
             &format!("{}; no verification attempts configured", change.message),
             server,
@@ -524,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_ip_stops_without_second_change() {
+    async fn unchanged_ip_is_unconfirmed_without_second_change() {
         let mock = MockServer::start(vec![
             ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
             accepted(),
@@ -536,9 +529,53 @@ mod tests {
 
         let result = reconnect_one(&client, &server("unchanged", true), &policy(2)).await;
 
-        assert_eq!(result.status, ReconnectStatus::IpUnchanged);
+        assert_eq!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
         assert_eq!(result.poll_attempts, 2);
         assert_eq!(mock.change_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_http_400_then_new_ip_succeeds_without_second_change() {
+        let mock = MockServer::start(vec![
+            ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
+            accepted(),
+            response(400, r#"{"error":"temporary backend error"}"#),
+            ip(r#"{"ok":true,"ip":"42.1.1.2"}"#),
+        ])
+        .await;
+        let client = BoilClient::with_api_base_url(&mock.base_url).unwrap();
+
+        let result = reconnect_one(&client, &server("http-400", true), &policy(3)).await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert!(result.changed);
+        assert_eq!(result.poll_attempts, 2);
+        assert_eq!(mock.change_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn three_http_400_responses_are_unconfirmed_without_second_change() {
+        let mock = MockServer::start(vec![
+            ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
+            accepted(),
+            response(400, r#"{"error":"temporary backend error"}"#),
+            response(400, r#"{"error":"temporary backend error"}"#),
+            response(400, r#"{"error":"temporary backend error"}"#),
+        ])
+        .await;
+        let client = BoilClient::with_api_base_url(&mock.base_url).unwrap();
+
+        let result = reconnect_one(&client, &server("http-400", true), &policy(3)).await;
+
+        assert_eq!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
+        assert_eq!(result.poll_attempts, 3);
+        assert_eq!(mock.change_count(), 1);
+        assert_eq!(mock.request_count(), 5);
+        assert!(!result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("HTTP 400"));
     }
 
     #[tokio::test]
@@ -582,7 +619,7 @@ mod tests {
         let result = reconnect_one(&client, &server("unconfirmed", true), &policy(3)).await;
 
         assert_eq!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
-        assert_eq!(result.poll_attempts, 1);
+        assert_eq!(result.poll_attempts, 3);
         assert_eq!(mock.change_count(), 1);
     }
 
@@ -599,7 +636,7 @@ mod tests {
         let result = reconnect_one(&client, &server("network", true), &policy(3)).await;
 
         assert_eq!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
-        assert_eq!(result.poll_attempts, 1);
+        assert_eq!(result.poll_attempts, 3);
         assert_eq!(mock.change_count(), 1);
     }
 

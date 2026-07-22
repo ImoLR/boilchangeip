@@ -546,7 +546,10 @@ async fn send_reconnect_result(bot: &Bot, chat_id: ChatId, result: &ReconnectRes
         lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
     }
     if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
-        lines.push("换 IP 请求已接受，但最终 IP 尚未确认".to_string());
+        lines.push(
+            "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 `boil status` 或 Telegram `/status` 查看。"
+                .to_string(),
+        );
     }
     if let Some(message) = &result.message {
         lines.push(format!("信息: {}", html_escape(message)));

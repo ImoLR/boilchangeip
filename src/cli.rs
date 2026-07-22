@@ -152,7 +152,9 @@ pub fn print_reconnect_result(result: &ReconnectResult) {
         println!("  下次允许时间: {next_allowed_at} (Unix)");
     }
     if matches!(result.status, ReconnectStatus::ChangeAcceptedButUnconfirmed) {
-        println!("  提示: 换 IP 请求已接受，但最终 IP 尚未确认");
+        println!(
+            "  提示: 换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 `boil status` 或 Telegram `/status` 查看。"
+        );
     }
     if let Some(message) = &result.message {
         println!("  信息: {message}");
@@ -274,7 +276,6 @@ fn status_text(status: &ReconnectStatus) -> &'static str {
         ReconnectStatus::PreflightFailed => "预检查失败",
         ReconnectStatus::ApiRejected => "API 拒绝",
         ReconnectStatus::ChangeAcceptedButUnconfirmed => "已接受但未确认",
-        ReconnectStatus::IpUnchanged => "IP 未变化",
         ReconnectStatus::InvalidResponse => "响应无效",
         ReconnectStatus::NetworkError => "网络错误",
     }

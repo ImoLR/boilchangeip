@@ -7,7 +7,7 @@ use std::{
 
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, MenuButton, ParseMode},
     utils::command::BotCommands,
 };
 
@@ -25,17 +25,19 @@ const CONFIRM_TTL: Duration = Duration::from_secs(120);
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "命令列表:")]
+#[command(rename_rule = "lowercase", description = "可用命令：")]
 enum Command {
-    #[command(description = "开始使用")]
+    #[command(description = "开始使用 Bot")]
     Start,
-    #[command(description = "查看当前 IP，可用 /status <server_id>")]
+    #[command(description = "查看使用帮助")]
+    Help,
+    #[command(description = "查看 VPS 当前状态")]
     Status(String),
-    #[command(description = "检查当前 IP 质量，可用 /check <server_id>")]
+    #[command(description = "检查 VPS 当前 IP 质量")]
     Check(String),
-    #[command(description = "换 IP，可用 /change <server_id>")]
+    #[command(description = "更换已启用 VPS 的 IP")]
     Change(String),
-    #[command(description = "查看定时换 IP")]
+    #[command(description = "查看定时换 IP 配置")]
     Timer,
 }
 
@@ -121,7 +123,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("未配置 TG_TOKEN，请在 config.env 中配置"))?;
 
     let bot = Bot::new(token);
-    bot.set_my_commands(Command::bot_commands()).await?;
+    sync_bot_menu(&bot).await;
 
     let config = Arc::new(config);
     let timer = Arc::new(Mutex::new(TimerManager::new(config.clone()).await?));
@@ -160,12 +162,10 @@ async fn handle_command(
 
     match cmd {
         Command::Start => {
-            bot.send_message(
-                msg.chat.id,
-                "👋 <b>Redial Bot</b>\n\n/status — 查看当前 IP\n/check — 检查 IP 质量\n/change — 选择并确认换 IP",
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
+            bot.send_message(msg.chat.id, start_text()).await?;
+        }
+        Command::Help => {
+            bot.send_message(msg.chat.id, help_text()).await?;
         }
         Command::Status(arg) => tg_status(&bot, msg.chat.id, &config, arg.trim()).await,
         Command::Check(arg) => tg_check(&bot, msg.chat.id, &config, arg.trim()).await,
@@ -175,6 +175,50 @@ async fn handle_command(
         Command::Timer => tg_timer(&bot, msg.chat.id, &timer).await,
     }
     Ok(())
+}
+
+fn menu_commands() -> Vec<BotCommand> {
+    Command::bot_commands()
+        .into_iter()
+        .map(|command| {
+            BotCommand::new(command.command.trim_start_matches('/'), command.description)
+        })
+        .collect()
+}
+
+fn help_text() -> String {
+    Command::descriptions().to_string()
+}
+
+fn start_text() -> String {
+    format!("欢迎使用 boilchangeip Telegram Bot。\n\n{}", help_text())
+}
+
+async fn sync_bot_menu(bot: &Bot) {
+    sync_menu_step("Telegram 命令列表", || async {
+        bot.set_my_commands(menu_commands()).await.map(|_| ())
+    })
+    .await;
+
+    sync_menu_step("Telegram 私聊菜单按钮", || async {
+        bot.set_chat_menu_button()
+            .menu_button(MenuButton::Commands)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
+
+async fn sync_menu_step<F, Fut, E>(label: &str, operation: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match operation().await {
+        Ok(()) => log::info!("{label}同步成功"),
+        Err(error) => log::warn!("{label}同步失败，Bot 将继续运行: {error}"),
+    }
 }
 
 async fn handle_callback(
@@ -617,6 +661,66 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_contains_every_supported_command_with_valid_names() {
+        let commands = menu_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["start", "help", "status", "check", "change", "timer"]
+        );
+
+        for command in commands {
+            assert!(!command.command.contains('/'));
+            assert!(!command.command.contains(' '));
+            assert!(command
+                .command
+                .chars()
+                .all(|character| character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '_'));
+        }
+    }
+
+    #[test]
+    fn help_text_uses_the_same_commands_and_descriptions_as_menu() {
+        let help = help_text();
+
+        for command in menu_commands() {
+            assert!(help.contains(&format!("/{} — {}", command.command, command.description)));
+        }
+    }
+
+    #[test]
+    fn required_commands_are_routable() {
+        assert!(matches!(Command::parse("/start", ""), Ok(Command::Start)));
+        assert!(matches!(Command::parse("/help", ""), Ok(Command::Help)));
+        assert!(matches!(
+            Command::parse("/status", ""),
+            Ok(Command::Status(argument)) if argument.is_empty()
+        ));
+        assert!(matches!(
+            Command::parse("/change", ""),
+            Ok(Command::Change(argument)) if argument.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_menu_sync_does_not_interrupt_startup_flow() {
+        let flow_result = async {
+            sync_menu_step("测试菜单", || async {
+                Err::<(), _>(std::io::Error::other("mock registration failure"))
+            })
+            .await;
+            "dispatcher can continue"
+        }
+        .await;
+
+        assert_eq!(flow_result, "dispatcher can continue");
+    }
 
     #[test]
     fn confirm_callback_does_not_contain_token() {

@@ -80,9 +80,6 @@ detect_arch() {
     x86_64|amd64)
       echo "amd64"
       ;;
-    aarch64|arm64)
-      echo "arm64"
-      ;;
     *)
       return 1
       ;;

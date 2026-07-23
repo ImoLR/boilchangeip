@@ -25,10 +25,12 @@ systemd 服务。只有当前架构没有官方二进制时，才回退到源码
 curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/install.sh | sudo bash
 ```
 
-安装脚本会优先下载 `boil-linux-amd64` 或 `boil-linux-arm64`，安装到
+安装脚本会在 amd64 机器上优先下载 `boil-linux-amd64`，安装到
 `/usr/local/bin/boil`。普通用户不需要安装 Rust、Cargo、Git，也不需要本地源码目录。
 它不会覆盖现有 `/etc/boil/config.env`。首次安装且没有配置时，会启动配置向导；
 配置完成后自动创建并启动 `boil.service`。
+
+arm64 用户需要使用源码编译路径，请先准备 Rust、Cargo、Git 和本机编译环境。
 
 后续升级请使用 `update.sh`。
 
@@ -318,9 +320,8 @@ v2.1.2 的 `update.sh` 默认使用官方 Release 二进制，不再要求用户
 脚本会检查当前分支、工作区状态、源码版本号、本地和远程 tag，然后构建并发布：
 
 - `boil-linux-amd64`
-- `boil-linux-arm64`
 
-Release 只包含以上两个二进制文件。
+Release 只包含以上二进制文件。arm64 用户如需使用，请自行从源码编译。
 
 ## 旧配置迁移
 

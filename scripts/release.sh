@@ -6,9 +6,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION_TAG="${1:-}"
 AMD64_TARGET="x86_64-unknown-linux-musl"
-ARM64_TARGET="aarch64-unknown-linux-musl"
 AMD64_ASSET="boil-linux-amd64"
-ARM64_ASSET="boil-linux-arm64"
 TMP_DIR=""
 
 die() {
@@ -78,24 +76,6 @@ validate_amd64() {
     die "$AMD64_ASSET 版本不匹配，期望: boil $expected，实际: $actual"
 }
 
-validate_arm64() {
-  local file_output=""
-
-  if command -v file >/dev/null 2>&1; then
-    file_output="$(file "$TMP_DIR/$ARM64_ASSET")"
-    echo "$file_output"
-    [[ "$file_output" == *"ARM aarch64"* || "$file_output" == *"ARM64"* ]] ||
-      die "$ARM64_ASSET 不是 ARM64/aarch64 二进制"
-  fi
-
-  if command -v readelf >/dev/null 2>&1; then
-    readelf -h "$TMP_DIR/$ARM64_ASSET" | grep -Eq 'Machine:[[:space:]]*AArch64' ||
-      die "$ARM64_ASSET ELF Machine 不是 AArch64"
-  elif [[ -z "$file_output" ]]; then
-    die "缺少 file 或 readelf，无法验证 ARM64 二进制架构"
-  fi
-}
-
 main() {
   if [[ "$VERSION_TAG" == "-h" || "$VERSION_TAG" == "--help" ]]; then
     usage
@@ -111,6 +91,7 @@ main() {
   require_command cargo
   require_command rustup
   require_command gh
+  require_command x86_64-linux-musl-gcc
 
   local branch version commit release_url
   branch="$(git branch --show-current)"
@@ -126,13 +107,11 @@ main() {
 
   TMP_DIR="$(mktemp -d -t boil-release.XXXXXX)"
 
-  rustup target add "$AMD64_TARGET" "$ARM64_TARGET"
+  rustup target add "$AMD64_TARGET"
 
   build_asset "$AMD64_TARGET" "$AMD64_ASSET"
-  build_asset "$ARM64_TARGET" "$ARM64_ASSET"
 
   validate_amd64 "$version"
-  validate_arm64
 
   git push origin main
   git tag -a "$VERSION_TAG" -m "Boil $VERSION_TAG"
@@ -140,7 +119,6 @@ main() {
 
   gh release create "$VERSION_TAG" \
     "$TMP_DIR/$AMD64_ASSET" \
-    "$TMP_DIR/$ARM64_ASSET" \
     --title "Boil $VERSION_TAG" \
     --generate-notes
 
@@ -154,7 +132,6 @@ main() {
   echo "Release: $release_url"
   echo "Assets:"
   echo "  - $AMD64_ASSET"
-  echo "  - $ARM64_ASSET"
 }
 
 main "$@"

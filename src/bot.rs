@@ -18,10 +18,11 @@ use crate::{
     config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
     core::check_ip_quality,
     reconnect::{reconnect_one, ReconnectPolicy, ReconnectResult},
-    timer::TimerManager,
+    timer::{parse_hhmm, TimerManager, TimerStatus, TimerTarget, TimerUpdate},
 };
 
 const CONFIRM_TTL: Duration = Duration::from_secs(120);
+const TIMER_INPUT_TTL: Duration = Duration::from_secs(300);
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(BotCommands, Clone)]
@@ -51,6 +52,46 @@ struct PendingConfirmation {
 #[derive(Default)]
 struct ConfirmationStore {
     pending: HashMap<String, PendingConfirmation>,
+}
+
+#[derive(Clone)]
+enum TimerInputMode {
+    New,
+    Edit(TimerTarget),
+}
+
+#[derive(Clone)]
+struct PendingTimerInput {
+    mode: TimerInputMode,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct TimerInputStore {
+    pending: HashMap<ChatId, PendingTimerInput>,
+}
+
+impl TimerInputStore {
+    fn set(&mut self, chat_id: ChatId, mode: TimerInputMode, now: Instant) {
+        self.prune(now);
+        self.pending.insert(
+            chat_id,
+            PendingTimerInput {
+                mode,
+                expires_at: now + TIMER_INPUT_TTL,
+            },
+        );
+    }
+
+    fn take(&mut self, chat_id: ChatId, now: Instant) -> Option<TimerInputMode> {
+        self.prune(now);
+        let pending = self.pending.remove(&chat_id)?;
+        (pending.expires_at > now).then_some(pending.mode)
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.pending.retain(|_, pending| pending.expires_at > now);
+    }
 }
 
 impl ConfirmationStore {
@@ -112,6 +153,16 @@ enum CallbackAction<'a> {
     SelectChange(&'a str),
     ConfirmChange { server_id: &'a str, nonce: &'a str },
     CancelChange { server_id: &'a str, nonce: &'a str },
+    TimerNew,
+    TimerEdit,
+    TimerClose,
+    TimerRefresh,
+    TimerCreateAll { hhmm: &'a str },
+    TimerCreateServer { server_id: &'a str, hhmm: &'a str },
+    TimerEditTargetAll,
+    TimerEditTargetServer(&'a str),
+    TimerCloseAll,
+    TimerCloseServer(&'a str),
     LegacyChange,
     Unknown,
 }
@@ -128,6 +179,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let timer = Arc::new(Mutex::new(TimerManager::new(config.clone()).await?));
     let confirmations = Arc::new(Mutex::new(ConfirmationStore::default()));
+    let timer_inputs = Arc::new(Mutex::new(TimerInputStore::default()));
 
     let handler = dptree::entry()
         .branch(
@@ -135,10 +187,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 .filter_command::<Command>()
                 .endpoint(handle_command),
         )
+        .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config, timer, confirmations])
+        .dependencies(dptree::deps![config, timer, confirmations, timer_inputs])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -156,7 +209,7 @@ async fn handle_command(
     confirmations: Arc<Mutex<ConfirmationStore>>,
 ) -> ResponseResult<()> {
     let chat_id_str = msg.chat.id.to_string();
-    if config.tg_chat_id.as_deref() != Some(&chat_id_str) {
+    if !is_authorized_tg_id(&config, &chat_id_str) {
         return Ok(());
     }
 
@@ -172,8 +225,32 @@ async fn handle_command(
         Command::Change(arg) => {
             tg_change(&bot, msg.chat.id, &config, &confirmations, arg.trim()).await
         }
-        Command::Timer => tg_timer(&bot, msg.chat.id, &timer).await,
+        Command::Timer => show_timer_panel(&bot, msg.chat.id, &timer).await,
     }
+    Ok(())
+}
+
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    config: Arc<AppConfig>,
+    timer: Arc<Mutex<TimerManager>>,
+    timer_inputs: Arc<Mutex<TimerInputStore>>,
+) -> ResponseResult<()> {
+    let chat_id_str = msg.chat.id.to_string();
+    if !is_authorized_tg_id(&config, &chat_id_str) {
+        return Ok(());
+    }
+
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    let text = text.trim();
+    if text.starts_with('/') {
+        return Ok(());
+    }
+
+    handle_timer_time_input(&bot, msg.chat.id, &timer, &timer_inputs, text).await;
     Ok(())
 }
 
@@ -225,10 +302,12 @@ async fn handle_callback(
     bot: Bot,
     q: CallbackQuery,
     config: Arc<AppConfig>,
+    timer: Arc<Mutex<TimerManager>>,
     confirmations: Arc<Mutex<ConfirmationStore>>,
+    timer_inputs: Arc<Mutex<TimerInputStore>>,
 ) -> ResponseResult<()> {
     let uid = q.from.id.to_string();
-    if config.tg_chat_id.as_deref() != Some(&uid) {
+    if !is_authorized_tg_id(&config, &uid) {
         bot.answer_callback_query(&q.id).await?;
         return Ok(());
     }
@@ -262,6 +341,90 @@ async fn handle_callback(
                 .await
                 .consume(server_id, nonce, Instant::now());
             let _ = bot.send_message(chat_id, "已取消换 IP").await;
+        }
+        CallbackAction::TimerNew => {
+            timer_inputs
+                .lock()
+                .await
+                .set(chat_id, TimerInputMode::New, Instant::now());
+            let _ = bot
+                .send_message(chat_id, "请输入每天执行时间（HH:MM），例如 03:30")
+                .await;
+        }
+        CallbackAction::TimerEdit => {
+            show_timer_edit_targets(&bot, chat_id, &timer).await;
+        }
+        CallbackAction::TimerClose => {
+            show_timer_close_targets(&bot, chat_id, &timer).await;
+        }
+        CallbackAction::TimerRefresh => {
+            show_timer_panel(&bot, chat_id, &timer).await;
+        }
+        CallbackAction::TimerCreateAll { hhmm } => {
+            apply_timer_change(
+                &bot,
+                chat_id,
+                &timer,
+                TimerUpdate::Enable {
+                    target: TimerTarget::AllEnabled,
+                    hhmm: hhmm.to_string(),
+                },
+            )
+            .await;
+        }
+        CallbackAction::TimerCreateServer { server_id, hhmm } => {
+            apply_timer_change(
+                &bot,
+                chat_id,
+                &timer,
+                TimerUpdate::Enable {
+                    target: TimerTarget::Server(server_id.to_string()),
+                    hhmm: hhmm.to_string(),
+                },
+            )
+            .await;
+        }
+        CallbackAction::TimerEditTargetAll => {
+            timer_inputs.lock().await.set(
+                chat_id,
+                TimerInputMode::Edit(TimerTarget::AllEnabled),
+                Instant::now(),
+            );
+            let _ = bot
+                .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
+                .await;
+        }
+        CallbackAction::TimerEditTargetServer(server_id) => {
+            timer_inputs.lock().await.set(
+                chat_id,
+                TimerInputMode::Edit(TimerTarget::Server(server_id.to_string())),
+                Instant::now(),
+            );
+            let _ = bot
+                .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
+                .await;
+        }
+        CallbackAction::TimerCloseAll => {
+            apply_timer_change(
+                &bot,
+                chat_id,
+                &timer,
+                TimerUpdate::Disable {
+                    target: TimerTarget::AllEnabled,
+                },
+            )
+            .await;
+        }
+        CallbackAction::TimerCloseServer(server_id) => {
+            apply_timer_change(
+                &bot,
+                chat_id,
+                &timer,
+                TimerUpdate::Disable {
+                    target: TimerTarget::Server(server_id.to_string()),
+                },
+            )
+            .await;
         }
         CallbackAction::LegacyChange => {
             let _ = bot
@@ -500,28 +663,213 @@ async fn confirm_and_change(
     send_reconnect_result(bot, chat_id, &result).await;
 }
 
-async fn tg_timer(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>) {
-    let timers = timer.lock().await.current();
-    if timers.is_empty() {
-        let _ = bot.send_message(chat_id, "⏰ 定时换 IP 未启用").await;
-        return;
-    }
-    let lines = timers
-        .iter()
-        .map(|(id, name, cron)| {
-            format!(
-                "{} (<code>{}</code>) | {}",
-                html_escape(name),
-                html_escape(id),
-                html_escape(cron.as_deref().unwrap_or("cron 未设置"))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+async fn show_timer_panel(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>) {
+    let status = timer.lock().await.status();
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("➕ 新建", "timer_new"),
+            InlineKeyboardButton::callback("✏️ 编辑", "timer_edit"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("⏸ 关闭", "timer_close"),
+            InlineKeyboardButton::callback("🔄 刷新", "timer_refresh"),
+        ],
+    ]);
     let _ = bot
-        .send_message(chat_id, format!("⏰ <b>定时换 IP</b>\n{lines}"))
+        .send_message(chat_id, format_timer_panel(&status))
+        .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)
         .await;
+}
+
+async fn show_timer_edit_targets(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>) {
+    let config = timer.lock().await.config().clone();
+    let keyboard = timer_target_keyboard(&config, "timer_edit_target");
+    let _ = bot
+        .send_message(chat_id, "请选择要编辑定时时间的范围：")
+        .reply_markup(keyboard)
+        .await;
+}
+
+async fn show_timer_close_targets(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>) {
+    let config = timer.lock().await.config().clone();
+    let keyboard = timer_target_keyboard(&config, "timer_close");
+    let _ = bot
+        .send_message(chat_id, "请选择要关闭定时换 IP 的范围：")
+        .reply_markup(keyboard)
+        .await;
+}
+
+async fn handle_timer_time_input(
+    bot: &Bot,
+    chat_id: ChatId,
+    timer: &Arc<Mutex<TimerManager>>,
+    timer_inputs: &Arc<Mutex<TimerInputStore>>,
+    text: &str,
+) {
+    let Some(mode) = timer_inputs.lock().await.take(chat_id, Instant::now()) else {
+        return;
+    };
+
+    if let Err(error) = parse_hhmm(text) {
+        let _ = bot
+            .send_message(chat_id, format!("❌ {}", html_escape(&error.to_string())))
+            .await;
+        return;
+    }
+
+    match mode {
+        TimerInputMode::New => show_timer_create_targets(bot, chat_id, timer, text).await,
+        TimerInputMode::Edit(target) => {
+            apply_timer_change(
+                bot,
+                chat_id,
+                timer,
+                TimerUpdate::Enable {
+                    target,
+                    hhmm: text.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn show_timer_create_targets(
+    bot: &Bot,
+    chat_id: ChatId,
+    timer: &Arc<Mutex<TimerManager>>,
+    hhmm: &str,
+) {
+    let config = timer.lock().await.config().clone();
+    let keyboard = timer_create_keyboard(&config, hhmm);
+    let _ = bot
+        .send_message(chat_id, "请选择定时换 IP 目标：")
+        .reply_markup(keyboard)
+        .await;
+}
+
+async fn apply_timer_change(
+    bot: &Bot,
+    chat_id: ChatId,
+    timer: &Arc<Mutex<TimerManager>>,
+    update: TimerUpdate,
+) {
+    let result = timer.lock().await.apply_update(update).await;
+    match result {
+        Ok(()) => {
+            let _ = bot
+                .send_message(chat_id, "✅ 定时配置已保存并重新调度")
+                .await;
+            show_timer_panel(bot, chat_id, timer).await;
+        }
+        Err(error) => {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    format!("❌ 保存失败: {}", html_escape(&error.to_string())),
+                )
+                .await;
+        }
+    }
+}
+
+fn format_timer_panel(status: &TimerStatus) -> String {
+    let mut lines = vec![
+        "⏰ <b>定时换 IP</b>".to_string(),
+        format!("当前时区: <code>{}</code>", html_escape(status.timezone)),
+        format!(
+            "🌐 全部 Server: {}",
+            timer_state_text(status.global_timer_enabled, status.global_time.as_deref())
+        ),
+        "Server 定时状态:".to_string(),
+    ];
+
+    for server in &status.servers {
+        let state = if !server.server_enabled {
+            "VPS 已禁用".to_string()
+        } else if server.timer_enabled {
+            timer_state_text(true, server.time.as_deref())
+        } else {
+            timer_state_text(false, server.time.as_deref())
+        };
+        lines.push(format!(
+            "- 🖥 {} (<code>{}</code>): {}",
+            html_escape(&server.server_name),
+            html_escape(&server.server_id),
+            state
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn timer_state_text(enabled: bool, time: Option<&str>) -> String {
+    if enabled {
+        format!(
+            "已开启 | 每天 {}",
+            html_escape(time.unwrap_or("时间未设置"))
+        )
+    } else {
+        let saved_time = time
+            .map(|time| format!(" | 保留时间 {}", html_escape(time)))
+            .unwrap_or_default();
+        format!("已关闭{saved_time}")
+    }
+}
+
+fn timer_target_keyboard(config: &AppConfig, prefix: &str) -> InlineKeyboardMarkup {
+    let mut rows = vec![vec![InlineKeyboardButton::callback(
+        "🌐 全部 Server",
+        format!("{prefix}:all"),
+    )]];
+    rows.extend(enabled_server_buttons(config, prefix));
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn timer_create_keyboard(config: &AppConfig, hhmm: &str) -> InlineKeyboardMarkup {
+    let mut rows = vec![vec![InlineKeyboardButton::callback(
+        "🌐 全部 Server",
+        format!("timer_create:all:{hhmm}"),
+    )]];
+    rows.extend(enabled_server_buttons_with_time(
+        config,
+        "timer_create:server",
+        hhmm,
+    ));
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn enabled_server_buttons(config: &AppConfig, prefix: &str) -> Vec<Vec<InlineKeyboardButton>> {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .map(|server| {
+            vec![InlineKeyboardButton::callback(
+                format!("🖥 {}", server.name),
+                format!("{prefix}:server:{}", server.id),
+            )]
+        })
+        .collect()
+}
+
+fn enabled_server_buttons_with_time(
+    config: &AppConfig,
+    prefix: &str,
+    hhmm: &str,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .map(|server| {
+            vec![InlineKeyboardButton::callback(
+                format!("🖥 {}", server.name),
+                format!("{prefix}:{}:{hhmm}", server.id),
+            )]
+        })
+        .collect()
 }
 
 async fn resolve_for_tg<'a>(
@@ -624,6 +972,10 @@ fn selected_servers(selected: ResolvedSelection<'_>) -> Vec<&ServerConfig> {
     }
 }
 
+fn is_authorized_tg_id(config: &AppConfig, id: &str) -> bool {
+    config.tg_chat_id.as_deref() == Some(id)
+}
+
 fn parse_callback(data: &str) -> CallbackAction<'_> {
     if data.starts_with("change:") {
         return CallbackAction::LegacyChange;
@@ -648,6 +1000,38 @@ fn parse_callback(data: &str) -> CallbackAction<'_> {
             return CallbackAction::CancelChange { server_id, nonce };
         }
     }
+    if data == "timer_new" {
+        return CallbackAction::TimerNew;
+    }
+    if data == "timer_edit" {
+        return CallbackAction::TimerEdit;
+    }
+    if data == "timer_close" {
+        return CallbackAction::TimerClose;
+    }
+    if data == "timer_refresh" {
+        return CallbackAction::TimerRefresh;
+    }
+    if let Some(hhmm) = data.strip_prefix("timer_create:all:") {
+        return CallbackAction::TimerCreateAll { hhmm };
+    }
+    if let Some(rest) = data.strip_prefix("timer_create:server:") {
+        if let Some((server_id, hhmm)) = rest.split_once(':') {
+            return CallbackAction::TimerCreateServer { server_id, hhmm };
+        }
+    }
+    if data == "timer_edit_target:all" {
+        return CallbackAction::TimerEditTargetAll;
+    }
+    if let Some(server_id) = data.strip_prefix("timer_edit_target:server:") {
+        return CallbackAction::TimerEditTargetServer(server_id);
+    }
+    if data == "timer_close:all" {
+        return CallbackAction::TimerCloseAll;
+    }
+    if let Some(server_id) = data.strip_prefix("timer_close:server:") {
+        return CallbackAction::TimerCloseServer(server_id);
+    }
     CallbackAction::Unknown
 }
 
@@ -661,6 +1045,38 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SecretToken, ServerTimerConfig};
+
+    fn app_config() -> AppConfig {
+        AppConfig {
+            servers: vec![
+                ServerConfig {
+                    id: "hk-01".to_string(),
+                    name: "Hong Kong 01".to_string(),
+                    token: SecretToken::from_test_value("hidden-token-a"),
+                    enabled: true,
+                    timer: Some(ServerTimerConfig {
+                        enabled: true,
+                        cron: Some("30 3 * * *".to_string()),
+                    }),
+                },
+                ServerConfig {
+                    id: "jp_02".to_string(),
+                    name: "Japan 02".to_string(),
+                    token: SecretToken::from_test_value("hidden-token-b"),
+                    enabled: true,
+                    timer: None,
+                },
+            ],
+            global_timer: Some(ServerTimerConfig {
+                enabled: true,
+                cron: Some("45 4 * * *".to_string()),
+            }),
+            tg_token: None,
+            tg_chat_id: Some("12345".to_string()),
+            migration_notice: None,
+        }
+    }
 
     #[test]
     fn menu_contains_every_supported_command_with_valid_names() {
@@ -741,6 +1157,95 @@ mod tests {
             parse_callback("change:router:interface"),
             CallbackAction::LegacyChange
         );
+    }
+
+    #[test]
+    fn timer_callbacks_are_routable_without_tokens() {
+        assert_eq!(parse_callback("timer_new"), CallbackAction::TimerNew);
+        assert_eq!(parse_callback("timer_edit"), CallbackAction::TimerEdit);
+        assert_eq!(parse_callback("timer_close"), CallbackAction::TimerClose);
+        assert_eq!(
+            parse_callback("timer_refresh"),
+            CallbackAction::TimerRefresh
+        );
+        assert_eq!(
+            parse_callback("timer_create:all:03:30"),
+            CallbackAction::TimerCreateAll { hhmm: "03:30" }
+        );
+        assert_eq!(
+            parse_callback("timer_create:server:hk-01:03:30"),
+            CallbackAction::TimerCreateServer {
+                server_id: "hk-01",
+                hhmm: "03:30"
+            }
+        );
+        assert_eq!(
+            parse_callback("timer_edit_target:server:hk-01"),
+            CallbackAction::TimerEditTargetServer("hk-01")
+        );
+        assert_eq!(
+            parse_callback("timer_close:server:hk-01"),
+            CallbackAction::TimerCloseServer("hk-01")
+        );
+    }
+
+    #[test]
+    fn timer_panel_shows_timezone_servers_and_actions_without_tokens() {
+        let config = app_config();
+        let status = crate::timer::timer_status(&config);
+        let text = format_timer_panel(&status);
+
+        assert!(text.contains("Asia/Shanghai"));
+        assert!(text.contains("🌐 全部 Server"));
+        assert!(text.contains("04:45"));
+        assert!(text.contains("Hong Kong 01"));
+        assert!(text.contains("03:30"));
+        assert!(text.contains("Japan 02"));
+        assert!(!text.contains("hidden-token"));
+
+        let keyboard = timer_create_keyboard(&config, "03:30");
+        let debug = format!("{keyboard:?}");
+        assert!(debug.contains("timer_create:all:03:30"));
+        assert!(debug.contains("timer_create:server:hk-01:03:30"));
+        assert!(!debug.contains("hidden-token"));
+    }
+
+    #[test]
+    fn timer_input_store_expires_and_consumes_once() {
+        let mut store = TimerInputStore::default();
+        let chat_id = ChatId(12345);
+        let now = Instant::now();
+
+        store.set(chat_id, TimerInputMode::New, now);
+        assert!(matches!(
+            store.take(chat_id, now + Duration::from_secs(1)),
+            Some(TimerInputMode::New)
+        ));
+        assert!(store.take(chat_id, now + Duration::from_secs(2)).is_none());
+
+        store.set(chat_id, TimerInputMode::New, now);
+        assert!(store
+            .take(chat_id, now + TIMER_INPUT_TTL + Duration::from_secs(1))
+            .is_none());
+    }
+
+    #[test]
+    fn tg_chat_id_authorization_is_reused_for_timer_inputs_and_callbacks() {
+        let config = app_config();
+        assert!(is_authorized_tg_id(&config, "12345"));
+        assert!(!is_authorized_tg_id(&config, "54321"));
+    }
+
+    #[test]
+    fn timer_keyboard_has_all_and_single_server_targets() {
+        let config = app_config();
+        let keyboard = timer_target_keyboard(&config, "timer_close");
+        let debug = format!("{keyboard:?}");
+
+        assert!(debug.contains("timer_close:all"));
+        assert!(debug.contains("timer_close:server:hk-01"));
+        assert!(debug.contains("timer_close:server:jp_02"));
+        assert!(!debug.contains("hidden-token"));
     }
 
     #[test]

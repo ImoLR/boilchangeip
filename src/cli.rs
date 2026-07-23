@@ -110,6 +110,14 @@ pub async fn cmd_change(config: &AppConfig, server: Option<&str>, all: bool) -> 
 pub fn cmd_timer(config: &AppConfig) -> anyhow::Result<()> {
     ensure_new_config_ready(config)?;
     println!("定时换 IP 配置\n");
+    let global_summary = match &config.global_timer {
+        Some(timer) if timer.enabled => match &timer.cron {
+            Some(cron) => format!("enabled | {cron}"),
+            None => "enabled | cron 未设置".to_string(),
+        },
+        _ => "disabled".to_string(),
+    };
+    println!("  全部 Server | {global_summary}");
     for server in &config.servers {
         let summary = match &server.timer {
             Some(timer) if timer.enabled => match &timer.cron {
@@ -290,6 +298,7 @@ mod tests {
                 enabled: true,
                 timer: None,
             }],
+            global_timer: None,
             tg_token: None,
             tg_chat_id: None,
             migration_notice: None,
@@ -313,6 +322,7 @@ mod tests {
     fn legacy_config_returns_migration_error() {
         let config = AppConfig {
             servers: Vec::new(),
+            global_timer: None,
             tg_token: None,
             tg_chat_id: None,
             migration_notice: Some("legacy config".to_string()),

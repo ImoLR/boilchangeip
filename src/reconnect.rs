@@ -12,6 +12,7 @@ use crate::{
 
 static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+static CHANGE_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const SUCCESS_MESSAGE: &str = "换 IP 已完成";
 const UNCONFIRMED_MESSAGE: &str =
@@ -138,7 +139,8 @@ async fn reconnect_one_locked(
         }
     };
 
-    let change = match client.change_ip(&server.token).await {
+    let change = with_change_ip_lock(client.change_ip(&server.token)).await;
+    let change = match change {
         Ok(response) => response,
         Err(error) => {
             let mut result = base_result(
@@ -240,6 +242,14 @@ fn change_error_status(error: &BoilApiError) -> ReconnectStatus {
             ReconnectStatus::NetworkError
         }
     }
+}
+
+async fn with_change_ip_lock<F, R>(future: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let _change_guard = CHANGE_IP_LOCK.lock().await;
+    future.await
 }
 
 fn server_lock(server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -459,6 +469,7 @@ mod tests {
     fn config(servers: Vec<ServerConfig>) -> AppConfig {
         AppConfig {
             servers,
+            global_timer: None,
             tg_token: None,
             tg_chat_id: None,
             migration_notice: None,
@@ -806,6 +817,43 @@ mod tests {
         assert_eq!(second.unwrap().status, ReconnectStatus::Success);
         assert_eq!(mock.change_count(), 2);
         assert_eq!(mock.max_active_changes(), 1);
+    }
+
+    #[tokio::test]
+    async fn change_ip_lock_prevents_overlap_across_different_tasks() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            tokio::spawn(async move {
+                with_change_ip_lock(async {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            })
+        };
+        let second = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            tokio::spawn(async move {
+                with_change_ip_lock(async {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            })
+        };
+
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

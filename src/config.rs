@@ -1,13 +1,14 @@
 use anyhow::Context as _;
 use dialoguer::{Confirm, Input};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
 const BOIL_SERVERS_ENV: &str = "BOIL_SERVERS";
+const BOIL_GLOBAL_TIMER_ENV: &str = "BOIL_GLOBAL_TIMER";
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SecretToken(String);
 
@@ -38,25 +39,26 @@ impl fmt::Display for SecretToken {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ServerTimerConfig {
     pub enabled: bool,
     pub cron: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ServerConfig {
     pub id: String,
     pub name: String,
     pub token: SecretToken,
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer: Option<ServerTimerConfig>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub servers: Vec<ServerConfig>,
+    pub global_timer: Option<ServerTimerConfig>,
     pub tg_token: Option<String>,
     pub tg_chat_id: Option<String>,
     pub migration_notice: Option<String>,
@@ -66,6 +68,7 @@ impl fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppConfig")
             .field("servers", &self.servers)
+            .field("global_timer", &self.global_timer)
             .field("tg_token", &self.tg_token.as_ref().map(|_| "<redacted>"))
             .field("tg_chat_id", &self.tg_chat_id)
             .field("migration_notice", &self.migration_notice)
@@ -100,6 +103,7 @@ impl AppConfig {
             if has_legacy_boil_config(&vars) {
                 return Ok(Self {
                     servers: Vec::new(),
+                    global_timer: parse_global_timer(&vars)?,
                     tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
                     tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
                     migration_notice: Some(legacy_config_migration_notice().to_string()),
@@ -114,6 +118,7 @@ impl AppConfig {
 
         Ok(Self {
             servers,
+            global_timer: parse_global_timer(&vars)?,
             tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
             tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
             migration_notice: None,
@@ -145,6 +150,77 @@ pub fn load_app_config() -> anyhow::Result<AppConfig> {
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     AppConfig::from_env_vars(borrowed_vars)
+}
+
+pub fn save_app_config(config: &AppConfig) -> anyhow::Result<()> {
+    save_app_config_to_path(config, &config_path())
+}
+
+pub(crate) fn save_app_config_to_path(
+    config: &AppConfig,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    validate_servers(&config.servers)?;
+    if let Some(timer) = &config.global_timer {
+        validate_timer_config(timer).context("BOIL_GLOBAL_TIMER 配置无效")?;
+    }
+
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let servers_json = serde_json::to_string_pretty(&config.servers)?;
+    let servers_line = format!("{BOIL_SERVERS_ENV}={}", shell_single_quote(&servers_json));
+    let global_timer_line = match &config.global_timer {
+        Some(timer) => {
+            let timer_json = serde_json::to_string_pretty(timer)?;
+            Some(format!(
+                "{BOIL_GLOBAL_TIMER_ENV}={}",
+                shell_single_quote(&timer_json)
+            ))
+        }
+        None => None,
+    };
+    let mut replaced = false;
+    let mut global_replaced = false;
+    let mut lines = Vec::new();
+
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{BOIL_SERVERS_ENV}=")) {
+            lines.push(servers_line.clone());
+            replaced = true;
+        } else if trimmed.starts_with(&format!("{BOIL_GLOBAL_TIMER_ENV}=")) {
+            if let Some(line) = &global_timer_line {
+                lines.push(line.clone());
+            }
+            global_replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !replaced {
+        lines.insert(0, servers_line);
+    }
+    if !global_replaced {
+        if let Some(line) = global_timer_line {
+            lines.insert(1.min(lines.len()), line);
+        }
+    }
+
+    let mut content = lines.join("\n");
+    content.push('\n');
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建配置目录: {}", parent.display()))?;
+    }
+
+    let temp_path = path.with_extension("env.tmp");
+    std::fs::write(&temp_path, content)
+        .with_context(|| format!("无法写入临时配置文件: {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("无法更新配置文件: {}", path.display()))?;
+
+    Ok(())
 }
 
 pub fn resolve_servers<'a>(
@@ -202,6 +278,10 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
             "server id '{}' 不得包含 token",
             server.id
         );
+        if let Some(timer) = &server.timer {
+            validate_timer_config(timer)
+                .with_context(|| format!("server id '{}' 的 timer 配置无效", server.id))?;
+        }
         anyhow::ensure!(ids.insert(&server.id), "server id '{}' 重复", server.id);
     }
 
@@ -229,6 +309,37 @@ fn has_legacy_boil_config(vars: &[(&str, &str)]) -> bool {
     .any(|legacy_key| find_var(vars, legacy_key).is_some())
 }
 
+fn parse_global_timer(vars: &[(&str, &str)]) -> anyhow::Result<Option<ServerTimerConfig>> {
+    let Some(timer_json) = find_var(vars, BOIL_GLOBAL_TIMER_ENV) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !timer_json.trim().is_empty(),
+        "BOIL_GLOBAL_TIMER 不能为空；未启用全局定时时请删除该配置项"
+    );
+    let timer = serde_json::from_str(timer_json)
+        .context("BOIL_GLOBAL_TIMER JSON 解析失败，请检查全局定时配置格式")?;
+    validate_timer_config(&timer).context("BOIL_GLOBAL_TIMER 配置无效")?;
+    Ok(Some(timer))
+}
+
+fn validate_timer_config(timer: &ServerTimerConfig) -> anyhow::Result<()> {
+    if let Some(cron) = &timer.cron {
+        validate_timer_cron(cron)?;
+    }
+    Ok(())
+}
+
+fn validate_timer_cron(cron: &str) -> anyhow::Result<()> {
+    let parts = cron.split_whitespace().collect::<Vec<_>>();
+    anyhow::ensure!(parts.len() == 5, "cron 必须是 5 字段格式，例如 30 3 * * *");
+    anyhow::ensure!(
+        parts.iter().all(|part| !part.trim().is_empty()),
+        "cron 字段不能为空"
+    );
+    Ok(())
+}
+
 fn legacy_config_migration_notice() -> &'static str {
     "检测到旧版 Boil 配置（BOIL_ACCOUNT/BOIL_PASSWORD/BOIL_ROUTER_ID/BOIL_INTERFACE）。当前版本已迁移到新版 Token API，不再使用旧账号密码、router_id 或 interface 调用旧 API。请从 Boil 面板获取新版 Token，并为每台 VPS 手动配置 BOIL_SERVERS；不会自动使用旧凭据获取 token。"
 }
@@ -252,6 +363,10 @@ fn config_path() -> PathBuf {
         .into_iter()
         .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("/etc/boil/config.env"))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// setup 向导写入配置的目标路径（优先写到 /etc/boil/，不存在则写当前目录）
@@ -286,7 +401,7 @@ fn build_config_content(
     ]);
     let servers_json = serde_json::to_string_pretty(&servers)?;
 
-    let mut content = format!("BOIL_SERVERS='{}'\n", servers_json.replace('\'', "'\\''"));
+    let mut content = format!("BOIL_SERVERS={}\n", shell_single_quote(&servers_json));
 
     match tg {
         Some((token, chat_id)) => {
@@ -635,5 +750,113 @@ mod tests {
         assert!(!msg.contains("legacy-password"));
         assert!(!msg.contains("182"));
         assert!(!msg.contains("adsl3"));
+    }
+
+    #[test]
+    fn old_boil_servers_config_without_global_timer_still_loads() {
+        let app = app_from_servers_json(ONE_SERVER).unwrap();
+        assert_eq!(app.servers.len(), 1);
+        assert!(app.global_timer.is_none());
+    }
+
+    #[test]
+    fn empty_global_timer_is_configuration_error() {
+        let error =
+            AppConfig::from_env_vars([("BOIL_SERVERS", ONE_SERVER), ("BOIL_GLOBAL_TIMER", "")])
+                .unwrap_err();
+        assert!(error.to_string().contains("BOIL_GLOBAL_TIMER 不能为空"));
+    }
+
+    #[test]
+    fn invalid_global_timer_json_is_configuration_error() {
+        let error = AppConfig::from_env_vars([
+            ("BOIL_SERVERS", ONE_SERVER),
+            ("BOIL_GLOBAL_TIMER", "not-json"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("BOIL_GLOBAL_TIMER JSON 解析失败"));
+    }
+
+    #[test]
+    fn invalid_timer_cron_is_configuration_error() {
+        let servers = r#"[
+            {
+                "id": "primary",
+                "name": "Primary VPS",
+                "token": "secret-token-primary",
+                "enabled": true,
+                "timer": {
+                    "enabled": true,
+                    "cron": "bad"
+                }
+            }
+        ]"#;
+        let error = app_from_servers_json(servers).unwrap_err();
+        assert!(error.to_string().contains("timer 配置无效"));
+        assert!(!error.to_string().contains("secret-token-primary"));
+    }
+
+    #[test]
+    fn save_app_config_replaces_only_boil_servers_line() {
+        let dir =
+            std::env::temp_dir().join(format!("boilchangeip-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        std::fs::write(
+            &path,
+            "TG_TOKEN='keep'\nBOIL_SERVERS='[]'\nTG_CHAT_ID='123'\n",
+        )
+        .unwrap();
+
+        let mut app = app_from_servers_json(ONE_SERVER).unwrap();
+        app.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("45 4 * * *".to_string()),
+        });
+        app.servers[0].timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("30 3 * * *".to_string()),
+        });
+
+        save_app_config_to_path(&app, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+
+        assert!(saved.contains("BOIL_SERVERS='"));
+        assert!(saved.contains("BOIL_GLOBAL_TIMER='"));
+        assert!(saved.contains("\"timer\""));
+        assert!(saved.contains("30 3 * * *"));
+        assert!(saved.contains("45 4 * * *"));
+        assert!(saved.contains("TG_TOKEN='keep'"));
+        assert!(saved.contains("TG_CHAT_ID='123'"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_app_config_validation_failure_leaves_existing_file_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "boilchangeip-config-fail-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        let original = "TG_TOKEN='keep'\nBOIL_SERVERS='[]'\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut app = app_from_servers_json(ONE_SERVER).unwrap();
+        app.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("bad".to_string()),
+        });
+
+        let error = save_app_config_to_path(&app, &path).unwrap_err();
+        assert!(error.to_string().contains("BOIL_GLOBAL_TIMER 配置无效"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

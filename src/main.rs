@@ -138,7 +138,11 @@ async fn run_daemon(config: Arc<config::AppConfig>) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|timer| timer.enabled && timer.cron.is_some())
                 .unwrap_or(false)
-    });
+    }) || config
+        .global_timer
+        .as_ref()
+        .map(|timer| timer.enabled && timer.cron.is_some())
+        .unwrap_or(false);
 
     anyhow::ensure!(
         has_tg || has_cron,

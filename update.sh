@@ -14,6 +14,7 @@ SERVICE_NAME="${BOIL_SERVICE_NAME:-boil}"
 INSTALL_DIR="${BOIL_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${BOIL_CONFIG_DIR:-/etc/boil}"
 BACKUP_ROOT="${BOIL_BACKUP_ROOT:-/var/backups/boilchangeip}"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 RELEASE_API_URL="${BOIL_RELEASE_API_URL:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
 RELEASE_DOWNLOAD_BASE="${BOIL_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO_SLUG}/releases/download}"
 TMP_DIR=""
@@ -248,6 +249,30 @@ backup_binary() {
   echo "已备份旧二进制: $BINARY_BACKUP"
 }
 
+write_service_file() {
+  local binary="$INSTALL_DIR/$BIN_NAME"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=boilchangeip daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$CONFIG_DIR
+ExecStart=$binary daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run_privileged install -m 0644 "$tmp" "$SERVICE_PATH"
+  rm -f -- "$tmp"
+}
+
 restore_config() {
   [[ -n "$CONFIG_BACKUP" ]] || return
   [[ -d "$CONFIG_BACKUP" ]] || return
@@ -283,6 +308,26 @@ stop_service_if_needed() {
     echo "停止服务: $SERVICE_NAME"
     run_privileged systemctl stop "$SERVICE_NAME"
   fi
+}
+
+ensure_service_if_configured() {
+  if ! systemctl_available; then
+    return
+  fi
+
+  if service_exists; then
+    return
+  fi
+
+  if [[ ! -f "$CONFIG_DIR/config.env" ]]; then
+    return
+  fi
+
+  echo "未检测到 systemd 服务，正在创建: $SERVICE_NAME"
+  write_service_file
+  run_privileged systemctl daemon-reload
+  run_privileged systemctl enable "$SERVICE_NAME"
+  WAS_ACTIVE=true
 }
 
 restart_service_if_needed() {
@@ -341,6 +386,7 @@ main() {
   stop_service_if_needed
   install_artifact
   "$INSTALL_DIR/$BIN_NAME" --version >/dev/null
+  ensure_service_if_configured
   restart_service_if_needed
 
   trap - ERR

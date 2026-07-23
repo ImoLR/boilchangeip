@@ -149,7 +149,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "boil"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "ab_glyph",
  "anyhow",

@@ -4,7 +4,8 @@
 
 set -euo pipefail
 
-REPO_URL="${BOIL_REPO_URL:-https://github.com/ImoLR/boilchangeip.git}"
+REPO_SLUG="${BOIL_REPO_SLUG:-ImoLR/boilchangeip}"
+REPO_URL="${BOIL_REPO_URL:-https://github.com/${REPO_SLUG}.git}"
 BRANCH="${BOIL_BRANCH:-main}"
 VERSION="${BOIL_VERSION:-}"
 TAG="${BOIL_TAG:-$VERSION}"
@@ -13,7 +14,13 @@ SERVICE_NAME="${BOIL_SERVICE_NAME:-boil}"
 INSTALL_DIR="${BOIL_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${BOIL_CONFIG_DIR:-/etc/boil}"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+RELEASE_API_URL="${BOIL_RELEASE_API_URL:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
+RELEASE_DOWNLOAD_BASE="${BOIL_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO_SLUG}/releases/download}"
 TMP_DIR=""
+CARGO_BIN=""
+ARTIFACT_PATH=""
+ARTIFACT_SOURCE=""
+ARTIFACT_REF=""
 
 die() {
   echo "错误: $*" >&2
@@ -24,10 +31,12 @@ usage() {
   cat <<EOF
 用法: install.sh [--help]
 
+默认优先下载 GitHub Release 预编译二进制；当前架构没有 Release Asset 时才回退源码编译。
+
 环境变量:
-  BOIL_BRANCH=main|develop      默认 main
-  BOIL_VERSION=2.1.1            指定版本，自动补 v 前缀
-  BOIL_TAG=v2.1.1               指定 tag，优先于 BOIL_VERSION
+  BOIL_BRANCH=main|develop      默认 main；develop 会直接源码编译
+  BOIL_VERSION=2.1.2            指定版本，自动补 v 前缀
+  BOIL_TAG=v2.1.2               指定 tag，优先于 BOIL_VERSION
   BOIL_INSTALL_DIR=/usr/local/bin
   BOIL_CONFIG_DIR=/etc/boil
   BOIL_SERVICE_NAME=boil
@@ -56,51 +65,6 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
 }
 
-detect_package_manager() {
-  for manager in apt-get dnf yum pacman zypper; do
-    if command -v "$manager" >/dev/null 2>&1; then
-      echo "$manager"
-      return
-    fi
-  done
-  return 1
-}
-
-install_dependencies() {
-  local missing=()
-  for command_name in git cargo systemctl install mktemp; do
-    command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
-  done
-
-  [[ "${#missing[@]}" -eq 0 ]] && return
-
-  local manager
-  manager="$(detect_package_manager)" || die "缺少依赖: ${missing[*]}，且无法识别包管理器"
-
-  echo "安装缺失依赖: ${missing[*]}"
-  case "$manager" in
-    apt-get)
-      run_privileged apt-get update
-      run_privileged apt-get install -y git cargo build-essential pkg-config ca-certificates
-      ;;
-    dnf)
-      run_privileged dnf install -y git cargo gcc make pkgconf-pkg-config ca-certificates
-      ;;
-    yum)
-      run_privileged yum install -y git cargo gcc make pkgconfig ca-certificates
-      ;;
-    pacman)
-      run_privileged pacman -Sy --needed --noconfirm git rust base-devel pkgconf ca-certificates
-      ;;
-    zypper)
-      run_privileged zypper --non-interactive install git cargo gcc make pkg-config ca-certificates
-      ;;
-    *)
-      die "不支持的包管理器: $manager"
-      ;;
-  esac
-}
-
 normalize_tag() {
   local tag="$1"
   [[ -z "$tag" ]] && return
@@ -109,6 +73,85 @@ normalize_tag() {
   else
     echo "v$tag"
   fi
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      echo "amd64"
+      ;;
+    aarch64|arm64)
+      echo "arm64"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+latest_release_tag() {
+  curl -fsSL "$RELEASE_API_URL" |
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -n 1
+}
+
+selected_release_tag() {
+  local tag
+  tag="$(normalize_tag "$TAG")"
+  if [[ -n "$tag" ]]; then
+    echo "$tag"
+    return
+  fi
+
+  if [[ "$BRANCH" != "main" ]]; then
+    return 1
+  fi
+
+  latest_release_tag
+}
+
+download_release_binary() {
+  local tag="$1"
+  local arch="$2"
+  local asset="boil-linux-${arch}"
+  local url="${RELEASE_DOWNLOAD_BASE}/${tag}/${asset}"
+  local destination="$TMP_DIR/$asset"
+
+  if curl -fL --silent --show-error "$url" -o "$destination"; then
+    chmod 0755 "$destination"
+    "$destination" --version >/dev/null
+    ARTIFACT_PATH="$destination"
+    ARTIFACT_SOURCE="release"
+    ARTIFACT_REF="$tag/$asset"
+    return 0
+  fi
+
+  rm -f -- "$destination"
+  return 1
+}
+
+find_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    command -v cargo
+    return
+  fi
+
+  if [[ -x /root/.cargo/bin/cargo ]]; then
+    echo /root/.cargo/bin/cargo
+    return
+  fi
+
+  if [[ -n "${SUDO_USER:-}" && -x "/home/${SUDO_USER}/.cargo/bin/cargo" ]]; then
+    echo "/home/${SUDO_USER}/.cargo/bin/cargo"
+    return
+  fi
+
+  return 1
+}
+
+require_source_tools() {
+  require_command git
+  CARGO_BIN="$(find_cargo)" || die "未检测到 Rust/Cargo。当前 Release 没有适配本机架构的预编译二进制，请先安装 Rust/Cargo 后重试。"
 }
 
 checkout_target_ref() {
@@ -120,37 +163,48 @@ checkout_target_ref() {
   if [[ -n "$tag" ]]; then
     git -C "$source_dir" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null ||
       die "指定版本不存在: $tag"
-    git -C "$source_dir" checkout --detach "refs/tags/$tag"
+    git -C "$source_dir" checkout --quiet --detach "refs/tags/$tag"
   else
     git -C "$source_dir" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null ||
       die "远程分支不存在: $BRANCH"
-    git -C "$source_dir" checkout -B "$BRANCH" "origin/$BRANCH"
+    git -C "$source_dir" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
   fi
 }
 
-prepare_source() {
-  TMP_DIR="$(mktemp -d -t boilchangeip-install.XXXXXX)"
+prepare_source_artifact() {
+  require_source_tools
+
   local source_dir="$TMP_DIR/source"
-  echo "下载源码: $REPO_URL" >&2
+  echo "未找到匹配的 Release 二进制，回退源码编译: $REPO_URL" >&2
   git clone --quiet "$REPO_URL" "$source_dir"
   checkout_target_ref "$source_dir"
-  echo "$source_dir"
+  echo "编译 Release 版本..." >&2
+  "$CARGO_BIN" build --release --manifest-path "$source_dir/Cargo.toml"
+
+  ARTIFACT_PATH="$source_dir/target/release/$BIN_NAME"
+  [[ -f "$ARTIFACT_PATH" ]] || die "未找到构建产物: $ARTIFACT_PATH"
+  ARTIFACT_SOURCE="source"
+  ARTIFACT_REF="$(git -C "$source_dir" rev-parse --short HEAD)"
 }
 
-build_release() {
-  local source_dir="$1"
-  echo "编译 Release 版本..." >&2
-  cargo build --release --manifest-path "$source_dir/Cargo.toml"
+prepare_artifact() {
+  TMP_DIR="$(mktemp -d -t boilchangeip-install.XXXXXX)"
+
+  local arch tag
+  if arch="$(detect_arch)" && tag="$(selected_release_tag)" && [[ -n "$tag" ]]; then
+    echo "尝试下载 Release 二进制: ${tag} (${arch})" >&2
+    if download_release_binary "$tag" "$arch"; then
+      return
+    fi
+  fi
+
+  prepare_source_artifact
 }
 
 install_artifact() {
-  local source_dir="$1"
-  local artifact="$source_dir/target/release/$BIN_NAME"
   local destination="$INSTALL_DIR/$BIN_NAME"
-
-  [[ -f "$artifact" ]] || die "未找到构建产物: $artifact"
   run_privileged install -d -m 0755 "$INSTALL_DIR"
-  run_privileged install -m 0755 "$artifact" "$destination"
+  run_privileged install -m 0755 "$ARTIFACT_PATH" "$destination"
 }
 
 write_service_file() {
@@ -209,13 +263,12 @@ start_and_verify_service() {
 }
 
 print_summary() {
-  local source_dir="$1"
   echo
   echo "安装完成。"
   echo "程序路径: $INSTALL_DIR/$BIN_NAME"
   echo "配置目录: $CONFIG_DIR"
   echo "服务名称: $SERVICE_NAME"
-  echo "源码版本: $(git -C "$source_dir" rev-parse --short HEAD)"
+  echo "安装来源: $ARTIFACT_SOURCE ($ARTIFACT_REF)"
   echo "程序版本: $("${INSTALL_DIR}/${BIN_NAME}" --version)"
   echo "后续升级: curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh | sudo bash"
   echo "查看服务: systemctl status $SERVICE_NAME"
@@ -236,15 +289,16 @@ main() {
   esac
 
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux 系统"
-  install_dependencies
-  local source_dir
-  source_dir="$(prepare_source)"
-  build_release "$source_dir"
-  install_artifact "$source_dir"
+  require_command curl
+  require_command install
+  require_command mktemp
+
+  prepare_artifact
+  install_artifact
   configure_if_missing
   install_systemd_service
   start_and_verify_service
-  print_summary "$source_dir"
+  print_summary
 }
 
 main "$@"

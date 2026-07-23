@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.1.2 - 2026-07-23
+
+### 修复
+
+- `install.sh` 和 `update.sh` 默认优先下载 GitHub Release 预编译二进制，普通用户不再需要 Rust、Cargo、Git 或源码目录。
+- `update.sh` 不再依赖当前目录、本地源码、`/opt/boilchangeip/source` 或 `cargo` 是否在 `PATH` 中。
+- 源码编译兜底时按顺序查找 `cargo`、`/root/.cargo/bin/cargo`、`/home/$SUDO_USER/.cargo/bin/cargo`。
+- Release 没有对应架构资产时才回退源码编译，并在缺少 Rust/Cargo 时输出明确错误。
+- 更新流程继续保留 `/etc/boil/config.env`，更新失败时恢复旧二进制和配置备份，并尝试恢复服务。
+
+### 发布
+
+- GitHub Actions 发布流程现在生成并上传 `boil-linux-amd64` 和 `boil-linux-arm64`。
+- 安装和更新脚本会自动识别 `amd64` 与 `arm64` 并下载对应资产。
+
 ## v2.1.1 - 2026-07-23
 
 ### 修复

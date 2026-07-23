@@ -48,6 +48,16 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET"
 
+      - name: Resolve expected version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) EXPECTED_VERSION="${RELEASE_TAG#v}" ;;
+            *) EXPECTED_VERSION="$RELEASE_TAG" ;;
+          esac
+          echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_ENV"
+
       - name: Rename binary
         env:
           TARGET: ${{ matrix.target }}
@@ -61,7 +71,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           "./$ARTIFACT" --version | tee version.txt
-          grep -qx 'boil 2.1.2' version.txt
+          grep -qx "boil $EXPECTED_VERSION" version.txt
 
           if command -v ldd >/dev/null 2>&1; then
             ldd "./$ARTIFACT" | tee ldd.txt || true

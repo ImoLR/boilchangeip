@@ -8,6 +8,7 @@ VERSION_TAG="${1:-}"
 AMD64_TARGET="x86_64-unknown-linux-musl"
 AMD64_ASSET="boil-linux-amd64"
 TMP_DIR=""
+MUSL_CC=""
 
 die() {
   echo "错误: $*" >&2
@@ -16,6 +17,20 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+}
+
+find_musl_cc() {
+  if command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+    command -v x86_64-linux-musl-gcc
+    return
+  fi
+
+  if command -v musl-gcc >/dev/null 2>&1; then
+    command -v musl-gcc
+    return
+  fi
+
+  return 1
 }
 
 cleanup() {
@@ -62,7 +77,7 @@ build_asset() {
   local target="$1"
   local asset="$2"
 
-  cargo build --release --locked --target "$target"
+  CC_x86_64_unknown_linux_musl="$MUSL_CC" cargo build --release --locked --target "$target"
   cp "$ROOT_DIR/target/$target/release/boil" "$TMP_DIR/$asset"
   chmod 0755 "$TMP_DIR/$asset"
 }
@@ -91,7 +106,7 @@ main() {
   require_command cargo
   require_command rustup
   require_command gh
-  require_command x86_64-linux-musl-gcc
+  MUSL_CC="$(find_musl_cc)" || die "缺少 x86_64 musl C 编译器，请安装 musl-tools"
 
   local branch version commit release_url
   branch="$(git branch --show-current)"

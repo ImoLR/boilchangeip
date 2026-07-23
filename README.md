@@ -40,6 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh |
 
 更新过程默认下载最新正式 Release 二进制并替换程序，现有 `config.env` 保持不变。
 更新脚本不依赖当前目录、本地源码、`/opt/boilchangeip/source`、Git 或 Cargo。
+脚本会同时下载 `SHA256SUMS` 并校验二进制，校验通过后才会替换程序。
 更新时会停止服务后替换二进制，避免 `Text file busy`，随后自动重启并验证服务。
 更新前会把 `/etc/boil` 备份到带时间戳的安全目录，失败时会恢复旧二进制、配置备份并尝试恢复服务。
 
@@ -306,6 +307,25 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh |
 
 v2.1.2 的 `update.sh` 默认使用官方 Release 二进制，不再要求用户安装 Rust、Cargo
 或 Git。更新前会备份 `/etc/boil` 和旧二进制；如果更新失败，会恢复旧二进制和配置备份，并尝试恢复服务。
+
+## Release 校验
+
+GitHub Release 会提供：
+
+- `boil-linux-amd64`
+- `boil-linux-arm64`
+- `SHA256SUMS`
+
+`install.sh` 和 `update.sh` 下载 Release 二进制后，会自动下载 `SHA256SUMS` 并验证
+SHA256。只有校验成功才会安装或替换二进制。这样可以避免下载损坏、代理缓存异常
+或中间人篡改导致的错误安装。
+
+校验工具按以下顺序自动检测：
+
+1. `sha256sum`
+2. `openssl dgst -sha256`
+
+如果两者都不存在，脚本会明确报错并停止，不会覆盖当前已安装版本。
 
 ## 旧配置迁移
 

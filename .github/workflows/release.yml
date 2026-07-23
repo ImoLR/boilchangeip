@@ -105,6 +105,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum boil-linux-amd64 boil-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Upload Release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,4 +119,5 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             artifacts/boil-linux-amd64 \
             artifacts/boil-linux-arm64 \
+            artifacts/SHA256SUMS \
             --clobber

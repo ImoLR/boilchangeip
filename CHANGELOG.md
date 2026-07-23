@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.0.2 - 2026-07-23
+
+### 改进
+
+- `install.sh` 和 `update.sh` 支持 `BOIL_VERSION`、`BOIL_TAG` 指定版本，继续支持 `BOIL_BRANCH=develop`。
+- `update.sh` 更新前会备份 `/etc/boil` 到带时间戳的安全目录，更新失败时恢复配置备份并尝试恢复服务。
+- `update.sh` 指定不存在版本或分支时会明确报错，不覆盖当前安装。
+- `uninstall.sh` 默认改为普通卸载，只删除 systemd 服务和二进制，保留 `/etc/boil`。
+- `uninstall.sh --purge` 才会要求输入 `DELETE` 并彻底删除 `/etc/boil` 和安装器维护的 `/opt/boilchangeip`。
+- README 补充普通卸载、彻底卸载、版本选择和更新备份说明。
+
+### 安全
+
+- 更新备份只输出备份目录路径，不打印配置文件内容，避免泄露 Token 或 Telegram Bot Token。
+- 更新失败恢复配置时不会输出配置内容。
+- 卸载脚本继续保留 Rust、Cargo、Git 和用户自己 clone 的仓库。
+
 ## v2.0.1 - 2026-07-23
 
 ### 新增

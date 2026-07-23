@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# boilchangeip 彻底卸载脚本。
+# boilchangeip 卸载脚本。默认保留 /etc/boil，--purge 才彻底删除配置和安装器源码。
 
 set -euo pipefail
 
@@ -9,6 +9,7 @@ INSTALL_DIR="${BOIL_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${BOIL_CONFIG_DIR:-/etc/boil}"
 MANAGED_ROOT="${BOIL_MANAGED_ROOT:-/opt/boilchangeip}"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+PURGE=false
 
 die() {
   echo "错误: $*" >&2
@@ -29,26 +30,50 @@ systemctl_available() {
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
 }
 
-confirm_delete() {
+service_exists() {
+  systemctl_available &&
+    (systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 ||
+      systemctl status "$SERVICE_NAME" >/dev/null 2>&1)
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge)
+        PURGE=true
+        ;;
+      -h|--help)
+        echo "用法: ./uninstall.sh [--purge]"
+        echo "默认删除程序和 systemd 服务，保留 $CONFIG_DIR。"
+        echo "--purge 会额外删除 $CONFIG_DIR 和 $MANAGED_ROOT。"
+        exit 0
+        ;;
+      *)
+        die "未知参数: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+confirm_purge() {
   local answer
 
-  echo "将彻底删除 boilchangeip："
-  echo "  systemd 服务: $SERVICE_NAME"
-  echo "  二进制: $INSTALL_DIR/$BIN_NAME"
+  echo "将彻底删除 boilchangeip 运行数据："
   echo "  配置和运行数据: $CONFIG_DIR"
   echo "  安装器维护的源码目录: $MANAGED_ROOT"
   echo
-  echo "不会删除 Rust、Cargo、Git，也不会删除用户自己 clone 的仓库。"
+  echo "Rust、Cargo、Git 和用户自己 clone 的仓库仍会保留。"
   echo
 
   if [[ -r /dev/tty ]]; then
-    read -r -p "如确认卸载，请输入 DELETE: " answer </dev/tty
+    read -r -p "如确认彻底卸载，请输入 DELETE: " answer </dev/tty
   else
-    die "彻底卸载需要交互确认，请在终端中运行本地 uninstall.sh"
+    die "--purge 需要交互确认，请在终端中运行本地 uninstall.sh"
   fi
 
   [[ "$answer" == "DELETE" ]] || {
-    echo "输入不匹配，已取消卸载。"
+    echo "输入不匹配，已取消彻底卸载。"
     exit 0
   }
 }
@@ -86,11 +111,8 @@ remove_path() {
 }
 
 remove_service() {
-  if systemctl_available; then
-    if systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 ||
-      systemctl status "$SERVICE_NAME" >/dev/null 2>&1; then
-      run_privileged systemctl disable --now "$SERVICE_NAME" || true
-    fi
+  if service_exists; then
+    run_privileged systemctl disable --now "$SERVICE_NAME" || true
   fi
 
   remove_path "$SERVICE_PATH"
@@ -103,23 +125,31 @@ remove_service() {
 
 main() {
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux 系统"
-  confirm_delete
+  parse_args "$@"
+
+  if [[ "$PURGE" == true ]]; then
+    confirm_purge
+  fi
 
   local binary
-  local config_path
-  local managed_path
-
   binary="$(validate_remove_path "$INSTALL_DIR/$BIN_NAME")"
-  config_path="$(validate_remove_path "$CONFIG_DIR")"
-  managed_path="$(validate_remove_path "$MANAGED_ROOT")"
 
   remove_service
   remove_path "$binary"
-  remove_path "$config_path"
-  remove_path "$managed_path"
 
-  echo
-  echo "boilchangeip 已彻底卸载。"
+  if [[ "$PURGE" == true ]]; then
+    local config_path
+    local managed_path
+    config_path="$(validate_remove_path "$CONFIG_DIR")"
+    managed_path="$(validate_remove_path "$MANAGED_ROOT")"
+    remove_path "$config_path"
+    remove_path "$managed_path"
+    echo "彻底卸载完成。"
+  else
+    echo "卸载完成，已保留配置: $CONFIG_DIR"
+    echo "如需删除配置和安装器源码，请运行: ./uninstall.sh --purge"
+  fi
+
   echo "Rust、Cargo、Git 和用户自己 clone 的仓库已保留。"
 }
 

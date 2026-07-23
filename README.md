@@ -37,6 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh |
 
 更新过程会拉取源码、重新编译并替换程序，现有 `config.env` 保持不变。
 更新时会停止服务后替换二进制，避免 `Text file busy`，随后自动重启并验证服务。
+更新前会把 `/etc/boil` 备份到带时间戳的安全目录，失败时会恢复该配置备份并尝试恢复服务。
 
 ### 卸载
 
@@ -44,9 +45,15 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh |
 curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/uninstall.sh | bash
 ```
 
-卸载脚本默认彻底卸载，会要求输入 `DELETE` 确认，然后删除 systemd 服务、
-二进制、`/etc/boil` 配置和安装器维护的源码目录。Rust、Cargo、Git 以及用户
-自己 clone 的仓库不会被删除。
+普通卸载会删除 systemd 服务和二进制，但保留 `/etc/boil` 配置。彻底卸载需要
+在本地运行：
+
+```bash
+./uninstall.sh --purge
+```
+
+`--purge` 会要求输入 `DELETE`，然后额外删除 `/etc/boil` 和安装器维护的
+`/opt/boilchangeip`。Rust、Cargo、Git 以及用户自己 clone 的仓库不会被删除。
 
 ## 配置
 
@@ -229,7 +236,16 @@ bash install.sh
 ```
 
 还可以使用 `BOIL_BRANCH` 指定源码分支，默认是 `main`。`update.sh` 支持
-`main` 和 `develop`，并会拒绝覆盖安装器源码目录中的未提交修改。
+`main` 和 `develop`，并会拒绝覆盖安装器源码目录中的未提交修改。安装和更新
+也支持指定版本：
+
+```bash
+BOIL_VERSION=2.0.2 bash install.sh
+BOIL_TAG=v2.0.2 bash update.sh
+BOIL_BRANCH=develop bash update.sh
+```
+
+指定不存在的版本或分支会明确报错，不会破坏当前安装。
 
 ## 旧配置迁移
 

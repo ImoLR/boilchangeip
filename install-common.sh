@@ -9,6 +9,7 @@ INSTALL_DIR="${BOIL_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${BOIL_CONFIG_DIR:-/etc/boil}"
 MANAGED_ROOT="${BOIL_MANAGED_ROOT:-/opt/boilchangeip}"
 SOURCE_DIR="${BOIL_SOURCE_DIR:-$MANAGED_ROOT/source}"
+BACKUP_ROOT="${BOIL_BACKUP_ROOT:-/var/backups/boilchangeip}"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
 common_die() {
@@ -43,6 +44,10 @@ write_privileged_file() {
     run_privileged install -m 0644 "$tmp" "$path"
   fi
   rm -f -- "$tmp"
+}
+
+timestamp_utc() {
+  date -u +"%Y%m%dT%H%M%SZ"
 }
 
 detect_package_manager() {
@@ -155,6 +160,12 @@ service_is_active() {
   systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"
 }
 
+service_exists() {
+  systemctl_available &&
+    (systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 ||
+      systemctl status "$SERVICE_NAME" >/dev/null 2>&1)
+}
+
 stop_service_if_present() {
   if systemctl_available && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1; then
     if systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -168,6 +179,26 @@ restart_service_if_enabled() {
   if systemctl_available && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
     echo "重启服务: $SERVICE_NAME"
     run_privileged systemctl restart "$SERVICE_NAME"
+  fi
+}
+
+remove_systemd_service() {
+  if service_exists; then
+    run_privileged systemctl disable --now "$SERVICE_NAME" || true
+  fi
+
+  if [[ -e "$SERVICE_PATH" || -L "$SERVICE_PATH" ]]; then
+    if [[ -w "$(dirname "$SERVICE_PATH")" ]]; then
+      rm -f -- "$SERVICE_PATH"
+    else
+      run_privileged rm -f -- "$SERVICE_PATH"
+    fi
+    echo "已删除服务文件: $SERVICE_PATH"
+  fi
+
+  if systemctl_available; then
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl reset-failed "$SERVICE_NAME" || true
   fi
 }
 
@@ -221,6 +252,49 @@ configure_if_missing() {
   echo "首次安装需要配置 Boil Token 和可选 Telegram 信息。"
   "$INSTALL_DIR/$BIN_NAME" setup </dev/tty >/dev/tty
   [[ -f "$CONFIG_DIR/config.env" ]] || common_die "配置向导未生成 $CONFIG_DIR/config.env"
+}
+
+backup_config_dir() {
+  local backup_path
+  backup_path="$BACKUP_ROOT/config-$(timestamp_utc)"
+
+  if [[ ! -d "$CONFIG_DIR" ]]; then
+    echo "未检测到配置目录，跳过配置备份。" >&2
+    echo ""
+    return
+  fi
+
+  if [[ -w "$(dirname "$BACKUP_ROOT")" ]]; then
+    mkdir -p "$BACKUP_ROOT"
+    chmod 0700 "$BACKUP_ROOT"
+    cp -a -- "$CONFIG_DIR" "$backup_path"
+  else
+    run_privileged mkdir -p "$BACKUP_ROOT"
+    run_privileged chmod 0700 "$BACKUP_ROOT"
+    run_privileged cp -a -- "$CONFIG_DIR" "$backup_path"
+  fi
+
+  echo "已备份配置目录: $backup_path" >&2
+  echo "$backup_path"
+}
+
+restore_config_dir() {
+  local backup_path="$1"
+
+  [[ -n "$backup_path" ]] || return
+  [[ -d "$backup_path" ]] || {
+    echo "配置备份不存在，无法恢复: $backup_path" >&2
+    return
+  }
+
+  echo "恢复配置目录: $CONFIG_DIR"
+  if [[ -w "$(dirname "$CONFIG_DIR")" ]]; then
+    rm -rf -- "$CONFIG_DIR"
+    cp -a -- "$backup_path" "$CONFIG_DIR"
+  else
+    run_privileged rm -rf -- "$CONFIG_DIR"
+    run_privileged cp -a -- "$backup_path" "$CONFIG_DIR"
+  fi
 }
 
 print_install_summary() {

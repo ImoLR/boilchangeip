@@ -462,6 +462,10 @@ mod tests {
             name: format!("Server {id}"),
             token: SecretToken::from_test_value(&test_credential()),
             enabled,
+            address: None,
+            country: None,
+            flag: None,
+            resolved_ip: None,
             timer: None,
         }
     }
@@ -472,6 +476,8 @@ mod tests {
             global_timer: None,
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         }
     }

@@ -37,6 +37,9 @@ pub enum TimerUpdate {
 pub struct TimerServerStatus {
     pub server_id: String,
     pub server_name: String,
+    pub address: Option<String>,
+    pub country: Option<String>,
+    pub flag: Option<String>,
     pub server_enabled: bool,
     pub timer_enabled: bool,
     pub time: Option<String>,
@@ -81,6 +84,12 @@ impl TimerManager {
         apply_timer_update(&mut next, update)?;
         save_app_config(&next)?;
         self.config = Arc::new(next);
+        self.reload().await?;
+        Ok(())
+    }
+
+    pub async fn replace_config(&mut self, config: AppConfig) -> anyhow::Result<()> {
+        self.config = Arc::new(config);
         self.reload().await?;
         Ok(())
     }
@@ -180,6 +189,9 @@ pub fn timer_status(config: &AppConfig) -> TimerStatus {
                 TimerServerStatus {
                     server_id: server.id.clone(),
                     server_name: server.name.clone(),
+                    address: server.address.clone(),
+                    country: server.country.clone(),
+                    flag: server.flag.clone(),
                     server_enabled: server.enabled,
                     timer_enabled,
                     time,
@@ -464,6 +476,10 @@ mod tests {
                     name: "A".to_string(),
                     token: SecretToken::from_test_value("token-a"),
                     enabled: true,
+                    address: None,
+                    country: None,
+                    flag: None,
+                    resolved_ip: None,
                     timer: Some(ServerTimerConfig {
                         enabled: true,
                         cron: Some("0 */6 * * *".to_string()),
@@ -474,6 +490,10 @@ mod tests {
                     name: "B".to_string(),
                     token: SecretToken::from_test_value("token-b"),
                     enabled: false,
+                    address: None,
+                    country: None,
+                    flag: None,
+                    resolved_ip: None,
                     timer: Some(ServerTimerConfig {
                         enabled: true,
                         cron: Some("0 */6 * * *".to_string()),
@@ -483,6 +503,8 @@ mod tests {
             global_timer: None,
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         }
     }
@@ -493,6 +515,10 @@ mod tests {
             name: format!("Server {id}"),
             token: SecretToken::from_test_value(&format!("token-{id}")),
             enabled: true,
+            address: None,
+            country: None,
+            flag: None,
+            resolved_ip: None,
             timer: cron.map(|cron| ServerTimerConfig {
                 enabled: timer_enabled,
                 cron: Some(cron.to_string()),
@@ -593,6 +619,8 @@ mod tests {
             global_timer: None,
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         };
 
@@ -634,6 +662,8 @@ mod tests {
             }),
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         };
 
@@ -679,6 +709,8 @@ mod tests {
             }),
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         };
 
@@ -706,6 +738,8 @@ mod tests {
             }),
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         };
 
@@ -733,6 +767,8 @@ mod tests {
             }),
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         };
 
@@ -765,6 +801,8 @@ mod tests {
             }),
             tg_token: None,
             tg_chat_id: None,
+            tg_pair_code: None,
+            tg_pair_expires_at: None,
             migration_notice: None,
         });
         let mut manager = TimerManager::new(config).await.unwrap();

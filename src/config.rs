@@ -1,18 +1,32 @@
 use anyhow::Context as _;
 use dialoguer::{Confirm, Input};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use teloxide::prelude::*;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const BOIL_SERVERS_ENV: &str = "BOIL_SERVERS";
 const BOIL_GLOBAL_TIMER_ENV: &str = "BOIL_GLOBAL_TIMER";
+const TG_PAIR_CODE_ENV: &str = "TG_PAIR_CODE";
+const TG_PAIR_EXPIRES_AT_ENV: &str = "TG_PAIR_EXPIRES_AT";
+const TG_PAIR_TTL_SECONDS: u64 = 300;
 
 #[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SecretToken(String);
 
 impl SecretToken {
+    pub fn new(value: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(!value.trim().is_empty(), "Token 不能为空");
+        Ok(Self(value))
+    }
+
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
@@ -39,6 +53,34 @@ impl fmt::Display for SecretToken {
     }
 }
 
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PairingCode(String);
+
+impl PairingCode {
+    pub fn new(value: String) -> anyhow::Result<Self> {
+        let trimmed = value.trim().to_ascii_uppercase();
+        anyhow::ensure!(!trimmed.is_empty(), "配对码不能为空");
+        Ok(Self(trimmed))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for PairingCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ServerTimerConfig {
     pub enabled: bool,
@@ -52,6 +94,14 @@ pub struct ServerConfig {
     pub token: SecretToken,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer: Option<ServerTimerConfig>,
 }
 
@@ -61,6 +111,8 @@ pub struct AppConfig {
     pub global_timer: Option<ServerTimerConfig>,
     pub tg_token: Option<String>,
     pub tg_chat_id: Option<String>,
+    pub tg_pair_code: Option<PairingCode>,
+    pub tg_pair_expires_at: Option<u64>,
     pub migration_notice: Option<String>,
 }
 
@@ -71,6 +123,11 @@ impl fmt::Debug for AppConfig {
             .field("global_timer", &self.global_timer)
             .field("tg_token", &self.tg_token.as_ref().map(|_| "<redacted>"))
             .field("tg_chat_id", &self.tg_chat_id)
+            .field(
+                "tg_pair_code",
+                &self.tg_pair_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tg_pair_expires_at", &self.tg_pair_expires_at)
             .field("migration_notice", &self.migration_notice)
             .finish()
     }
@@ -106,6 +163,8 @@ impl AppConfig {
                     global_timer: parse_global_timer(&vars)?,
                     tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
                     tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
+                    tg_pair_code: parse_pairing_code(&vars)?,
+                    tg_pair_expires_at: parse_pair_expires_at(&vars)?,
                     migration_notice: Some(legacy_config_migration_notice().to_string()),
                 });
             }
@@ -121,6 +180,8 @@ impl AppConfig {
             global_timer: parse_global_timer(&vars)?,
             tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
             tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
+            tg_pair_code: parse_pairing_code(&vars)?,
+            tg_pair_expires_at: parse_pair_expires_at(&vars)?,
             migration_notice: None,
         })
     }
@@ -133,7 +194,7 @@ impl AppConfig {
     }
 
     pub fn has_tg(&self) -> bool {
-        self.tg_token.is_some() && self.tg_chat_id.is_some()
+        self.tg_token.is_some()
     }
 }
 
@@ -178,8 +239,24 @@ pub(crate) fn save_app_config_to_path(
         }
         None => None,
     };
+    let tg_chat_id_line = config
+        .tg_chat_id
+        .as_ref()
+        .map(|chat_id| format!("TG_CHAT_ID={}", shell_single_quote(chat_id)));
+    let tg_pair_code_line = config.tg_pair_code.as_ref().map(|code| {
+        format!(
+            "{TG_PAIR_CODE_ENV}={}",
+            shell_single_quote(code.expose_secret())
+        )
+    });
+    let tg_pair_expires_at_line = config
+        .tg_pair_expires_at
+        .map(|expires_at| format!("{TG_PAIR_EXPIRES_AT_ENV}={expires_at}"));
     let mut replaced = false;
     let mut global_replaced = false;
+    let mut tg_chat_id_replaced = false;
+    let mut tg_pair_code_replaced = false;
+    let mut tg_pair_expires_at_replaced = false;
     let mut lines = Vec::new();
 
     for line in existing.lines() {
@@ -192,6 +269,23 @@ pub(crate) fn save_app_config_to_path(
                 lines.push(line.clone());
             }
             global_replaced = true;
+        } else if trimmed.starts_with("TG_CHAT_ID=") {
+            if let Some(line) = &tg_chat_id_line {
+                lines.push(line.clone());
+            } else {
+                lines.push(line.to_string());
+            }
+            tg_chat_id_replaced = true;
+        } else if trimmed.starts_with(&format!("{TG_PAIR_CODE_ENV}=")) {
+            if let Some(line) = &tg_pair_code_line {
+                lines.push(line.clone());
+            }
+            tg_pair_code_replaced = true;
+        } else if trimmed.starts_with(&format!("{TG_PAIR_EXPIRES_AT_ENV}=")) {
+            if let Some(line) = &tg_pair_expires_at_line {
+                lines.push(line.clone());
+            }
+            tg_pair_expires_at_replaced = true;
         } else {
             lines.push(line.to_string());
         }
@@ -203,6 +297,21 @@ pub(crate) fn save_app_config_to_path(
     if !global_replaced {
         if let Some(line) = global_timer_line {
             lines.insert(1.min(lines.len()), line);
+        }
+    }
+    if !tg_chat_id_replaced {
+        if let Some(line) = tg_chat_id_line {
+            lines.push(line);
+        }
+    }
+    if !tg_pair_code_replaced {
+        if let Some(line) = tg_pair_code_line {
+            lines.push(line);
+        }
+    }
+    if !tg_pair_expires_at_replaced {
+        if let Some(line) = tg_pair_expires_at_line {
+            lines.push(line);
         }
     }
 
@@ -217,9 +326,22 @@ pub(crate) fn save_app_config_to_path(
     let temp_path = path.with_extension("env.tmp");
     std::fs::write(&temp_path, content)
         .with_context(|| format!("无法写入临时配置文件: {}", temp_path.display()))?;
+    set_private_file_permissions(&temp_path)?;
     std::fs::rename(&temp_path, path)
         .with_context(|| format!("无法更新配置文件: {}", path.display()))?;
+    set_private_file_permissions(path)?;
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("无法设置配置文件权限: {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -309,6 +431,23 @@ fn has_legacy_boil_config(vars: &[(&str, &str)]) -> bool {
     .any(|legacy_key| find_var(vars, legacy_key).is_some())
 }
 
+fn parse_pairing_code(vars: &[(&str, &str)]) -> anyhow::Result<Option<PairingCode>> {
+    find_var(vars, TG_PAIR_CODE_ENV)
+        .map(|code| PairingCode::new(code.to_string()))
+        .transpose()
+}
+
+fn parse_pair_expires_at(vars: &[(&str, &str)]) -> anyhow::Result<Option<u64>> {
+    find_var(vars, TG_PAIR_EXPIRES_AT_ENV)
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .context("TG_PAIR_EXPIRES_AT 必须是 Unix 时间戳")
+        })
+        .transpose()
+}
+
 fn parse_global_timer(vars: &[(&str, &str)]) -> anyhow::Result<Option<ServerTimerConfig>> {
     let Some(timer_json) = find_var(vars, BOIL_GLOBAL_TIMER_ENV) else {
         return Ok(None);
@@ -380,12 +519,18 @@ fn setup_save_path() -> PathBuf {
 }
 
 /// 构建新版配置内容：只写 BOIL_SERVERS 和 TG 配置，不写旧账号密码。
+struct TgSetupConfig<'a> {
+    token: &'a str,
+    pair_code: &'a PairingCode,
+    pair_expires_at: u64,
+}
+
 fn build_config_content(
     existing: &str,
     server_id: &str,
     server_name: &str,
     token: &str,
-    tg: Option<(&str, &str)>,
+    tg: Option<TgSetupConfig<'_>>,
 ) -> anyhow::Result<String> {
     validate_server_id(server_id)?;
     anyhow::ensure!(!server_name.trim().is_empty(), "server name 不能为空");
@@ -404,8 +549,13 @@ fn build_config_content(
     let mut content = format!("BOIL_SERVERS={}\n", shell_single_quote(&servers_json));
 
     match tg {
-        Some((token, chat_id)) => {
-            content.push_str(&format!("TG_TOKEN='{token}'\nTG_CHAT_ID='{chat_id}'\n"));
+        Some(tg) => {
+            content.push_str(&format!(
+                "TG_TOKEN={}\n{TG_PAIR_CODE_ENV}={}\n{TG_PAIR_EXPIRES_AT_ENV}={}\n",
+                shell_single_quote(tg.token),
+                shell_single_quote(tg.pair_code.expose_secret()),
+                tg.pair_expires_at
+            ));
         }
         None => {
             let tg_lines: String = existing
@@ -417,6 +567,37 @@ fn build_config_content(
         }
     }
     Ok(content)
+}
+
+fn generate_pairing_code() -> anyhow::Result<PairingCode> {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0_u8; 8];
+    OsRng.try_fill_bytes(&mut bytes)?;
+    let code = bytes
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            let value = ALPHABET[usize::from(*byte) % ALPHABET.len()] as char;
+            if index == 4 {
+                format!("-{value}")
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<String>();
+    PairingCode::new(code)
+}
+
+fn pairing_expires_at() -> anyhow::Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TG_PAIR_TTL_SECONDS)
+}
+
+async fn validate_tg_token(token: &str) -> anyhow::Result<()> {
+    Bot::new(token)
+        .get_me()
+        .await
+        .context("Bot Token 验证失败")?;
+    Ok(())
 }
 
 pub async fn run_setup_wizard() -> anyhow::Result<()> {
@@ -444,8 +625,10 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
         let tg_token: String = Input::new()
             .with_prompt("Bot Token（从 @BotFather 获取）")
             .interact_text()?;
-        let chat_id: String = Input::new().with_prompt("TG_CHAT_ID").interact_text()?;
-        Some((tg_token, chat_id))
+        validate_tg_token(&tg_token).await?;
+        let pair_code = generate_pairing_code()?;
+        let pair_expires_at = pairing_expires_at()?;
+        Some((tg_token, pair_code, pair_expires_at))
     } else {
         None
     };
@@ -454,10 +637,21 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
     let tg_refs = tg
         .as_ref()
-        .map(|(token, chat_id)| (token.as_str(), chat_id.as_str()));
+        .map(|(token, pair_code, pair_expires_at)| TgSetupConfig {
+            token: token.as_str(),
+            pair_code,
+            pair_expires_at: *pair_expires_at,
+        });
     let content = build_config_content(&existing, &server_id, &server_name, &token, tg_refs)?;
     std::fs::write(&save_path, content)?;
+    set_private_file_permissions(&save_path)?;
     println!("✅ 新版配置已保存到 {}\n", save_path.display());
+
+    if let Some((_, pair_code, _)) = &tg {
+        println!("请在 Telegram Bot 中发送：");
+        println!("/pair {}", pair_code.expose_secret());
+        println!("并等待配对结果。配对码 5 分钟内有效且只能使用一次。\n");
+    }
 
     println!("常用命令:");
     println!("  boil servers list          查看 VPS");
@@ -528,7 +722,16 @@ mod tests {
         }
     }
 
-    /// 复现并验证修复：重新配置 TG 时不应产生重复的 TG_ 行，且新值生效。
+    fn tg_setup(token: &str) -> TgSetupConfig<'_> {
+        let pair_code = Box::leak(Box::new(PairingCode::new("TEST-CODE".to_string()).unwrap()));
+        TgSetupConfig {
+            token,
+            pair_code,
+            pair_expires_at: 1_782_732_942,
+        }
+    }
+
+    /// 复现并验证修复：重新配置 TG 时不应产生重复的 TG_ 行，且使用配对码而不是 Chat ID。
     #[test]
     fn reconfigure_tg_no_duplicate() {
         let existing = "BOIL_SERVERS='[]'\nTG_TOKEN='oldtoken'\nTG_CHAT_ID='111'\n";
@@ -537,18 +740,21 @@ mod tests {
             "primary",
             "Primary VPS",
             "new-server-token",
-            Some(("newtoken", "222")),
+            Some(tg_setup("newtoken")),
         )
         .unwrap();
 
         assert_eq!(out.matches("TG_TOKEN=").count(), 1, "TG_TOKEN 应只出现一次");
         assert_eq!(
             out.matches("TG_CHAT_ID=").count(),
-            1,
-            "TG_CHAT_ID 应只出现一次"
+            0,
+            "setup 不应直接写入 TG_CHAT_ID"
         );
+        assert_eq!(out.matches("TG_PAIR_CODE=").count(), 1);
+        assert_eq!(out.matches("TG_PAIR_EXPIRES_AT=").count(), 1);
         assert!(out.contains("TG_TOKEN='newtoken'"));
-        assert!(out.contains("TG_CHAT_ID='222'"));
+        assert!(out.contains("TG_PAIR_CODE='TEST-CODE'"));
+        assert!(out.contains("TG_PAIR_EXPIRES_AT=1782732942"));
         assert!(!out.contains("oldtoken"), "旧 token 不应残留");
         assert!(out.contains("BOIL_SERVERS="));
     }
@@ -571,7 +777,7 @@ mod tests {
             "primary",
             "Primary VPS",
             "token",
-            Some(("t", "c")),
+            Some(tg_setup("t")),
         )
         .unwrap();
         assert!(!out.contains("CHANGE_CRON="));
@@ -831,7 +1037,37 @@ mod tests {
         assert!(saved.contains("45 4 * * *"));
         assert!(saved.contains("TG_TOKEN='keep'"));
         assert!(saved.contains("TG_CHAT_ID='123'"));
+        assert_private_permissions(&path);
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_private_permissions(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(not(unix))]
+    fn assert_private_permissions(_path: &std::path::Path) {}
+
+    #[test]
+    fn save_app_config_file_permissions_are_private() {
+        let dir = std::env::temp_dir().join(format!(
+            "boilchangeip-config-permission-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        std::fs::write(&path, "TG_TOKEN='keep'\nBOIL_SERVERS='[]'\n").unwrap();
+
+        let app = app_from_servers_json(ONE_SERVER).unwrap();
+        save_app_config_to_path(&app, &path).unwrap();
+
+        assert_private_permissions(&path);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

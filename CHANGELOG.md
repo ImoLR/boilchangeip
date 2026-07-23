@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.1.0 - 2026-07-23
+
+### 新增
+
+- Telegram Bot 新增一次性配对码流程，`boil setup` 生成 `/pair CODE`，成功后自动保存 `TG_CHAT_ID` 并同步 Menu。
+- Telegram `/start` 改为 Inline Keyboard 主菜单，支持直接进入添加服务器、服务器列表、状态、换 IP、Timer 和帮助。
+- Telegram 新增交互式添加服务器向导，支持名称、地址、Token 分步录入，并自动识别国家/地区和国旗。
+- Telegram `/servers` 支持服务器管理按钮：状态、换 IP、定时任务、编辑、删除、上移和下移。
+- Telegram 新增服务器编辑流程，支持修改名称、地址、Token 和重新验证。
+- Telegram 新增服务器删除确认流程，删除服务器时同步删除该服务器自己的定时任务。
+- Telegram `/status` 新增本地生成的图片卡片，显示服务器名称、地区、地址、状态和下次换 IP 倒计时。
+
+### 改进
+
+- 服务器展示统一为用户填写名称、国家/地区和地址，不显示内部 server id 或 Token。
+- 图片卡片生成失败或 Telegram `sendPhoto` 失败时自动回退为安全文本。
+- Bot 代码拆分为命令、callback、配对、添加向导、编辑、删除、列表、格式化、状态和 Timer UI 等模块。
+- 状态卡倒计时不再引入额外 `chrono` 直接依赖，复用项目现有 HH:MM 解析逻辑。
+
+### 兼容性
+
+- v2.0.2 的 `BOIL_SERVERS` 配置可直接读取；新增的 `address`、`country`、`flag` 和 `resolved_ip` 字段均为可选。
+- 已存在 `TG_CHAT_ID` 的配置继续有效，不需要重新配对。
+- 重新保存配置时继续保留 Token、服务器名称、启用状态、全局定时和每台服务器定时。
+
+### 安全
+
+- 未完成配对前，除 `/start` 和 `/pair` 外的管理命令均拒绝访问。
+- 已绑定后，其他 chat 的普通消息和 callback 都会被拒绝。
+- Token、配对码和服务器地址不会进入 Telegram callback；Token 不会展示在状态卡或服务器列表中。
+
 ## v2.0.2 - 2026-07-23
 
 ### 改进

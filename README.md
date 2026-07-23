@@ -9,6 +9,8 @@
 - 提供 CLI 状态查询、IP 检测和换 IP 操作
 - Telegram Bot 支持 VPS 选择与二次确认
 - Telegram Bot 支持原生命令菜单和 `/timer` 可视化管理定时任务
+- Telegram Bot 支持交互式配对、添加/编辑/删除/排序服务器
+- `/status` 支持手机友好的图片卡片，失败时自动回退为文本
 - Timer 支持独立的“全部 Server”任务和每台 VPS 的单独任务
 - `changeIP` 每次操作只提交一次，验证阶段只轮询 `getIP`
 
@@ -80,7 +82,7 @@ BOIL_SERVERS='[
 ]'
 
 TG_TOKEN='your-bot-token'
-TG_CHAT_ID='your-chat-id'
+# TG_CHAT_ID 由 boil setup 生成配对码后自动写入，请不要手动填写。
 
 # 可选：独立的“全部 Server”定时任务。
 # 触发时会按配置顺序顺序处理所有 enabled=true 的 Server。
@@ -154,9 +156,11 @@ boil setup
 
 ## Telegram
 
-在 `config.env` 中配置 `TG_TOKEN` 和 `TG_CHAT_ID` 后运行：
+在 `config.env` 中配置 `TG_TOKEN` 后，先运行 `boil setup` 生成一次性配对码，再启动 Bot：
 
 ```bash
+boil setup
+# 按终端提示在 Telegram 中发送 /pair 配对码
 boil bot
 ```
 
@@ -171,9 +175,45 @@ boil bot
 | `/change` | 选择 VPS 后二次确认；即使只有一台也需要确认 |
 | `/change hk-01` | 对指定 VPS 发起二次确认 |
 | `/timer` | 管理全部 Server 和单台 VPS 的定时换 IP |
+| `/servers` | 查看服务器列表，并进入状态、更换 IP、定时、编辑、删除和排序操作 |
+| `/addserver` | 启动添加服务器向导 |
 
 Bot 启动时会同步 Telegram 原生命令菜单，私聊输入框左下角可直接打开 Menu。
-菜单包含 `/start`、`/help`、`/status`、`/check`、`/change` 和 `/timer`。
+菜单包含 `/start`、`/status`、`/change`、`/timer`、`/servers`、`/addserver` 和 `/help`。`/check` 仍可使用，但不显示在原生命令菜单中。
+
+首次配对流程：
+
+1. 运行 `boil setup`。
+2. 终端显示一次性 `/pair CODE`，有效期 5 分钟。
+3. 在 Telegram Bot 私聊中发送终端提示的 `/pair CODE`。
+4. 配对成功后，程序自动保存 `TG_CHAT_ID`，同步命令菜单和 Menu 按钮。
+
+未配对前，`/start` 只提示先完成配对，其他管理命令会拒绝访问。已绑定后，
+`/pair` 不能覆盖现有绑定，其他聊天和 callback 都会被拒绝。
+
+服务器管理：
+
+- `/addserver` 会依次要求输入服务器名称、服务器地址和 Token。
+- 服务器地址支持 IPv4、IPv6 和域名；输入 `http://` 或 `https://` 时会自动取主机名。
+- Bot 会尝试识别国家/地区和国旗，失败时显示 `🌐 未知地区`，不阻止保存。
+- `/servers` 按配置顺序展示服务器，支持查看状态、更换 IP、管理定时、编辑、删除和上移/下移。
+- 编辑名称、地址、Token 后会立即刷新内存配置和 TimerManager，无需重启 Bot。
+- 修改 Token 会先验证，验证失败不会覆盖旧 Token。
+- 删除服务器需要二次确认，删除后只移除该服务器及其单机定时任务，不影响全局定时任务和其他服务器。
+
+服务器展示统一使用：
+
+```text
+📡 服务器名称
+
+🇭🇰 中国香港
+203.0.113.10
+```
+
+不会显示内部 server id、Token 或旧版 router/interface 信息。
+
+`/status` 默认发送每台服务器一张图片卡片，包含服务器名称、地区、地址、状态和下次换 IP 倒计时。
+图片在本地临时生成，不依赖在线制图服务；图片生成或 Telegram `sendPhoto` 失败时，会自动回退为安全文本。
 
 `/timer` 面板显示当前时区、全局任务、每台 Server 的定时状态和每天执行时间。
 支持新建、编辑、关闭和刷新。关闭只会设置 `enabled=false`，保留原时间，后续
@@ -240,14 +280,20 @@ bash install.sh
 也支持指定版本：
 
 ```bash
-BOIL_VERSION=2.0.2 bash install.sh
-BOIL_TAG=v2.0.2 bash update.sh
+BOIL_VERSION=2.1.0 bash install.sh
+BOIL_TAG=v2.1.0 bash update.sh
 BOIL_BRANCH=develop bash update.sh
 ```
 
 指定不存在的版本或分支会明确报错，不会破坏当前安装。
 
 ## 旧配置迁移
+
+从 v2.0.2 升级到 v2.1.0 不需要手动迁移 `BOIL_SERVERS`。新增的
+`address`、`country`、`flag` 和 `resolved_ip` 字段都是可选字段；旧配置可直接读取。
+重新保存配置时会保留服务器 Token、名称、启用状态、全局定时和每台服务器定时。
+
+如果已经存在 `TG_CHAT_ID`，Bot 会继续使用现有绑定，不会要求重新配对。
 
 旧版 `BOIL_ACCOUNT`、`BOIL_PASSWORD`、`BOIL_ROUTER_ID` 和
 `BOIL_INTERFACE` 已废弃。当前主路径不再使用旧 `/login`、

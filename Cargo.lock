@@ -127,7 +127,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "boil"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "chrono-tz",

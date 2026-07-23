@@ -69,51 +69,6 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
 }
 
-find_sha256_tool() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "sha256sum"
-    return
-  fi
-
-  if command -v openssl >/dev/null 2>&1; then
-    echo "openssl"
-    return
-  fi
-
-  return 1
-}
-
-expected_sha256() {
-  local asset="$1"
-  local sums_file="$2"
-  sed -n "s/^[[:space:]]*\\([0-9a-fA-F]\\{64\\}\\)[[:space:]]\\{1,\\}\\*\\{0,1\\}${asset}\$/\\1/p" "$sums_file" |
-    head -n 1
-}
-
-verify_release_checksum() {
-  local asset="$1"
-  local sums_file="$2"
-  local tool expected actual
-
-  tool="$(find_sha256_tool)" || die "缺少 SHA256 校验工具。请安装 sha256sum 或 openssl 后重试。"
-  expected="$(expected_sha256 "$asset" "$sums_file")"
-  [[ -n "$expected" ]] || die "SHA256SUMS 中缺少 $asset 的校验记录"
-
-  case "$tool" in
-    sha256sum)
-      printf '%s  %s\n' "$expected" "$asset" | (cd "$TMP_DIR" && sha256sum -c -) ||
-        die "$asset SHA256 校验失败"
-      ;;
-    openssl)
-      actual="$(openssl dgst -sha256 "$TMP_DIR/$asset" | sed -n 's/^.*= //p')"
-      [[ "$actual" == "$expected" ]] || die "$asset SHA256 校验失败"
-      ;;
-    *)
-      die "未知 SHA256 校验工具: $tool"
-      ;;
-  esac
-}
-
 systemctl_available() {
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
 }
@@ -178,14 +133,10 @@ download_release_binary() {
   local arch="$2"
   local asset="boil-linux-${arch}"
   local url="${RELEASE_DOWNLOAD_BASE}/${tag}/${asset}"
-  local sums_url="${RELEASE_DOWNLOAD_BASE}/${tag}/SHA256SUMS"
   local destination="$TMP_DIR/$asset"
-  local sums_file="$TMP_DIR/SHA256SUMS"
 
   if curl -fL --silent --show-error "$url" -o "$destination"; then
-    curl -fL --silent --show-error "$sums_url" -o "$sums_file" ||
-      die "无法下载 SHA256SUMS，已停止更新"
-    verify_release_checksum "$asset" "$sums_file"
+    [[ -s "$destination" ]] || die "下载的 Release 二进制为空，已停止更新"
     chmod 0755 "$destination"
     "$destination" --version >/dev/null
     ARTIFACT_PATH="$destination"

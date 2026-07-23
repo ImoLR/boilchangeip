@@ -6,6 +6,8 @@ set -euo pipefail
 
 REPO_URL="${BOIL_REPO_URL:-https://github.com/ImoLR/boilchangeip.git}"
 BRANCH="${BOIL_BRANCH:-main}"
+VERSION="${BOIL_VERSION:-}"
+TAG="${BOIL_TAG:-$VERSION}"
 MANAGED_ROOT="${BOIL_MANAGED_ROOT:-/opt/boilchangeip}"
 SOURCE_DIR="${BOIL_SOURCE_DIR:-$MANAGED_ROOT/source}"
 
@@ -86,6 +88,48 @@ ensure_clean_worktree() {
     die "源码目录存在未提交修改，拒绝覆盖: $SOURCE_DIR"
 }
 
+normalize_tag() {
+  local tag="$1"
+  if [[ -z "$tag" ]]; then
+    return
+  fi
+  if [[ "$tag" == v* ]]; then
+    echo "$tag"
+  else
+    echo "v$tag"
+  fi
+}
+
+target_ref_description() {
+  local tag
+  tag="$(normalize_tag "$TAG")"
+  if [[ -n "$tag" ]]; then
+    echo "tag $tag"
+  else
+    echo "branch $BRANCH"
+  fi
+}
+
+checkout_target_ref() {
+  local tag
+  tag="$(normalize_tag "$TAG")"
+  git -C "$SOURCE_DIR" fetch origin --tags
+  if [[ -n "$tag" ]]; then
+    git -C "$SOURCE_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null ||
+      die "指定版本不存在: $tag"
+    git -C "$SOURCE_DIR" checkout --detach "refs/tags/$tag"
+  else
+    git -C "$SOURCE_DIR" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null ||
+      die "远程分支不存在: $BRANCH"
+    if git -C "$SOURCE_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      git -C "$SOURCE_DIR" checkout "$BRANCH"
+    else
+      git -C "$SOURCE_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+    fi
+    git -C "$SOURCE_DIR" merge --ff-only "origin/$BRANCH"
+  fi
+}
+
 prepare_source() {
   if [[ -d "$SOURCE_DIR/.git" ]]; then
     local origin_url
@@ -93,16 +137,15 @@ prepare_source() {
     [[ "$origin_url" == "$REPO_URL" ]] ||
       die "源码目录 origin 为 $origin_url，预期为 $REPO_URL"
     ensure_clean_worktree
-    git -C "$SOURCE_DIR" fetch origin "$BRANCH"
-    git -C "$SOURCE_DIR" checkout "$BRANCH"
-    git -C "$SOURCE_DIR" merge --ff-only "origin/$BRANCH"
+    checkout_target_ref
     return
   fi
 
   [[ ! -e "$SOURCE_DIR" ]] || die "源码目录已存在但不是 Git 仓库: $SOURCE_DIR"
   ensure_parent_dir
-  echo "克隆源码: $REPO_URL ($BRANCH)"
-  git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$SOURCE_DIR"
+  echo "克隆源码: $REPO_URL ($(target_ref_description))"
+  git clone "$REPO_URL" "$SOURCE_DIR"
+  checkout_target_ref
 }
 
 main() {

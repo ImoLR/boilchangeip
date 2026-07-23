@@ -397,8 +397,15 @@ fn draw_text_mut(
         let glyph_id = scaled.glyph_id(ch);
         let glyph: Glyph = glyph_id.with_scale_and_position(scale, caret);
         if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
             outlined.draw(|gx, gy, coverage| {
-                blend_pixel(image, gx as i32, gy as i32, color, coverage);
+                blend_pixel(
+                    image,
+                    bounds.min.x as i32 + gx as i32,
+                    bounds.min.y as i32 + gy as i32,
+                    color,
+                    coverage,
+                );
             });
         }
         caret.x += scaled.h_advance(glyph_id);
@@ -551,6 +558,21 @@ mod tests {
         if let Ok(card) = result {
             assert!(card.path().exists());
         }
+    }
+
+    #[test]
+    fn rendered_card_contains_dark_text_pixels() {
+        let data = sample_data();
+        let Ok(card) = TempStatusCard::render(&data) else {
+            return;
+        };
+        let image = image::open(card.path()).unwrap().to_rgba8();
+        let dark_pixels = image
+            .pixels()
+            .filter(|pixel| pixel[0] < 120 && pixel[1] < 130 && pixel[2] < 145)
+            .count();
+
+        assert!(dark_pixels > 1_000, "status card text did not render");
     }
 
     #[test]

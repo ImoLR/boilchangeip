@@ -200,12 +200,15 @@ impl AppConfig {
 
 pub fn load_app_config() -> anyhow::Result<AppConfig> {
     let path = config_path();
+    let mut owned_vars: Vec<(String, String)> = Vec::new();
     if path.exists() {
-        dotenvy::from_path(&path).ok();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
+        owned_vars.extend(parse_config_env_content(&content)?);
+    } else {
+        dotenvy::dotenv().ok();
     }
-    dotenvy::dotenv().ok();
-
-    let owned_vars: Vec<(String, String)> = std::env::vars().collect();
+    owned_vars.extend(std::env::vars());
     let borrowed_vars: Vec<(&str, &str)> = owned_vars
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -259,15 +262,18 @@ pub(crate) fn save_app_config_to_path(
     let mut tg_pair_expires_at_replaced = false;
     let mut lines = Vec::new();
 
-    for line in existing.lines() {
+    let mut existing_lines = existing.lines().peekable();
+    while let Some(line) = existing_lines.next() {
         let trimmed = line.trim_start();
         if trimmed.starts_with(&format!("{BOIL_SERVERS_ENV}=")) {
             lines.push(servers_line.clone());
+            skip_multiline_single_quoted_value(trimmed, &mut existing_lines);
             replaced = true;
         } else if trimmed.starts_with(&format!("{BOIL_GLOBAL_TIMER_ENV}=")) {
             if let Some(line) = &global_timer_line {
                 lines.push(line.clone());
             }
+            skip_multiline_single_quoted_value(trimmed, &mut existing_lines);
             global_replaced = true;
         } else if trimmed.starts_with("TG_CHAT_ID=") {
             if let Some(line) = &tg_chat_id_line {
@@ -502,6 +508,95 @@ fn config_path() -> PathBuf {
         .into_iter()
         .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("/etc/boil/config.env"))
+}
+
+fn parse_config_env_content(content: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    let mut lines = content.lines().enumerate();
+
+    while let Some((line_index, line)) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some(eq_index) = trimmed.find('=') else {
+            anyhow::bail!("配置文件第 {} 行格式无效", line_index + 1);
+        };
+        let key = trimmed[..eq_index].trim();
+        anyhow::ensure!(
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "配置文件第 {} 行变量名无效",
+            line_index + 1
+        );
+
+        let raw_value = trimmed[eq_index + 1..].trim_start();
+        let value = if let Some(mut rest) = raw_value.strip_prefix('\'') {
+            let mut value = String::new();
+            loop {
+                if let Some((before, after)) = split_shell_single_quoted(rest) {
+                    value.push_str(before);
+                    if let Some(next_rest) = after.strip_prefix("\\''") {
+                        value.push('\'');
+                        rest = next_rest;
+                        continue;
+                    }
+                    break value;
+                }
+
+                value.push_str(rest);
+                let Some((_, next_line)) = lines.next() else {
+                    anyhow::bail!("配置文件第 {} 行单引号未闭合", line_index + 1);
+                };
+                value.push('\n');
+                rest = next_line;
+            }
+        } else if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
+            raw_value[1..raw_value.len() - 1].to_string()
+        } else {
+            raw_value.trim().to_string()
+        };
+
+        vars.push((key.to_string(), value));
+    }
+
+    Ok(vars)
+}
+
+fn split_shell_single_quoted(value: &str) -> Option<(&str, &str)> {
+    value
+        .find('\'')
+        .map(|quote_index| (&value[..quote_index], &value[quote_index + 1..]))
+}
+
+fn skip_multiline_single_quoted_value<'a, I>(line: &str, lines: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    let Some(raw_value) = line.split_once('=').map(|(_, value)| value.trim_start()) else {
+        return;
+    };
+    let Some(mut rest) = raw_value.strip_prefix('\'') else {
+        return;
+    };
+
+    loop {
+        if let Some((_, after)) = split_shell_single_quoted(rest) {
+            if let Some(next_rest) = after.strip_prefix("\\''") {
+                rest = next_rest;
+                continue;
+            }
+            return;
+        }
+
+        let Some(next_line) = lines.next() else {
+            return;
+        };
+        rest = next_line;
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -966,6 +1061,24 @@ mod tests {
     }
 
     #[test]
+    fn multiline_config_keeps_tg_fields_after_boil_servers() {
+        let content = format!(
+            "BOIL_SERVERS={}\nTG_TOKEN='telegram-token'\nTG_CHAT_ID='12345'\n",
+            shell_single_quote(ONE_SERVER)
+        );
+        let vars = parse_config_env_content(&content).unwrap();
+        let borrowed = vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let app = AppConfig::from_env_vars(borrowed).unwrap();
+
+        assert_eq!(app.servers.len(), 1);
+        assert_eq!(app.tg_token.as_deref(), Some("telegram-token"));
+        assert_eq!(app.tg_chat_id.as_deref(), Some("12345"));
+    }
+
+    #[test]
     fn empty_global_timer_is_configuration_error() {
         let error =
             AppConfig::from_env_vars([("BOIL_SERVERS", ONE_SERVER), ("BOIL_GLOBAL_TIMER", "")])
@@ -1038,6 +1151,33 @@ mod tests {
         assert!(saved.contains("TG_TOKEN='keep'"));
         assert!(saved.contains("TG_CHAT_ID='123'"));
         assert_private_permissions(&path);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_app_config_removes_old_multiline_boil_servers_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "boilchangeip-config-multiline-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        let original = format!(
+            "BOIL_SERVERS={}\nTG_TOKEN='keep'\nTG_CHAT_ID='123'\n",
+            shell_single_quote(TWO_ENABLED_SERVERS)
+        );
+        std::fs::write(&path, original).unwrap();
+
+        let app = app_from_servers_json(ONE_SERVER).unwrap();
+        save_app_config_to_path(&app, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(saved.matches("BOIL_SERVERS=").count(), 1);
+        assert!(!saved.contains("Japan 02"));
+        assert!(saved.contains("TG_TOKEN='keep'"));
+        assert!(saved.contains("TG_CHAT_ID='123'"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

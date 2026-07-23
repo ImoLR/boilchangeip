@@ -1,39 +1,83 @@
 #!/usr/bin/env bash
 # boilchangeip 一键更新入口。
-# 用法: curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh | bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh | sudo bash
 
 set -euo pipefail
 
 REPO_URL="${BOIL_REPO_URL:-https://github.com/ImoLR/boilchangeip.git}"
-MANAGED_ROOT="${BOIL_MANAGED_ROOT:-/opt/boilchangeip}"
-SOURCE_DIR="${BOIL_SOURCE_DIR:-$MANAGED_ROOT/source}"
-REQUESTED_BRANCH="${BOIL_BRANCH:-}"
+BRANCH="${BOIL_BRANCH:-main}"
 VERSION="${BOIL_VERSION:-}"
 TAG="${BOIL_TAG:-$VERSION}"
+BIN_NAME="${BOIL_BIN_NAME:-boil}"
+SERVICE_NAME="${BOIL_SERVICE_NAME:-boil}"
+INSTALL_DIR="${BOIL_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${BOIL_CONFIG_DIR:-/etc/boil}"
 BACKUP_ROOT="${BOIL_BACKUP_ROOT:-/var/backups/boilchangeip}"
-BACKUP_PATH=""
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+TMP_DIR=""
+CONFIG_BACKUP=""
+BINARY_BACKUP=""
 WAS_ACTIVE=false
-SOURCE_CHANGED=false
+INSTALL_DONE=false
 
 die() {
   echo "错误: $*" >&2
   exit 1
 }
 
+usage() {
+  cat <<EOF
+用法: update.sh [--help]
+
+环境变量:
+  BOIL_BRANCH=main|develop      默认 main
+  BOIL_VERSION=2.1.1            指定版本，自动补 v 前缀
+  BOIL_TAG=v2.1.1               指定 tag，优先于 BOIL_VERSION
+  BOIL_INSTALL_DIR=/usr/local/bin
+  BOIL_CONFIG_DIR=/etc/boil
+  BOIL_SERVICE_NAME=boil
+EOF
+}
+
+cleanup() {
+  if [[ -n "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+run_privileged() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "操作需要管理员权限，但未找到 sudo"
+  fi
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
 }
 
-timestamp_utc() {
-  date -u +"%Y%m%dT%H%M%SZ"
+systemctl_available() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+service_exists() {
+  systemctl_available &&
+    (systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 ||
+      systemctl status "$SERVICE_NAME" >/dev/null 2>&1)
+}
+
+service_is_active() {
+  systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"
 }
 
 normalize_tag() {
   local tag="$1"
-  if [[ -z "$tag" ]]; then
-    return
-  fi
+  [[ -z "$tag" ]] && return
   if [[ "$tag" == v* ]]; then
     echo "$tag"
   else
@@ -41,198 +85,177 @@ normalize_tag() {
   fi
 }
 
-backup_config_dir_for_update() {
+timestamp_utc() {
+  date -u +"%Y%m%dT%H%M%SZ"
+}
+
+prepare_source() {
+  TMP_DIR="$(mktemp -d -t boilchangeip-update.XXXXXX)"
+  local source_dir="$TMP_DIR/source"
+  echo "下载源码: $REPO_URL" >&2
+  git clone --quiet "$REPO_URL" "$source_dir"
+  git -C "$source_dir" fetch origin --tags
+
+  local tag
+  tag="$(normalize_tag "$TAG")"
+  if [[ -n "$tag" ]]; then
+    git -C "$source_dir" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null ||
+      die "指定版本不存在: $tag"
+    git -C "$source_dir" checkout --quiet --detach "refs/tags/$tag"
+  else
+    git -C "$source_dir" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null ||
+      die "远程分支不存在: $BRANCH"
+    git -C "$source_dir" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+  fi
+
+  echo "$source_dir"
+}
+
+backup_config_dir() {
   local backup_path
   backup_path="$BACKUP_ROOT/config-$(timestamp_utc)"
 
   if [[ ! -d "$CONFIG_DIR" ]]; then
-    echo "未检测到配置目录，跳过配置备份。" >&2
-    echo ""
+    echo "未检测到配置目录，跳过配置备份。"
     return
   fi
 
-  if [[ -w "$(dirname "$BACKUP_ROOT")" ]]; then
-    mkdir -p "$BACKUP_ROOT"
-    chmod 0700 "$BACKUP_ROOT"
-    cp -a -- "$CONFIG_DIR" "$backup_path"
-  else
-    run_privileged mkdir -p "$BACKUP_ROOT"
-    run_privileged chmod 0700 "$BACKUP_ROOT"
-    run_privileged cp -a -- "$CONFIG_DIR" "$backup_path"
-  fi
-
-  echo "已备份配置目录: $backup_path" >&2
-  echo "$backup_path"
+  run_privileged install -d -m 0700 "$BACKUP_ROOT"
+  run_privileged cp -a -- "$CONFIG_DIR" "$backup_path"
+  CONFIG_BACKUP="$backup_path"
+  echo "已备份配置目录: $CONFIG_BACKUP"
 }
 
-restore_config_dir_for_update() {
-  local backup_path="$1"
+backup_binary() {
+  local binary="$INSTALL_DIR/$BIN_NAME"
+  [[ -f "$binary" ]] || return
 
-  [[ -n "$backup_path" ]] || return
-  [[ -d "$backup_path" ]] || {
-    echo "配置备份不存在，无法恢复: $backup_path" >&2
-    return
-  }
+  local backup_path
+  backup_path="$BACKUP_ROOT/${BIN_NAME}-$(timestamp_utc)"
+  run_privileged install -d -m 0700 "$BACKUP_ROOT"
+  run_privileged cp -a -- "$binary" "$backup_path"
+  BINARY_BACKUP="$backup_path"
+  echo "已备份旧二进制: $BINARY_BACKUP"
+}
+
+restore_config() {
+  [[ -n "$CONFIG_BACKUP" ]] || return
+  [[ -d "$CONFIG_BACKUP" ]] || return
 
   echo "恢复配置目录: $CONFIG_DIR"
-  if [[ -w "$(dirname "$CONFIG_DIR")" ]]; then
-    rm -rf -- "$CONFIG_DIR"
-    cp -a -- "$backup_path" "$CONFIG_DIR"
-  else
-    run_privileged rm -rf -- "$CONFIG_DIR"
-    run_privileged cp -a -- "$backup_path" "$CONFIG_DIR"
+  run_privileged rm -rf -- "$CONFIG_DIR"
+  run_privileged cp -a -- "$CONFIG_BACKUP" "$CONFIG_DIR"
+}
+
+restore_binary() {
+  [[ -n "$BINARY_BACKUP" ]] || return
+  [[ -f "$BINARY_BACKUP" ]] || return
+
+  echo "恢复旧二进制: $INSTALL_DIR/$BIN_NAME"
+  run_privileged install -d -m 0755 "$INSTALL_DIR"
+  run_privileged install -m 0755 "$BINARY_BACKUP" "$INSTALL_DIR/$BIN_NAME"
+}
+
+rollback_on_error() {
+  echo "更新失败，开始恢复..." >&2
+  if [[ "$INSTALL_DONE" == true ]]; then
+    restore_binary || true
+  fi
+  restore_config || true
+  if [[ "$WAS_ACTIVE" == true ]] && systemctl_available; then
+    run_privileged systemctl restart "$SERVICE_NAME" || true
   fi
 }
 
-ensure_managed_source() {
-  [[ -d "$SOURCE_DIR/.git" ]] || die "未找到安装器维护的源码目录，请先运行 install.sh: $SOURCE_DIR"
-  local origin_url
-  origin_url="$(git -C "$SOURCE_DIR" remote get-url origin)"
-  [[ "$origin_url" == "$REPO_URL" ]] ||
-    die "源码目录 origin 为 $origin_url，预期为 $REPO_URL"
-  [[ -z "$(git -C "$SOURCE_DIR" status --porcelain)" ]] ||
-    die "源码目录存在未提交修改，拒绝更新: $SOURCE_DIR"
+build_release() {
+  local source_dir="$1"
+  echo "编译 Release 版本..." >&2
+  cargo build --release --manifest-path "$source_dir/Cargo.toml"
 }
 
-remote_branch_exists() {
-  local branch="$1"
-  git -C "$SOURCE_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch"
-}
-
-detect_target_branch() {
-  if [[ -n "$REQUESTED_BRANCH" ]]; then
-    echo "$REQUESTED_BRANCH"
-    return
-  fi
-
-  local current_branch
-  current_branch="$(git -C "$SOURCE_DIR" branch --show-current)"
-  if [[ "$current_branch" == "main" || "$current_branch" == "develop" ]]; then
-    echo "$current_branch"
-    return
-  fi
-
-  if remote_branch_exists main && git -C "$SOURCE_DIR" merge-base --is-ancestor HEAD origin/main; then
-    echo "main"
-    return
-  fi
-  if remote_branch_exists develop && git -C "$SOURCE_DIR" merge-base --is-ancestor HEAD origin/develop; then
-    echo "develop"
-    return
-  fi
-
-  if remote_branch_exists main; then
-    echo "main"
-  elif remote_branch_exists develop; then
-    echo "develop"
-  else
-    die "远程没有 main 或 develop 分支"
+stop_service_if_needed() {
+  if service_is_active; then
+    WAS_ACTIVE=true
+    echo "停止服务: $SERVICE_NAME"
+    run_privileged systemctl stop "$SERVICE_NAME"
   fi
 }
 
-checkout_branch() {
-  local branch="$1"
-  git -C "$SOURCE_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null ||
-    die "远程分支不存在: $branch"
-  if git -C "$SOURCE_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$SOURCE_DIR" checkout "$branch"
-  else
-    git -C "$SOURCE_DIR" checkout -B "$branch" "origin/$branch"
-  fi
-}
-
-checkout_tag() {
-  local tag="$1"
-  git -C "$SOURCE_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null ||
-    die "指定版本不存在: $tag"
-  git -C "$SOURCE_DIR" checkout --detach "refs/tags/$tag"
-}
-
-update_source() {
-  local before
-  local after
-  local tag
-
-  git -C "$SOURCE_DIR" fetch origin --tags
-  before="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
-  tag="$(normalize_tag "$TAG")"
-
-  if [[ -n "$tag" ]]; then
-    checkout_tag "$tag"
-  else
-    local branch
-    branch="$(detect_target_branch)"
-    checkout_branch "$branch"
-    git -C "$SOURCE_DIR" merge --ff-only "origin/$branch"
-  fi
-
-  after="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
-  if [[ "$before" == "$after" ]]; then
-    echo "源码已是最新版: $(git -C "$SOURCE_DIR" rev-parse --short HEAD)"
-    SOURCE_CHANGED=false
-    return
-  fi
-
-  echo "源码已更新: $(git -C "$SOURCE_DIR" rev-parse --short "$before") -> $(git -C "$SOURCE_DIR" rev-parse --short "$after")"
-  SOURCE_CHANGED=true
-}
-
-restore_after_failure() {
-  echo "更新失败，开始恢复..."
-  restore_config_dir_for_update "$BACKUP_PATH" || true
+restart_service_if_needed() {
   if [[ "$WAS_ACTIVE" == true ]]; then
-    restart_service_if_enabled || true
+    echo "重启服务: $SERVICE_NAME"
+    run_privileged systemctl restart "$SERVICE_NAME"
+    sleep 2
+    systemctl is-active --quiet "$SERVICE_NAME" ||
+      die "服务重启后未处于 active 状态"
+  elif service_exists; then
+    echo "服务当前未运行，已保留未运行状态。"
+  fi
+}
+
+install_artifact() {
+  local source_dir="$1"
+  local artifact="$source_dir/target/release/$BIN_NAME"
+  [[ -f "$artifact" ]] || die "未找到构建产物: $artifact"
+
+  run_privileged install -d -m 0755 "$INSTALL_DIR"
+  run_privileged install -m 0755 "$artifact" "$INSTALL_DIR/$BIN_NAME"
+  INSTALL_DONE=true
+}
+
+installed_version() {
+  local binary="$INSTALL_DIR/$BIN_NAME"
+  if [[ -x "$binary" ]]; then
+    "$binary" --version
+  else
+    echo "未安装"
   fi
 }
 
 main() {
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    "")
+      ;;
+    *)
+      die "未知参数: $1"
+      ;;
+  esac
+
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux 系统"
   require_command git
   require_command cargo
+  require_command install
+  require_command mktemp
 
-  ensure_managed_source
-  # shellcheck source=install-common.sh
-  source "$SOURCE_DIR/install-common.sh"
+  local source_dir
+  source_dir="$(prepare_source)"
+  local target_commit
+  target_commit="$(git -C "$source_dir" rev-parse HEAD)"
+  local current_version
+  current_version="$(installed_version)"
 
-  if service_is_active; then
-    WAS_ACTIVE=true
-  fi
+  backup_config_dir
+  backup_binary
+  trap rollback_on_error ERR
 
-  BACKUP_PATH="$(backup_config_dir_for_update)"
-  trap restore_after_failure ERR
-
-  update_source
-  # 源码更新后重新加载公共函数，确保使用目标版本的构建和安装逻辑。
-  # shellcheck source=install-common.sh
-  source "$SOURCE_DIR/install-common.sh"
-
-  install_dependencies
-  build_release "$SOURCE_DIR"
-
-  stop_service_if_present
-  install_artifact "$SOURCE_DIR/target/release/$BIN_NAME"
-  restart_service_if_enabled
-
-  if service_is_active; then
-    echo "服务已运行: $SERVICE_NAME"
-  elif [[ "$WAS_ACTIVE" == true ]]; then
-    die "服务重启后未处于 active 状态"
-  else
-    echo "服务未运行，如需启动请执行: systemctl start $SERVICE_NAME"
-  fi
+  build_release "$source_dir"
+  stop_service_if_needed
+  install_artifact "$source_dir"
+  restart_service_if_needed
 
   trap - ERR
-
   echo
-  if [[ "$SOURCE_CHANGED" == true ]]; then
-    echo "更新完成。"
-  else
-    echo "已是最新版，二进制已重新验证安装。"
-  fi
-  if [[ -n "$BACKUP_PATH" ]]; then
-    echo "本次配置备份保留在: $BACKUP_PATH"
-  fi
-  print_install_summary "$SOURCE_DIR"
+  echo "更新完成。"
+  echo "目标提交: $(git -C "$source_dir" rev-parse --short "$target_commit")"
+  echo "更新前版本: $current_version"
+  echo "当前版本: $("${INSTALL_DIR}/${BIN_NAME}" --version)"
+  echo "配置目录已保留: $CONFIG_DIR"
+  [[ -n "$CONFIG_BACKUP" ]] && echo "本次配置备份保留在: $CONFIG_BACKUP"
+  [[ -n "$BINARY_BACKUP" ]] && echo "旧二进制备份保留在: $BINARY_BACKUP"
 }
 
 main "$@"

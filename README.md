@@ -25,7 +25,7 @@
 curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/install.sh | bash
 ```
 
-安装程序会把源码保存在 `/opt/boilchangeip/source`，从源码编译 Release 二进制，并安装到
+安装脚本会在临时目录下载源码、编译 Release 二进制，并安装到
 `/usr/local/bin/boil`。它不会覆盖现有 `/etc/boil/config.env`。首次安装且没有
 配置时，会启动配置向导；配置完成后自动创建并启动 `boil.service`。
 
@@ -54,8 +54,8 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/uninstall.s
 ./uninstall.sh --purge
 ```
 
-`--purge` 会要求输入 `DELETE`，然后额外删除 `/etc/boil` 和安装器维护的
-`/opt/boilchangeip`。Rust、Cargo、Git 以及用户自己 clone 的仓库不会被删除。
+`--purge` 会要求输入 `DELETE`，然后额外删除 `/etc/boil`。Rust、Cargo、Git
+以及用户自己 clone 的仓库不会被删除。
 
 ## 配置
 
@@ -265,7 +265,7 @@ BOIL_GLOBAL_TIMER='{
 | --- | --- |
 | 程序 | `/usr/local/bin/boil` |
 | 配置 | `/etc/boil/config.env` |
-| 安装器维护的源码 | `/opt/boilchangeip/source` |
+| systemd 服务 | `boil.service` |
 
 可以在运行安装、更新或卸载脚本时通过环境变量覆盖路径：
 
@@ -275,17 +275,26 @@ BOIL_MANAGED_ROOT="$HOME/.local/share/boilchangeip" \
 bash install.sh
 ```
 
-还可以使用 `BOIL_BRANCH` 指定源码分支，默认是 `main`。`update.sh` 支持
-`main` 和 `develop`，并会拒绝覆盖安装器源码目录中的未提交修改。安装和更新
-也支持指定版本：
+还可以使用 `BOIL_BRANCH` 指定源码分支，默认是 `main`。安装和更新脚本都会从
+临时目录下载源码，不依赖调用者当前目录，也不依赖本地长期源码目录。安装和更新
+也支持指定版本或 tag：
 
 ```bash
-BOIL_VERSION=2.1.0 bash install.sh
-BOIL_TAG=v2.1.0 bash update.sh
+BOIL_VERSION=2.1.1 bash install.sh
+BOIL_TAG=v2.1.1 bash update.sh
 BOIL_BRANCH=develop bash update.sh
 ```
 
 指定不存在的版本或分支会明确报错，不会破坏当前安装。
+
+从 v2.1.0 升级时，建议直接使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh | sudo bash
+```
+
+v2.1.1 的 `update.sh` 不再依赖本地源码目录，更新前会备份 `/etc/boil` 和旧二进制。
+如果更新失败，会恢复旧二进制和配置备份，并尝试恢复服务。
 
 ## 旧配置迁移
 
@@ -327,4 +336,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## 来源与致谢
 
-本项目 fork 自 [0xUnixIO/boil](https://github.com/0xUnixIO/boil)，感谢原作者的实现与开源贡献。
+boilchangeip 现作为独立项目维护。感谢早期上游实现与开源社区提供的基础思路。

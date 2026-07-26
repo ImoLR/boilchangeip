@@ -1,11 +1,10 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use teloxide::{prelude::*, types::ParseMode};
 
 use crate::{
     boil::BoilClient,
     config::{AppConfig, ServerConfig},
-    status_card::CountdownState,
     timer::parse_hhmm,
 };
 
@@ -77,9 +76,7 @@ pub(super) fn status_text(
         html_escape(&server_geo_label(server).display()),
         html_escape(ip),
         status_line,
-        html_escape(&crate::status_card::format_countdown(&status_countdown(
-            config, server
-        )))
+        html_escape(&next_change_text(config, server, SystemTime::now()))
     )
 }
 
@@ -89,41 +86,53 @@ pub(super) enum StatusQueryState {
     VerificationFailed,
 }
 
-pub(super) fn status_countdown(config: &AppConfig, server: &ServerConfig) -> CountdownState {
+pub(super) fn next_change_text(
+    config: &AppConfig,
+    server: &ServerConfig,
+    now: SystemTime,
+) -> String {
+    let Some(hhmm) = effective_timer_hhmm(config, server) else {
+        return "未开启".to_string();
+    };
+    next_daily_run_text(&hhmm, now).unwrap_or_else(|| "未开启".to_string())
+}
+
+fn effective_timer_hhmm(config: &AppConfig, server: &ServerConfig) -> Option<String> {
     if let Some(timer) = &server.timer {
-        if !timer.enabled {
-            return CountdownState::Paused;
-        }
-        if let Some(hhmm) = timer.cron.as_deref().and_then(crate::timer::cron_to_hhmm) {
-            return next_daily_countdown(&hhmm).unwrap_or(CountdownState::NotAvailable);
+        if timer.enabled {
+            if let Some(hhmm) = timer.cron.as_deref().and_then(crate::timer::cron_to_hhmm) {
+                return Some(hhmm);
+            }
         }
     }
 
     if let Some(timer) = &config.global_timer {
         if timer.enabled {
             if let Some(hhmm) = timer.cron.as_deref().and_then(crate::timer::cron_to_hhmm) {
-                return next_daily_countdown(&hhmm).unwrap_or(CountdownState::NotAvailable);
+                return Some(hhmm);
             }
-        } else if timer.cron.is_some() {
-            return CountdownState::Paused;
         }
     }
 
-    CountdownState::NotAvailable
+    None
 }
 
-fn next_daily_countdown(hhmm: &str) -> Option<CountdownState> {
+fn next_daily_run_text(hhmm: &str, now: SystemTime) -> Option<String> {
     let (hour, minute) = parse_hhmm(hhmm).ok()?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let shanghai_now = now + 8 * 3_600;
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let shanghai_now = now + shanghai_offset_seconds();
     let seconds_today = shanghai_now % 86_400;
     let target_today = u64::from(hour) * 3_600 + u64::from(minute) * 60;
-    let seconds_until = if target_today > seconds_today {
-        target_today - seconds_today
+    let day = if target_today > seconds_today {
+        "今天"
     } else {
-        86_400 - seconds_today + target_today
+        "明天"
     };
-    Some(CountdownState::Duration(Duration::from_secs(seconds_until)))
+    Some(format!("{day} {hour:02}:{minute:02}"))
+}
+
+fn shanghai_offset_seconds() -> u64 {
+    8 * 3_600
 }
 
 #[cfg(test)]
@@ -156,22 +165,85 @@ mod tests {
     }
 
     #[test]
-    fn status_countdown_handles_missing_and_paused_timers() {
+    fn next_change_text_handles_missing_timer() {
         let mut config = app_config();
         config.global_timer = None;
         config.servers[0].timer = None;
         assert_eq!(
-            status_countdown(&config, &config.servers[0]),
-            CountdownState::NotAvailable
+            next_change_text(&config, &config.servers[0], unix_time_at_shanghai(4, 0)),
+            "未开启"
         );
+    }
 
+    #[test]
+    fn next_change_text_uses_single_server_timer_before_global_timer() {
+        let mut config = app_config();
+        config.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("0 5 * * *".to_string()),
+        });
+        config.servers[0].timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("30 3 * * *".to_string()),
+        });
+
+        assert_eq!(
+            next_change_text(&config, &config.servers[0], unix_time_at_shanghai(2, 0)),
+            "今天 03:30"
+        );
+    }
+
+    #[test]
+    fn next_change_text_uses_global_timer_for_single_server_status() {
+        let mut config = app_config();
+        config.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("0 5 * * *".to_string()),
+        });
+        config.servers[0].timer = None;
+
+        assert_eq!(
+            next_change_text(&config, &config.servers[0], unix_time_at_shanghai(4, 0)),
+            "今天 05:00"
+        );
+    }
+
+    #[test]
+    fn next_change_text_handles_asia_shanghai_next_day() {
+        let mut config = app_config();
+        config.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("0 5 * * *".to_string()),
+        });
+        config.servers[0].timer = None;
+
+        assert_eq!(
+            next_change_text(&config, &config.servers[0], unix_time_at_shanghai(6, 0)),
+            "明天 05:00"
+        );
+    }
+
+    #[test]
+    fn disabled_single_timer_does_not_hide_enabled_global_timer() {
+        let mut config = app_config();
+        config.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("0 5 * * *".to_string()),
+        });
         config.servers[0].timer = Some(ServerTimerConfig {
             enabled: false,
             cron: Some("30 3 * * *".to_string()),
         });
+
         assert_eq!(
-            status_countdown(&config, &config.servers[0]),
-            CountdownState::Paused
+            next_change_text(&config, &config.servers[0], unix_time_at_shanghai(4, 0)),
+            "今天 05:00"
         );
+    }
+
+    fn unix_time_at_shanghai(hour: u64, minute: u64) -> SystemTime {
+        let shanghai_seconds = hour * 3_600 + minute * 60;
+        UNIX_EPOCH
+            + std::time::Duration::from_secs(shanghai_seconds + 86_400 - shanghai_offset_seconds())
     }
 }

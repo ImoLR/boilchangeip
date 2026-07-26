@@ -20,7 +20,10 @@ mod timer_ui;
 
 use callbacks::handle_callback;
 use commands::{handle_command, handle_message, sync_bot_menu, Command};
-use state::{BotShared, ConfirmationStore, ServerEditStore, ServerWizardStore, TimerInputStore};
+use state::{
+    BotShared, ConfirmationStore, ServerEditStore, ServerWizardStore, TimerInputStore,
+    TimerMessageStore,
+};
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let token = config
@@ -37,6 +40,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         timer: Arc::new(Mutex::new(TimerManager::new(timer_config).await?)),
         confirmations: Arc::new(Mutex::new(ConfirmationStore::default())),
         timer_inputs: Arc::new(Mutex::new(TimerInputStore::default())),
+        timer_messages: Arc::new(Mutex::new(TimerMessageStore::default())),
         server_wizards: Arc::new(Mutex::new(ServerWizardStore::default())),
         server_edits: Arc::new(Mutex::new(ServerEditStore::default())),
     };

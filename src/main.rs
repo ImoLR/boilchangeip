@@ -6,7 +6,6 @@ mod core;
 mod reconnect;
 mod server_manage;
 mod service;
-mod status_card;
 mod streaming;
 mod timer;
 

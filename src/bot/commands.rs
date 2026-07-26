@@ -17,7 +17,7 @@ use super::{
     server_wizard::{handle_add_server_input, start_add_server_wizard},
     state::BotShared,
     status::tg_status,
-    timer_ui::{handle_timer_time_input, show_timer_panel},
+    timer_ui::{handle_timer_time_input, show_timer_panel, TimerUiContext},
 };
 
 #[derive(BotCommands, Clone)]
@@ -90,7 +90,9 @@ pub(super) async fn handle_command(
             )
             .await
         }
-        Command::Timer => show_timer_panel(&bot, msg.chat.id, &shared.timer).await,
+        Command::Timer => {
+            show_timer_panel(&bot, msg.chat.id, &shared.timer, &shared.timer_messages).await
+        }
         Command::Servers => show_servers(&bot, msg.chat.id, &config_snapshot).await,
         Command::Addserver => {
             start_add_server_wizard(&bot, msg.chat.id, &shared.server_wizards).await
@@ -147,7 +149,19 @@ pub(super) async fn handle_message(
         return Ok(());
     }
 
-    handle_timer_time_input(&bot, msg.chat.id, &shared.timer, &shared.timer_inputs, text).await;
+    handle_timer_time_input(
+        TimerUiContext {
+            bot: &bot,
+            config: &shared.config,
+            timer: &shared.timer,
+            timer_messages: &shared.timer_messages,
+        },
+        msg.chat.id,
+        msg.id,
+        &shared.timer_inputs,
+        text,
+    )
+    .await;
     Ok(())
 }
 
@@ -248,7 +262,7 @@ async fn ensure_authorized_message(msg: &Message, config: &Arc<Mutex<AppConfig>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bot::test_support::app_config, config::ServerTimerConfig};
+    use crate::bot::test_support::app_config;
 
     #[test]
     fn menu_contains_every_supported_command_with_valid_names() {
@@ -363,25 +377,5 @@ mod tests {
         assert!(debug.contains("timer_create:all:03:30"));
         assert!(debug.contains("timer_create:server:hk-01:03:30"));
         assert!(!debug.contains("hidden-token"));
-    }
-
-    #[test]
-    fn status_countdown_handles_missing_and_paused_timers() {
-        let mut config = app_config();
-        config.global_timer = None;
-        config.servers[0].timer = None;
-        assert_eq!(
-            super::super::status::status_countdown(&config, &config.servers[0]),
-            crate::status_card::CountdownState::NotAvailable
-        );
-
-        config.servers[0].timer = Some(ServerTimerConfig {
-            enabled: false,
-            cron: Some("30 3 * * *".to_string()),
-        });
-        assert_eq!(
-            super::super::status::status_countdown(&config, &config.servers[0]),
-            crate::status_card::CountdownState::Paused
-        );
     }
 }

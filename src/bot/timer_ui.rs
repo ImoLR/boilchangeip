@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode},
 };
 use tokio::sync::Mutex;
 
@@ -13,10 +13,16 @@ use crate::{
 
 use super::{
     formatting::html_escape,
-    state::{TimerInputMode, TimerInputStore},
+    state::{TimerInputMode, TimerInputStore, TimerMessageStore},
 };
 
-pub(super) async fn show_timer_panel(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>) {
+pub(super) async fn show_timer_panel(
+    bot: &Bot,
+    chat_id: ChatId,
+    timer: &Arc<Mutex<TimerManager>>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+) {
+    clear_timer_messages(bot, chat_id, timer_messages).await;
     let status = timer.lock().await.status();
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![
@@ -28,43 +34,48 @@ pub(super) async fn show_timer_panel(bot: &Bot, chat_id: ChatId, timer: &Arc<Mut
             InlineKeyboardButton::callback("🔄 刷新", "timer_refresh"),
         ],
     ]);
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, format_timer_panel(&status))
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)
         .await;
+    record_sent_timer_message(chat_id, sent, timer_messages).await;
 }
 
 pub(super) async fn show_timer_edit_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
 ) {
     let config = timer.lock().await.config().clone();
     let keyboard = timer_target_keyboard(&config, "timer_edit_target");
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, "请选择要编辑定时时间的范围：")
         .reply_markup(keyboard)
         .await;
+    record_sent_timer_message(chat_id, sent, timer_messages).await;
 }
 
 pub(super) async fn show_timer_close_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
 ) {
     let config = timer.lock().await.config().clone();
     let keyboard = timer_target_keyboard(&config, "timer_close");
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, "请选择要关闭定时换 IP 的范围：")
         .reply_markup(keyboard)
         .await;
+    record_sent_timer_message(chat_id, sent, timer_messages).await;
 }
 
 pub(super) async fn handle_timer_time_input(
-    bot: &Bot,
+    ctx: TimerUiContext<'_>,
     chat_id: ChatId,
-    timer: &Arc<Mutex<TimerManager>>,
+    message_id: MessageId,
     timer_inputs: &Arc<Mutex<TimerInputStore>>,
     text: &str,
 ) {
@@ -75,21 +86,28 @@ pub(super) async fn handle_timer_time_input(
     else {
         return;
     };
+    record_timer_message(chat_id, message_id, ctx.timer_messages).await;
 
     if let Err(error) = parse_hhmm(text) {
-        let _ = bot
+        let sent = ctx
+            .bot
             .send_message(chat_id, format!("❌ {}", html_escape(&error.to_string())))
             .await;
+        record_sent_timer_message(chat_id, sent, ctx.timer_messages).await;
         return;
     }
 
     match mode {
-        TimerInputMode::New => show_timer_create_targets(bot, chat_id, timer, text).await,
+        TimerInputMode::New => {
+            show_timer_create_targets(ctx.bot, chat_id, ctx.timer, ctx.timer_messages, text).await
+        }
         TimerInputMode::Edit(target) => {
             apply_timer_change(
-                bot,
+                ctx.bot,
                 chat_id,
-                timer,
+                ctx.config,
+                ctx.timer,
+                ctx.timer_messages,
                 TimerUpdate::Enable {
                     target,
                     hhmm: text.to_string(),
@@ -100,41 +118,57 @@ pub(super) async fn handle_timer_time_input(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TimerUiContext<'a> {
+    pub(super) bot: &'a Bot,
+    pub(super) config: &'a Arc<Mutex<AppConfig>>,
+    pub(super) timer: &'a Arc<Mutex<TimerManager>>,
+    pub(super) timer_messages: &'a Arc<Mutex<TimerMessageStore>>,
+}
+
 async fn show_timer_create_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
     hhmm: &str,
 ) {
     let config = timer.lock().await.config().clone();
     let keyboard = timer_create_keyboard(&config, hhmm);
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, "请选择定时换 IP 目标：")
         .reply_markup(keyboard)
         .await;
+    record_sent_timer_message(chat_id, sent, timer_messages).await;
 }
 
 pub(super) async fn apply_timer_change(
     bot: &Bot,
     chat_id: ChatId,
+    config: &Arc<Mutex<AppConfig>>,
     timer: &Arc<Mutex<TimerManager>>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
     update: TimerUpdate,
 ) {
     let result = timer.lock().await.apply_update(update).await;
     match result {
         Ok(()) => {
-            let _ = bot
+            let next_config = timer.lock().await.config().clone();
+            *config.lock().await = next_config;
+            let sent = bot
                 .send_message(chat_id, "✅ 定时配置已保存并重新调度")
                 .await;
-            show_timer_panel(bot, chat_id, timer).await;
+            record_sent_timer_message(chat_id, sent, timer_messages).await;
+            show_timer_panel(bot, chat_id, timer, timer_messages).await;
         }
         Err(error) => {
-            let _ = bot
+            let sent = bot
                 .send_message(
                     chat_id,
                     format!("❌ 保存失败: {}", html_escape(&error.to_string())),
                 )
                 .await;
+            record_sent_timer_message(chat_id, sent, timer_messages).await;
         }
     }
 }
@@ -163,7 +197,11 @@ pub(super) fn format_timer_panel(status: &TimerStatus) -> String {
             html_escape(&server.server_name),
             html_escape(server.flag.as_deref().unwrap_or("🌐")),
             html_escape(server.country.as_deref().unwrap_or("未知地区")),
-            html_escape(server.address.as_deref().unwrap_or("地址未设置")),
+            html_escape(&server_endpoint_text(
+                server.resolved_ip.as_deref(),
+                server.address.as_deref(),
+                server.server_enabled
+            )),
             state
         ));
     }
@@ -178,10 +216,49 @@ fn timer_state_text(enabled: bool, time: Option<&str>) -> String {
             html_escape(time.unwrap_or("时间未设置"))
         )
     } else {
-        let saved_time = time
-            .map(|time| format!(" | 保留时间 {}", html_escape(time)))
-            .unwrap_or_default();
-        format!("已关闭{saved_time}")
+        "未开启".to_string()
+    }
+}
+
+fn server_endpoint_text(
+    resolved_ip: Option<&str>,
+    address: Option<&str>,
+    _server_enabled: bool,
+) -> String {
+    let value = resolved_ip
+        .filter(|ip| !ip.trim().is_empty())
+        .or_else(|| address.filter(|address| !address.trim().is_empty()))
+        .filter(|address| !address.trim().is_empty())
+        .unwrap_or("N/A");
+    format!("当前 IP：{value}")
+}
+
+pub(super) async fn record_timer_message(
+    chat_id: ChatId,
+    message_id: MessageId,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+) {
+    timer_messages.lock().await.record(chat_id, message_id);
+}
+
+async fn record_sent_timer_message(
+    chat_id: ChatId,
+    sent: ResponseResult<Message>,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+) {
+    if let Ok(message) = sent {
+        record_timer_message(chat_id, message.id, timer_messages).await;
+    }
+}
+
+async fn clear_timer_messages(
+    bot: &Bot,
+    chat_id: ChatId,
+    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+) {
+    let messages = timer_messages.lock().await.take_all(chat_id);
+    for message_id in messages {
+        let _ = bot.delete_message(chat_id, message_id).await;
     }
 }
 
@@ -254,5 +331,25 @@ mod tests {
         assert!(debug.contains("timer_close:server:hk-01"));
         assert!(debug.contains("timer_close:server:jp_02"));
         assert!(!debug.contains("hidden-token"));
+    }
+
+    #[test]
+    fn timer_panel_uses_not_enabled_without_saved_time_or_missing_address_text() {
+        let mut config = app_config();
+        config.servers[1].address = None;
+        config.servers[1].resolved_ip = Some("198.51.100.20".to_string());
+        config.servers[1].timer = Some(crate::config::ServerTimerConfig {
+            enabled: false,
+            cron: Some("0 5 * * *".to_string()),
+        });
+        let status = crate::timer::timer_status(&config);
+        let text = format_timer_panel(&status);
+
+        assert!(text.contains("Japan 02"));
+        assert!(text.contains("当前 IP：198.51.100.20"));
+        assert!(text.contains("未开启"));
+        assert!(!text.contains("地址未设置"));
+        assert!(!text.contains("已关闭"));
+        assert!(!text.contains("保留时间"));
     }
 }

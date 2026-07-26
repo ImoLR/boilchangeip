@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use teloxide::types::ChatId;
+use teloxide::types::{ChatId, MessageId};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -45,6 +45,11 @@ pub(super) struct PendingTimerInput {
 #[derive(Default)]
 pub(super) struct TimerInputStore {
     pending: HashMap<ChatId, PendingTimerInput>,
+}
+
+#[derive(Default)]
+pub(super) struct TimerMessageStore {
+    messages: HashMap<ChatId, Vec<MessageId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +96,7 @@ pub(super) struct BotShared {
     pub(super) timer: Arc<Mutex<TimerManager>>,
     pub(super) confirmations: Arc<Mutex<ConfirmationStore>>,
     pub(super) timer_inputs: Arc<Mutex<TimerInputStore>>,
+    pub(super) timer_messages: Arc<Mutex<TimerMessageStore>>,
     pub(super) server_wizards: Arc<Mutex<ServerWizardStore>>,
     pub(super) server_edits: Arc<Mutex<ServerEditStore>>,
 }
@@ -115,6 +121,27 @@ impl TimerInputStore {
 
     pub(super) fn prune(&mut self, now: Instant) {
         self.pending.retain(|_, pending| pending.expires_at > now);
+    }
+}
+
+impl TimerMessageStore {
+    pub(super) fn record(&mut self, chat_id: ChatId, message_id: MessageId) {
+        let messages = self.messages.entry(chat_id).or_default();
+        if !messages.contains(&message_id) {
+            messages.push(message_id);
+        }
+    }
+
+    pub(super) fn take_all(&mut self, chat_id: ChatId) -> Vec<MessageId> {
+        self.messages.remove(&chat_id).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn count(&self, chat_id: ChatId) -> usize {
+        self.messages
+            .get(&chat_id)
+            .map(|messages| messages.len())
+            .unwrap_or_default()
     }
 }
 
@@ -249,6 +276,20 @@ pub(super) fn next_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_message_store_records_deduplicates_and_takes_messages() {
+        let chat_id = ChatId(12345);
+        let mut store = TimerMessageStore::default();
+        store.record(chat_id, MessageId(10));
+        store.record(chat_id, MessageId(10));
+        store.record(chat_id, MessageId(11));
+
+        assert_eq!(store.count(chat_id), 2);
+        assert_eq!(store.take_all(chat_id), vec![MessageId(10), MessageId(11)]);
+        assert_eq!(store.count(chat_id), 0);
+    }
+
     #[test]
     fn server_edit_state_expires_and_can_be_cancelled() {
         let mut store = ServerEditStore::default();

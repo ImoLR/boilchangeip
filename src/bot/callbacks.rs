@@ -15,7 +15,8 @@ use super::{
     state::{BotShared, ServerEditMode, TimerInputMode},
     status::tg_status,
     timer_ui::{
-        apply_timer_change, show_timer_close_targets, show_timer_edit_targets, show_timer_panel,
+        apply_timer_change, record_timer_message, show_timer_close_targets,
+        show_timer_edit_targets, show_timer_panel,
     },
 };
 
@@ -93,7 +94,7 @@ pub(super) async fn handle_callback(
             tg_change(&bot, chat_id, &config_snapshot, &shared.confirmations, "").await;
         }
         CallbackAction::MenuTimer => {
-            show_timer_panel(&bot, chat_id, &shared.timer).await;
+            show_timer_panel(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::MenuHelp => {
             let _ = send_help(&bot, chat_id).await;
@@ -141,29 +142,49 @@ pub(super) async fn handle_callback(
             let _ = bot.send_message(chat_id, "已取消换 IP").await;
         }
         CallbackAction::TimerNew => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             shared
                 .timer_inputs
                 .lock()
                 .await
                 .set(chat_id, TimerInputMode::New, Instant::now());
-            let _ = bot
+            let sent = bot
                 .send_message(chat_id, "请输入每天执行时间（HH:MM），例如 03:30")
                 .await;
+            if let Ok(message) = sent {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
         }
         CallbackAction::TimerEdit => {
-            show_timer_edit_targets(&bot, chat_id, &shared.timer).await;
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
+            show_timer_edit_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::TimerClose => {
-            show_timer_close_targets(&bot, chat_id, &shared.timer).await;
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
+            show_timer_close_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::TimerRefresh => {
-            show_timer_panel(&bot, chat_id, &shared.timer).await;
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
+            show_timer_panel(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::TimerCreateAll { hhmm } => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             apply_timer_change(
                 &bot,
                 chat_id,
+                &shared.config,
                 &shared.timer,
+                &shared.timer_messages,
                 TimerUpdate::Enable {
                     target: TimerTarget::AllEnabled,
                     hhmm: hhmm.to_string(),
@@ -172,10 +193,15 @@ pub(super) async fn handle_callback(
             .await;
         }
         CallbackAction::TimerCreateServer { server_id, hhmm } => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             apply_timer_change(
                 &bot,
                 chat_id,
+                &shared.config,
                 &shared.timer,
+                &shared.timer_messages,
                 TimerUpdate::Enable {
                     target: TimerTarget::Server(server_id.to_string()),
                     hhmm: hhmm.to_string(),
@@ -184,30 +210,47 @@ pub(super) async fn handle_callback(
             .await;
         }
         CallbackAction::TimerEditTargetAll => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             shared.timer_inputs.lock().await.set(
                 chat_id,
                 TimerInputMode::Edit(TimerTarget::AllEnabled),
                 Instant::now(),
             );
-            let _ = bot
+            let sent = bot
                 .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
                 .await;
+            if let Ok(message) = sent {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
         }
         CallbackAction::TimerEditTargetServer(server_id) => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             shared.timer_inputs.lock().await.set(
                 chat_id,
                 TimerInputMode::Edit(TimerTarget::Server(server_id.to_string())),
                 Instant::now(),
             );
-            let _ = bot
+            let sent = bot
                 .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
                 .await;
+            if let Ok(message) = sent {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
         }
         CallbackAction::TimerCloseAll => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             apply_timer_change(
                 &bot,
                 chat_id,
+                &shared.config,
                 &shared.timer,
+                &shared.timer_messages,
                 TimerUpdate::Disable {
                     target: TimerTarget::AllEnabled,
                 },
@@ -215,10 +258,15 @@ pub(super) async fn handle_callback(
             .await;
         }
         CallbackAction::TimerCloseServer(server_id) => {
+            if let Some(message) = &q.message {
+                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+            }
             apply_timer_change(
                 &bot,
                 chat_id,
+                &shared.config,
                 &shared.timer,
+                &shared.timer_messages,
                 TimerUpdate::Disable {
                     target: TimerTarget::Server(server_id.to_string()),
                 },

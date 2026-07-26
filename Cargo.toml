@@ -23,8 +23,6 @@ tokio-cron-scheduler    = "0.13"
 chrono-tz               = "0.10"
 uuid                    = "1"
 rand                    = "0.8"
-image                   = { version = "0.25", default-features = false, features = ["png"] }
-ab_glyph                = "0.2"
 
 [profile.release]
 opt-level     = "z"

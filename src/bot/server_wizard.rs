@@ -223,12 +223,10 @@ async fn handle_name_step(
         .send_message(
             chat_id,
             format!(
-                "✅ 配置完成\n\n{}\n当前 IP：{}",
-                format_server_display_parts(name, &data.current_ip, &metadata.geo),
-                html_escape(&data.current_ip)
+                "✅ 配置完成\n\n{}",
+                format_server_display_parts(name, &data.current_ip, &metadata.geo)
             ),
         )
-        .reply_markup(super::commands::start_menu_keyboard())
         .parse_mode(ParseMode::Html)
         .await;
 }

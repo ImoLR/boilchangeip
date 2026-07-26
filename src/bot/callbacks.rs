@@ -99,6 +99,9 @@ pub(super) async fn handle_callback(
             let _ = send_help(&bot, chat_id).await;
         }
         CallbackAction::SelectStatus(server_id) => {
+            let _ = bot
+                .send_message(chat_id, "⚙️ 正在查询服务器状态，请稍候…")
+                .await;
             let config_snapshot = shared.config.lock().await.clone();
             tg_status(&bot, chat_id, &config_snapshot, server_id).await;
         }

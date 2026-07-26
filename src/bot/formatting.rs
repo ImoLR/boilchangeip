@@ -29,20 +29,26 @@ impl GeoLabel {
 
 pub(super) fn format_server_card(server: &ServerConfig) -> String {
     let geo = server_geo_label(server);
-    let address = server
-        .address
+    let current_ip = server
+        .resolved_ip
         .as_deref()
-        .filter(|address| !address.trim().is_empty())
-        .unwrap_or("地址未设置");
-    format_server_display_parts(&server.name, address, &geo)
+        .filter(|ip| !ip.trim().is_empty())
+        .or_else(|| {
+            server
+                .address
+                .as_deref()
+                .filter(|address| !address.trim().is_empty())
+        })
+        .unwrap_or("N/A");
+    format_server_display_parts(&server.name, current_ip, &geo)
 }
 
-pub(super) fn format_server_display_parts(name: &str, address: &str, geo: &GeoLabel) -> String {
+pub(super) fn format_server_display_parts(name: &str, current_ip: &str, geo: &GeoLabel) -> String {
     format!(
-        "📡 <b>{}</b>\n\n{}\n{}",
+        "📡 <b>{}</b>\n\n{}\n当前 IP：{}",
         html_escape(name),
         html_escape(&geo.display()),
-        html_escape(address)
+        html_escape(current_ip)
     )
 }
 

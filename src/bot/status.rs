@@ -1,20 +1,17 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use teloxide::{
-    prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode},
-};
+use teloxide::{prelude::*, types::ParseMode};
 
 use crate::{
     boil::BoilClient,
     config::{AppConfig, ServerConfig},
-    status_card::{CountdownState, StatusCardData, StatusCardState, TempStatusCard},
+    status_card::CountdownState,
     timer::parse_hhmm,
 };
 
 use super::{
     change::{resolve_for_tg, selected_servers, selection_from_tg_arg},
-    formatting::{server_geo_label, short_safe_error},
+    formatting::{html_escape, server_geo_label, short_safe_error},
 };
 
 pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg: &str) {
@@ -36,73 +33,60 @@ pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, ar
 
     for server in selected_servers(selected) {
         let (status, detail, current_ip) = match client.get_ip(&server.token).await {
-            Ok(response) => (StatusCardState::Normal, None, Some(response.ip.to_string())),
+            Ok(response) => (
+                StatusQueryState::Normal,
+                None,
+                Some(response.ip.to_string()),
+            ),
             Err(e) => (
-                StatusCardState::VerificationFailed,
+                StatusQueryState::VerificationFailed,
                 Some(short_safe_error(&e.to_string())),
                 None,
             ),
         };
-        let data = status_card_data(config, server, status, current_ip.as_deref(), detail);
-        send_status_card_or_text(bot, chat_id, server, data).await;
+        let text = status_text(config, server, status, current_ip.as_deref(), detail);
+        let _ = bot
+            .send_message(chat_id, text)
+            .parse_mode(ParseMode::Html)
+            .await;
     }
 }
 
-async fn send_status_card_or_text(
-    bot: &Bot,
-    chat_id: ChatId,
-    server: &ServerConfig,
-    data: StatusCardData,
-) {
-    let keyboard = status_card_keyboard(server);
-    match TempStatusCard::render(&data) {
-        Ok(card) => {
-            let result = bot
-                .send_photo(chat_id, InputFile::file(card.path().to_path_buf()))
-                .reply_markup(keyboard.clone())
-                .await;
-            if result.is_ok() {
-                drop(card);
-                return;
-            }
-            drop(card);
-            let _ = bot
-                .send_message(chat_id, crate::status_card::fallback_text(&data))
-                .reply_markup(keyboard)
-                .parse_mode(ParseMode::Html)
-                .await;
-        }
-        Err(error) => {
-            log::warn!("状态卡片生成失败，回退为文本: {error}");
-            let _ = bot
-                .send_message(chat_id, crate::status_card::fallback_text(&data))
-                .reply_markup(keyboard)
-                .parse_mode(ParseMode::Html)
-                .await;
-        }
-    }
-}
-
-pub(super) fn status_card_data(
+pub(super) fn status_text(
     config: &AppConfig,
     server: &ServerConfig,
-    status: StatusCardState,
+    status: StatusQueryState,
     current_ip: Option<&str>,
     detail: Option<String>,
-) -> StatusCardData {
-    StatusCardData {
-        server_name: server.name.clone(),
-        region: server_geo_label(server).display(),
-        address: server
-            .address
+) -> String {
+    let status_line = match status {
+        StatusQueryState::Normal => "正常".to_string(),
+        StatusQueryState::VerificationFailed => detail
             .as_deref()
-            .or(current_ip)
-            .unwrap_or("地址未设置")
-            .to_string(),
-        status,
-        countdown: status_countdown(config, server),
-        detail,
-    }
+            .map(|detail| format!("验证失败（{}）", html_escape(detail)))
+            .unwrap_or_else(|| "验证失败".to_string()),
+    };
+    let ip = current_ip
+        .or(server.resolved_ip.as_deref())
+        .or(server.address.as_deref())
+        .unwrap_or("N/A");
+
+    format!(
+        "✅ 服务器状态\n\n📡 <b>{}</b>\n\n{}\n当前 IP：{}\n\n状态：{}\n下次换 IP：{}",
+        html_escape(&server.name),
+        html_escape(&server_geo_label(server).display()),
+        html_escape(ip),
+        status_line,
+        html_escape(&crate::status_card::format_countdown(&status_countdown(
+            config, server
+        )))
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum StatusQueryState {
+    Normal,
+    VerificationFailed,
 }
 
 pub(super) fn status_countdown(config: &AppConfig, server: &ServerConfig) -> CountdownState {
@@ -142,48 +126,33 @@ fn next_daily_countdown(hhmm: &str) -> Option<CountdownState> {
     Some(CountdownState::Duration(Duration::from_secs(seconds_until)))
 }
 
-pub(super) fn status_card_keyboard(server: &ServerConfig) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("🔄 更换 IP", format!("select_change:{}", server.id)),
-            InlineKeyboardButton::callback(
-                "⏰ 定时任务",
-                format!("timer_edit_target:server:{}", server.id),
-            ),
-        ],
-        vec![
-            InlineKeyboardButton::callback("✏️ 编辑服务器", format!("server_edit:{}", server.id)),
-            InlineKeyboardButton::callback("🗑 删除服务器", format!("server_delete:{}", server.id)),
-        ],
-        vec![InlineKeyboardButton::callback(
-            "⬅️ 返回服务器列表",
-            "menu:servers",
-        )],
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{bot::test_support::app_config, config::ServerTimerConfig};
 
     #[test]
-    fn status_card_data_uses_public_fields_only() {
+    fn status_text_uses_public_fields_only_without_action_buttons() {
         let config = app_config();
-        let data = status_card_data(
+        let text = status_text(
             &config,
             &config.servers[0],
-            StatusCardState::Normal,
+            StatusQueryState::Normal,
             Some("42.0.0.1"),
             None,
         );
-        let debug = format!("{data:?}");
 
-        assert!(data.server_name.contains("Hong Kong 01"));
-        assert!(data.region.contains("中国香港"));
-        assert_eq!(data.address, "203.0.113.10");
-        assert!(!debug.contains("hk-01"));
-        assert!(!debug.contains("hidden-token"));
+        assert!(text.contains("✅ 服务器状态"));
+        assert!(text.contains("Hong Kong 01"));
+        assert!(text.contains("中国香港"));
+        assert!(text.contains("当前 IP：42.0.0.1"));
+        assert!(text.contains("状态：正常"));
+        assert!(!text.contains("hk-01"));
+        assert!(!text.contains("hidden-token"));
+        assert!(!text.contains("更换 IP"));
+        assert!(!text.contains("定时任务"));
+        assert!(!text.contains("编辑服务器"));
+        assert!(!text.contains("删除服务器"));
     }
 
     #[test]
@@ -204,20 +173,5 @@ mod tests {
             status_countdown(&config, &config.servers[0]),
             CountdownState::Paused
         );
-    }
-
-    #[test]
-    fn status_card_keyboard_keeps_internal_id_out_of_labels() {
-        let config = app_config();
-        let keyboard = status_card_keyboard(&config.servers[0]);
-        let debug = format!("{keyboard:?}");
-
-        assert!(debug.contains("🔄 更换 IP"));
-        assert!(debug.contains("⏰ 定时任务"));
-        assert!(debug.contains("编辑服务器"));
-        assert!(debug.contains("🗑 删除服务器"));
-        assert!(debug.contains("返回服务器列表"));
-        assert!(debug.contains("select_change:hk-01"));
-        assert!(!debug.contains("hidden-token"));
     }
 }

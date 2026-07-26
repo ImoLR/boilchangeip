@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode},
+    types::{MessageId, ParseMode},
 };
 use tokio::sync::Mutex;
 
@@ -14,10 +14,8 @@ use crate::{
 };
 
 use super::{
-    formatting::{
-        detect_address_metadata, format_server_display_parts, html_escape, normalize_server_address,
-    },
-    state::{PendingServerDraft, ServerWizardStep, ServerWizardStore, SERVER_WIZARD_TTL},
+    formatting::{detect_address_metadata, format_server_display_parts, html_escape},
+    state::{ServerWizardStep, ServerWizardStore},
 };
 
 pub(super) async fn start_add_server_wizard(
@@ -35,8 +33,8 @@ pub(super) async fn handle_add_server_input(
     bot: &Bot,
     chat_id: ChatId,
     message_id: MessageId,
-    _config: &Arc<Mutex<AppConfig>>,
-    _timer: &Arc<Mutex<TimerManager>>,
+    config: &Arc<Mutex<AppConfig>>,
+    timer: &Arc<Mutex<TimerManager>>,
     server_wizards: &Arc<Mutex<ServerWizardStore>>,
     text: &str,
 ) -> bool {
@@ -53,27 +51,14 @@ pub(super) async fn handle_add_server_input(
             handle_token_step(bot, chat_id, message_id, server_wizards, text).await;
         }
         ServerWizardStep::Name { current_ip, token } => {
-            handle_name_step(bot, chat_id, server_wizards, text, current_ip, token).await;
-        }
-        ServerWizardStep::Address {
-            name,
-            current_ip,
-            token,
-            geo,
-            resolved_ip,
-        } => {
-            handle_address_step(
+            handle_name_step(
                 bot,
                 chat_id,
+                config,
+                timer,
                 server_wizards,
                 text,
-                AddressStepData {
-                    name,
-                    current_ip,
-                    token,
-                    geo,
-                    resolved_ip,
-                },
+                NameStepData { current_ip, token },
             )
             .await;
         }
@@ -110,6 +95,9 @@ async fn handle_token_step(
             return;
         }
     };
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在验证 Token，请稍候…")
+        .await;
     let current_ip = match client.get_ip(&token).await {
         Ok(response) => response.ip.to_string(),
         Err(_) => {
@@ -129,11 +117,11 @@ async fn handle_token_step(
     let _ = bot
         .send_message(
             chat_id,
-            format!(
-                "✅ Token 验证成功\n\n当前 IP：{}\n\n请给这台服务器设置一个显示名称，例如 HKT、HKG、Tokyo、JP、US：",
-                html_escape(&current_ip)
-            ),
+            format!("✅ Token 验证成功\n\n当前 IP：{}", html_escape(&current_ip)),
         )
+        .await;
+    let _ = bot
+        .send_message(chat_id, "请给这台服务器设置一个显示名称：")
         .await;
 }
 
@@ -154,16 +142,20 @@ async fn reset_to_token_step(
 async fn handle_name_step(
     bot: &Bot,
     chat_id: ChatId,
+    config: &Arc<Mutex<AppConfig>>,
+    timer: &Arc<Mutex<TimerManager>>,
     server_wizards: &Arc<Mutex<ServerWizardStore>>,
     text: &str,
-    current_ip: String,
-    token: SecretToken,
+    data: NameStepData,
 ) {
     let name = text.trim();
     if name.is_empty() {
         server_wizards.lock().await.set_step(
             chat_id,
-            ServerWizardStep::Name { current_ip, token },
+            ServerWizardStep::Name {
+                current_ip: data.current_ip,
+                token: data.token,
+            },
             Instant::now(),
         );
         let _ = bot
@@ -172,159 +164,37 @@ async fn handle_name_step(
         return;
     }
 
-    let metadata = detect_address_metadata(&current_ip).await;
-    server_wizards.lock().await.set_step(
-        chat_id,
-        ServerWizardStep::Address {
-            name: name.to_string(),
-            current_ip,
-            token,
-            geo: metadata.geo,
-            resolved_ip: metadata.resolved_ip,
-        },
-        Instant::now(),
-    );
-    let _ = bot
-        .send_message(
-            chat_id,
-            "是否填写服务器域名/地址？\n\n可以直接发送 IP 或域名，例如 boil.example.com。\n不填写请发送 /skip。",
-        )
-        .await;
-}
-
-struct AddressStepData {
-    name: String,
-    current_ip: String,
-    token: SecretToken,
-    geo: super::formatting::GeoLabel,
-    resolved_ip: Option<String>,
-}
-
-async fn handle_address_step(
-    bot: &Bot,
-    chat_id: ChatId,
-    server_wizards: &Arc<Mutex<ServerWizardStore>>,
-    text: &str,
-    data: AddressStepData,
-) {
-    let (address, geo, resolved_ip) = if text.eq_ignore_ascii_case("/skip") {
-        (
-            None,
-            data.geo,
-            data.resolved_ip.or_else(|| Some(data.current_ip.clone())),
-        )
-    } else {
-        let Some(address) = normalize_server_address(text) else {
-            server_wizards.lock().await.set_step(
-                chat_id,
-                ServerWizardStep::Address {
-                    name: data.name,
-                    current_ip: data.current_ip,
-                    token: data.token,
-                    geo: data.geo,
-                    resolved_ip: data.resolved_ip,
-                },
-                Instant::now(),
-            );
-            let _ = bot
-                .send_message(chat_id, "❌ 服务器地址不能为空；不填写请发送 /skip。")
-                .await;
-            return;
-        };
-        let metadata = detect_address_metadata(&address).await;
-        (Some(address), metadata.geo, metadata.resolved_ip)
-    };
-
-    let draft = PendingServerDraft {
-        chat_id,
-        name: data.name,
-        address,
-        current_ip: data.current_ip,
-        token: data.token,
-        geo,
-        resolved_ip,
-        expires_at: Instant::now() + SERVER_WIZARD_TTL,
-    };
-    let nonce = server_wizards
-        .lock()
-        .await
-        .insert_draft(draft.clone(), Instant::now());
-    show_add_server_confirmation(bot, chat_id, &draft, &nonce).await;
-}
-
-async fn show_add_server_confirmation(
-    bot: &Bot,
-    chat_id: ChatId,
-    draft: &PendingServerDraft,
-    nonce: &str,
-) {
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(
-            "✅ 确认添加",
-            format!("addserver_confirm:{nonce}"),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "✏️ 重新填写",
-            format!("addserver_retry:{nonce}"),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "❌ 取消",
-            format!("addserver_cancel:{nonce}"),
-        )],
-    ]);
-    let address = draft.address.as_deref().unwrap_or(&draft.current_ip);
-    let _ = bot
-        .send_message(
-            chat_id,
-            format!(
-                "✅ 服务器验证成功\n\n{}\n当前 IP：{}",
-                format_server_display_parts(&draft.name, address, &draft.geo),
-                html_escape(&draft.current_ip)
-            ),
-        )
-        .reply_markup(keyboard)
-        .parse_mode(ParseMode::Html)
-        .await;
-}
-
-pub(super) async fn confirm_add_server(
-    bot: &Bot,
-    chat_id: ChatId,
-    config: &Arc<Mutex<AppConfig>>,
-    timer: &Arc<Mutex<TimerManager>>,
-    server_wizards: &Arc<Mutex<ServerWizardStore>>,
-    nonce: &str,
-) {
-    let Some(draft) = server_wizards
-        .lock()
-        .await
-        .take_draft(nonce, Instant::now())
-    else {
-        let _ = bot
-            .send_message(chat_id, "确认已过期，请重新点击添加服务器。")
-            .await;
-        return;
-    };
+    let metadata = detect_address_metadata(&data.current_ip).await;
+    let retry_current_ip = data.current_ip.clone();
+    let retry_token = data.token.clone();
 
     let current = config.lock().await.clone();
     let server_id = next_server_id(&current);
     let mut next = current;
     next.servers.push(ServerConfig {
         id: server_id,
-        name: draft.name.clone(),
-        token: draft.token,
+        name: name.to_string(),
+        token: data.token,
         enabled: true,
-        address: draft.address.clone(),
-        country: Some(draft.geo.country.clone()),
-        flag: Some(draft.geo.flag.clone()),
-        resolved_ip: draft
+        address: Some(data.current_ip.clone()),
+        country: Some(metadata.geo.country.clone()),
+        flag: Some(metadata.geo.flag.clone()),
+        resolved_ip: metadata
             .resolved_ip
             .clone()
-            .or_else(|| Some(draft.current_ip.clone())),
+            .or_else(|| Some(data.current_ip.clone())),
         timer: None,
     });
 
     if let Err(error) = save_app_config(&next) {
+        server_wizards.lock().await.set_step(
+            chat_id,
+            ServerWizardStep::Name {
+                current_ip: retry_current_ip,
+                token: retry_token,
+            },
+            Instant::now(),
+        );
         let _ = bot
             .send_message(
                 chat_id,
@@ -349,19 +219,23 @@ pub(super) async fn confirm_add_server(
         return;
     }
 
-    let address = draft.address.as_deref().unwrap_or(&draft.current_ip);
     let _ = bot
         .send_message(
             chat_id,
             format!(
-                "✅ 配置完成\n\n{}\nIP：{}\n\nTelegram Bot 已可以使用。",
-                format_server_display_parts(&draft.name, address, &draft.geo),
-                html_escape(&draft.current_ip)
+                "✅ 配置完成\n\n{}\n当前 IP：{}",
+                format_server_display_parts(name, &data.current_ip, &metadata.geo),
+                html_escape(&data.current_ip)
             ),
         )
         .reply_markup(super::commands::start_menu_keyboard())
         .parse_mode(ParseMode::Html)
         .await;
+}
+
+struct NameStepData {
+    current_ip: String,
+    token: SecretToken,
 }
 
 pub(super) fn next_server_id(config: &AppConfig) -> String {
@@ -380,29 +254,6 @@ mod tests {
         bot::test_support::app_config,
         config::{AppConfig, SecretToken, ServerConfig},
     };
-
-    #[test]
-    fn add_server_callbacks_do_not_contain_token_or_address() {
-        let nonce = "nonce-value";
-        let confirm = format!("addserver_confirm:{nonce}");
-        let retry = format!("addserver_retry:{nonce}");
-        let cancel = format!("addserver_cancel:{nonce}");
-
-        assert_eq!(
-            super::super::callbacks::parse_callback(&confirm),
-            super::super::callbacks::CallbackAction::ConfirmAddServer(nonce)
-        );
-        assert_eq!(
-            super::super::callbacks::parse_callback(&retry),
-            super::super::callbacks::CallbackAction::RetryAddServer(nonce)
-        );
-        assert_eq!(
-            super::super::callbacks::parse_callback(&cancel),
-            super::super::callbacks::CallbackAction::CancelAddServer(nonce)
-        );
-        assert!(!confirm.contains("hidden-token"));
-        assert!(!confirm.contains("203.0.113.10"));
-    }
 
     #[test]
     fn next_server_id_uses_max_numeric_suffix_plus_one() {

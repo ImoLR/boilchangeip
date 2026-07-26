@@ -13,8 +13,6 @@ use crate::{
     timer::TimerManager,
 };
 
-use super::formatting::GeoLabel;
-
 pub(super) const CONFIRM_TTL: Duration = Duration::from_secs(120);
 pub(super) const TIMER_INPUT_TTL: Duration = Duration::from_secs(300);
 pub(super) const SERVER_WIZARD_TTL: Duration = Duration::from_secs(900);
@@ -56,13 +54,6 @@ pub(super) enum ServerWizardStep {
         current_ip: String,
         token: SecretToken,
     },
-    Address {
-        name: String,
-        current_ip: String,
-        token: SecretToken,
-        geo: GeoLabel,
-        resolved_ip: Option<String>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -71,22 +62,9 @@ pub(super) struct PendingServerWizard {
     expires_at: Instant,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct PendingServerDraft {
-    pub(super) chat_id: ChatId,
-    pub(super) name: String,
-    pub(super) address: Option<String>,
-    pub(super) current_ip: String,
-    pub(super) token: SecretToken,
-    pub(super) geo: GeoLabel,
-    pub(super) resolved_ip: Option<String>,
-    pub(super) expires_at: Instant,
-}
-
 #[derive(Default)]
 pub(super) struct ServerWizardStore {
     pending: HashMap<ChatId, PendingServerWizard>,
-    drafts: HashMap<String, PendingServerDraft>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,7 +122,6 @@ impl ServerWizardStore {
     pub(super) fn start(&mut self, chat_id: ChatId, now: Instant) {
         self.prune(now);
         self.pending.remove(&chat_id);
-        self.drafts.retain(|_, draft| draft.chat_id != chat_id);
         self.pending.insert(
             chat_id,
             PendingServerWizard {
@@ -171,34 +148,8 @@ impl ServerWizardStore {
         (pending.expires_at > now).then_some(pending.step)
     }
 
-    pub(super) fn insert_draft(&mut self, draft: PendingServerDraft, now: Instant) -> String {
-        self.prune(now);
-        let nonce = next_nonce();
-        self.drafts.insert(nonce.clone(), draft);
-        nonce
-    }
-
-    pub(super) fn take_draft(&mut self, nonce: &str, now: Instant) -> Option<PendingServerDraft> {
-        self.prune(now);
-        let draft = self.drafts.remove(nonce)?;
-        (draft.expires_at > now).then_some(draft)
-    }
-
-    pub(super) fn cancel_draft(&mut self, nonce: &str) {
-        self.drafts.remove(nonce);
-    }
-
     pub(super) fn prune(&mut self, now: Instant) {
         self.pending.retain(|_, pending| pending.expires_at > now);
-        self.drafts.retain(|_, draft| draft.expires_at > now);
-    }
-
-    #[cfg(test)]
-    pub(super) fn draft_count_for_chat(&self, chat_id: ChatId) -> usize {
-        self.drafts
-            .values()
-            .filter(|draft| draft.chat_id == chat_id)
-            .count()
     }
 }
 
@@ -298,56 +249,6 @@ pub(super) fn next_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SecretToken;
-
-    #[test]
-    fn starting_server_wizard_clears_old_chat_token_drafts() {
-        let chat_id = ChatId(12345);
-        let mut store = ServerWizardStore::default();
-        let now = Instant::now();
-        store.insert_draft(
-            PendingServerDraft {
-                chat_id,
-                name: "Server".to_string(),
-                address: Some("example.com".to_string()),
-                current_ip: "203.0.113.10".to_string(),
-                token: SecretToken::from_test_value("temporary-token"),
-                geo: GeoLabel::unknown(),
-                resolved_ip: None,
-                expires_at: now + SERVER_WIZARD_TTL,
-            },
-            now,
-        );
-
-        store.start(chat_id, now + Duration::from_secs(1));
-
-        assert_eq!(store.draft_count_for_chat(chat_id), 0);
-    }
-
-    #[test]
-    fn expired_server_wizard_draft_is_pruned_with_token() {
-        let chat_id = ChatId(12345);
-        let mut store = ServerWizardStore::default();
-        let now = Instant::now();
-        store.insert_draft(
-            PendingServerDraft {
-                chat_id,
-                name: "Server".to_string(),
-                address: Some("example.com".to_string()),
-                current_ip: "203.0.113.10".to_string(),
-                token: SecretToken::from_test_value("temporary-token"),
-                geo: GeoLabel::unknown(),
-                resolved_ip: None,
-                expires_at: now + Duration::from_secs(1),
-            },
-            now,
-        );
-
-        store.prune(now + Duration::from_secs(2));
-
-        assert_eq!(store.draft_count_for_chat(chat_id), 0);
-    }
-
     #[test]
     fn server_edit_state_expires_and_can_be_cancelled() {
         let mut store = ServerEditStore::default();

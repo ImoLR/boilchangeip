@@ -11,7 +11,7 @@ use super::{
     server_delete::{delete_server_from_config, show_server_delete_confirmation},
     server_edit::{revalidate_server, show_server_edit_menu},
     server_list::{move_server, show_servers},
-    server_wizard::{confirm_add_server, start_add_server_wizard},
+    server_wizard::start_add_server_wizard,
     state::{BotShared, ServerEditMode, TimerInputMode},
     status::tg_status,
     timer_ui::{
@@ -27,9 +27,6 @@ pub(super) enum CallbackAction<'a> {
     MenuChange,
     MenuTimer,
     MenuHelp,
-    ConfirmAddServer(&'a str),
-    RetryAddServer(&'a str),
-    CancelAddServer(&'a str),
     SelectStatus(&'a str),
     SelectCheck(&'a str),
     SelectChange(&'a str),
@@ -100,25 +97,6 @@ pub(super) async fn handle_callback(
         }
         CallbackAction::MenuHelp => {
             let _ = send_help(&bot, chat_id).await;
-        }
-        CallbackAction::ConfirmAddServer(nonce) => {
-            confirm_add_server(
-                &bot,
-                chat_id,
-                &shared.config,
-                &shared.timer,
-                &shared.server_wizards,
-                nonce,
-            )
-            .await;
-        }
-        CallbackAction::RetryAddServer(nonce) => {
-            shared.server_wizards.lock().await.cancel_draft(nonce);
-            start_add_server_wizard(&bot, chat_id, &shared.server_wizards).await;
-        }
-        CallbackAction::CancelAddServer(nonce) => {
-            shared.server_wizards.lock().await.cancel_draft(nonce);
-            let _ = bot.send_message(chat_id, "已取消添加服务器").await;
         }
         CallbackAction::SelectStatus(server_id) => {
             let config_snapshot = shared.config.lock().await.clone();
@@ -343,16 +321,6 @@ pub(super) fn parse_callback(data: &str) -> CallbackAction<'_> {
         "menu:timer" => return CallbackAction::MenuTimer,
         "menu:help" => return CallbackAction::MenuHelp,
         _ => {}
-    }
-
-    if let Some(nonce) = data.strip_prefix("addserver_confirm:") {
-        return CallbackAction::ConfirmAddServer(nonce);
-    }
-    if let Some(nonce) = data.strip_prefix("addserver_retry:") {
-        return CallbackAction::RetryAddServer(nonce);
-    }
-    if let Some(nonce) = data.strip_prefix("addserver_cancel:") {
-        return CallbackAction::CancelAddServer(nonce);
     }
 
     if let Some(server_id) = data.strip_prefix("select_status:") {

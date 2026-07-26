@@ -321,7 +321,7 @@ v2.1.2 的 `update.sh` 默认使用官方 Release 二进制，不再要求用户
 发布在 VPS 本地执行，不依赖 GitHub Actions：
 
 ```bash
-./scripts/release.sh v2.2.1
+./scripts/release.sh v2.2.3
 ```
 
 脚本会检查当前分支、工作区状态、源码版本号、本地和远程 tag，然后构建并发布：

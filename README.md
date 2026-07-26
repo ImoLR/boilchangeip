@@ -27,8 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/install.sh 
 
 安装脚本会在 amd64 机器上优先下载 `boil-linux-amd64`，安装到
 `/usr/local/bin/boil`。普通用户不需要安装 Rust、Cargo、Git，也不需要本地源码目录。
-它不会覆盖现有 `/etc/boil/config.env`。首次安装且没有配置时，会启动配置向导；
-配置完成后自动创建并启动 `boil.service`。
+它不会覆盖现有 `/etc/boil/config.env`。首次安装且没有配置时，只会引导配置
+Telegram Bot Token，随后创建并启动 `boil.service`，生成一次性配对码。Boil
+Token、服务器名称和服务器地址都在 Telegram Bot 内继续完成。
 
 arm64 用户需要使用源码编译路径，请先准备 Rust、Cargo、Git 和本机编译环境。
 
@@ -66,7 +67,8 @@ curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/uninstall.s
 
 ## 配置
 
-主要配置项是 `BOIL_SERVERS`，内容为 JSON 数组：
+主要配置项是 `BOIL_SERVERS`，内容为 JSON 数组。首次安装会先写入空数组，
+后续通过 Telegram `/addserver` 添加服务器：
 
 ```bash
 BOIL_SERVERS='[
@@ -107,8 +109,9 @@ cp config.env.example config.env
 
 配置规则：
 
+- `id` 是程序自动生成的本地内部标识，通常为 `server-1`、`server-2`。
 - `id` 必须唯一，只能包含字母、数字、短横线和下划线。
-- `id` 不得包含 Token、IP、邮箱、账号等敏感信息。
+- `id` 不会向 Telegram 用户展示，也不会发送给 Boil API。
 - 只有一台已启用 VPS 时，CLI 可以省略 `--server`。
 - 多台已启用 VPS 时，必须指定 `--server <id>` 或 `--all`。
 - `--all` 按配置顺序执行，不并发调用 `changeIP`。
@@ -190,18 +193,22 @@ Bot 启动时会同步 Telegram 原生命令菜单，私聊输入框左下角可
 
 首次配对流程：
 
-1. 运行 `boil setup`。
-2. 终端显示一次性 `/pair CODE`，有效期 5 分钟。
-3. 在 Telegram Bot 私聊中发送终端提示的 `/pair CODE`。
-4. 配对成功后，程序自动保存 `TG_CHAT_ID`，同步命令菜单和 Menu 按钮。
+1. 安装脚本或 `boil setup` 只配置 Telegram Bot Token。
+2. Bot Token 通过 Telegram `getMe` 验证成功后，程序保存 Token 并生成一次性配对码。
+3. `boil.service` 启动成功后，终端显示 `/pair CODE`，有效期 5 分钟。
+4. 在 Telegram Bot 私聊中发送终端提示的 `/pair CODE`。
+5. 配对成功后，程序自动保存 `TG_CHAT_ID`，同步命令菜单和 Menu 按钮。
+6. 如果还没有任何 Boil Server，Bot 会自动进入第一台 VPS 配置向导。
 
 未配对前，`/start` 只提示先完成配对，其他管理命令会拒绝访问。已绑定后，
 `/pair` 不能覆盖现有绑定，其他聊天和 callback 都会被拒绝。
 
 服务器管理：
 
-- `/addserver` 会依次要求输入服务器名称、服务器地址和 Token。
-- 服务器地址支持 IPv4、IPv6 和域名；输入 `http://` 或 `https://` 时会自动取主机名。
+- `/addserver` 会依次要求输入 Boil Token、服务器显示名称和可选服务器地址。
+- Token 只通过 `POST /api/v1/getIP` 做只读验证，不会调用 `changeIP` 或 reconnect。
+- Token 验证成功后显示当前 IP，然后要求输入显示名称；内部 `server.id` 自动生成，不需要用户输入。
+- 服务器地址支持 IPv4、IPv6 和域名；输入 `http://` 或 `https://` 时会自动取主机名，也可以发送 `/skip` 跳过。
 - Bot 会尝试识别国家/地区和国旗，失败时显示 `🌐 未知地区`，不阻止保存。
 - `/servers` 按配置顺序展示服务器，支持查看状态、更换 IP、管理定时、编辑、删除和上移/下移。
 - 编辑名称、地址、Token 后会立即刷新内存配置和 TimerManager，无需重启 Bot。
@@ -335,7 +342,7 @@ Release 只包含以上二进制文件。arm64 用户如需使用，请自行从
 `BOIL_INTERFACE` 已废弃。当前主路径不再使用旧 `/login`、
 `/api/query_all` 或 `/api/reconnect`。
 
-请在 Boil 面板为每台 VPS 获取新版 Token，并手动写入 `BOIL_SERVERS`。工具不会用旧账号密码自动换取 Token。
+请在 Boil 面板为每台 VPS 获取新版 Token，并通过 Telegram `/addserver` 添加。工具不会用旧账号密码自动换取 Token。
 
 `change-ip.sh` 和 `tg-bot.sh` 是已禁用的 legacy 入口，只会提示使用 Rust 主程序，不会调用旧 API。
 

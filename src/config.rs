@@ -613,54 +613,32 @@ fn setup_save_path() -> PathBuf {
     }
 }
 
-/// 构建新版配置内容：只写 BOIL_SERVERS 和 TG 配置，不写旧账号密码。
+/// 构建 Telegram 初始化配置：保留已有 BOIL_SERVERS，只写 TG 配置，不写旧账号密码。
 struct TgSetupConfig<'a> {
     token: &'a str,
     pair_code: &'a PairingCode,
     pair_expires_at: u64,
 }
 
-fn build_config_content(
-    existing: &str,
-    server_id: &str,
-    server_name: &str,
-    token: &str,
-    tg: Option<TgSetupConfig<'_>>,
-) -> anyhow::Result<String> {
-    validate_server_id(server_id)?;
-    anyhow::ensure!(!server_name.trim().is_empty(), "server name 不能为空");
-    anyhow::ensure!(!token.trim().is_empty(), "token 不能为空");
+fn build_tg_config_content(existing: &str, tg: TgSetupConfig<'_>) -> anyhow::Result<String> {
+    let vars = parse_config_env_content(existing)?;
+    let borrowed = vars
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let servers_json = find_var(&borrowed, BOIL_SERVERS_ENV).unwrap_or("[]");
+    let servers: Vec<ServerConfig> = serde_json::from_str(servers_json)
+        .context("已有 BOIL_SERVERS JSON 解析失败，请先修复配置文件")?;
+    validate_servers(&servers)?;
 
-    let servers = serde_json::json!([
-        {
-            "id": server_id,
-            "name": server_name,
-            "token": token,
-            "enabled": true
-        }
-    ]);
     let servers_json = serde_json::to_string_pretty(&servers)?;
-
     let mut content = format!("BOIL_SERVERS={}\n", shell_single_quote(&servers_json));
-
-    match tg {
-        Some(tg) => {
-            content.push_str(&format!(
-                "TG_TOKEN={}\n{TG_PAIR_CODE_ENV}={}\n{TG_PAIR_EXPIRES_AT_ENV}={}\n",
-                shell_single_quote(tg.token),
-                shell_single_quote(tg.pair_code.expose_secret()),
-                tg.pair_expires_at
-            ));
-        }
-        None => {
-            let tg_lines: String = existing
-                .lines()
-                .filter(|l| l.starts_with("TG_"))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            content.push_str(&tg_lines);
-        }
-    }
+    content.push_str(&format!(
+        "TG_TOKEN={}\n{TG_PAIR_CODE_ENV}={}\n{TG_PAIR_EXPIRES_AT_ENV}={}\n",
+        shell_single_quote(tg.token),
+        shell_single_quote(tg.pair_code.expose_secret()),
+        tg.pair_expires_at
+    ));
     Ok(content)
 }
 
@@ -687,73 +665,73 @@ fn pairing_expires_at() -> anyhow::Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TG_PAIR_TTL_SECONDS)
 }
 
-async fn validate_tg_token(token: &str) -> anyhow::Result<()> {
-    Bot::new(token)
+async fn validate_tg_token(token: &str) -> anyhow::Result<String> {
+    let me = Bot::new(token)
         .get_me()
         .await
         .context("Bot Token 验证失败")?;
-    Ok(())
+    Ok(me.user.username.unwrap_or(me.user.first_name))
 }
 
 pub async fn run_setup_wizard() -> anyhow::Result<()> {
-    println!("新版 Boil API 使用 Token 配置，一个 Token 对应一台 VPS。");
-    println!("请先从 Boil 面板获取该 VPS 的新版 Token。\n");
-
-    let server_id: String = Input::new()
-        .with_prompt("server id（字母/数字/-/_，不含敏感信息）")
-        .interact_text()?;
-
-    let server_name: String = Input::new().with_prompt("显示名称").interact_text()?;
-
-    let token: String = Input::new()
-        .with_prompt("Boil 新版 Token")
-        .interact_text()?;
-
-    validate_server_id(&server_id)?;
-
-    let want_tg = Confirm::new()
-        .with_prompt("配置 Telegram Bot（用于远程控制）")
-        .default(false)
-        .interact()?;
-
-    let tg = if want_tg {
-        let tg_token: String = Input::new()
-            .with_prompt("Bot Token（从 @BotFather 获取）")
-            .interact_text()?;
-        validate_tg_token(&tg_token).await?;
-        let pair_code = generate_pairing_code()?;
-        let pair_expires_at = pairing_expires_at()?;
-        Some((tg_token, pair_code, pair_expires_at))
-    } else {
-        None
-    };
-
     let save_path = setup_save_path();
     let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
-    let tg_refs = tg
-        .as_ref()
-        .map(|(token, pair_code, pair_expires_at)| TgSetupConfig {
-            token: token.as_str(),
-            pair_code,
-            pair_expires_at: *pair_expires_at,
-        });
-    let content = build_config_content(&existing, &server_id, &server_name, &token, tg_refs)?;
+    if !existing.trim().is_empty() && std::env::var_os("BOIL_SETUP_FORCE").is_none() {
+        println!("检测到已有配置: {}", save_path.display());
+        let keep = Confirm::new()
+            .with_prompt("是否保留并继续使用现有配置")
+            .default(true)
+            .interact()?;
+        if keep {
+            println!("已保留现有配置。");
+            return Ok(());
+        }
+    }
+
+    println!("----------------------------------------");
+    println!("Telegram Bot 配置");
+    println!("----------------------------------------\n");
+    println!("请打开 Telegram，找到：\n");
+    println!("@BotFather\n");
+    println!("创建一个机器人：\n");
+    println!("/newbot\n");
+    println!("按照 BotFather 提示完成创建后，复制 Bot Token 并粘贴到这里。\n");
+
+    let (tg_token, bot_name) = loop {
+        let tg_token: String = Input::new()
+            .with_prompt("Telegram Bot Token")
+            .interact_text()?;
+        match validate_tg_token(&tg_token).await {
+            Ok(bot_name) => break (tg_token, bot_name),
+            Err(error) => {
+                println!("❌ Bot Token 验证失败: {error}");
+                println!("请重新输入 Telegram Bot Token。\n");
+            }
+        }
+    };
+
+    let pair_code = generate_pairing_code()?;
+    let pair_expires_at = pairing_expires_at()?;
+    let content = build_tg_config_content(
+        &existing,
+        TgSetupConfig {
+            token: tg_token.as_str(),
+            pair_code: &pair_code,
+            pair_expires_at,
+        },
+    )?;
     std::fs::write(&save_path, content)?;
     set_private_file_permissions(&save_path)?;
-    println!("✅ 新版配置已保存到 {}\n", save_path.display());
+    println!("\nTelegram Bot 验证成功\n");
+    println!("机器人：");
+    println!("@{}\n", bot_name.trim_start_matches('@'));
+    println!("✅ 配置已保存到 {}\n", save_path.display());
 
-    if let Some((_, pair_code, _)) = &tg {
+    if std::env::var_os("BOIL_SETUP_SUPPRESS_PAIR").is_none() {
         println!("请在 Telegram Bot 中发送：");
         println!("/pair {}", pair_code.expose_secret());
         println!("并等待配对结果。配对码 5 分钟内有效且只能使用一次。\n");
     }
-
-    println!("常用命令:");
-    println!("  boil servers list          查看 VPS");
-    println!("  boil status --server ID    查看当前 IP");
-    println!("  boil check --server ID     检查 IP 质量");
-    println!("  boil change --server ID    换 IP");
-    println!();
     Ok(())
 }
 
@@ -830,14 +808,7 @@ mod tests {
     #[test]
     fn reconfigure_tg_no_duplicate() {
         let existing = "BOIL_SERVERS='[]'\nTG_TOKEN='oldtoken'\nTG_CHAT_ID='111'\n";
-        let out = build_config_content(
-            existing,
-            "primary",
-            "Primary VPS",
-            "new-server-token",
-            Some(tg_setup("newtoken")),
-        )
-        .unwrap();
+        let out = build_tg_config_content(existing, tg_setup("newtoken")).unwrap();
 
         assert_eq!(out.matches("TG_TOKEN=").count(), 1, "TG_TOKEN 应只出现一次");
         assert_eq!(
@@ -854,34 +825,29 @@ mod tests {
         assert!(out.contains("BOIL_SERVERS="));
     }
 
-    /// 跳过 TG 配置时，应保留已有的 TG 配置。
     #[test]
-    fn skip_tg_keeps_existing() {
-        let existing = "BOIL_SERVERS='[]'\nTG_TOKEN='keep'\nTG_CHAT_ID='1'\n";
-        let out = build_config_content(existing, "primary", "Primary VPS", "token", None).unwrap();
-        assert!(out.contains("TG_TOKEN='keep'"));
+    fn setup_preserves_existing_servers() {
+        let existing = format!("BOIL_SERVERS={}\n", shell_single_quote(ONE_SERVER));
+        let out = build_tg_config_content(&existing, tg_setup("newtoken")).unwrap();
+
+        assert!(out.contains("Primary VPS"));
+        assert!(out.contains("secret-token-primary"));
+        assert!(out.contains("TG_TOKEN='newtoken'"));
         assert_eq!(out.matches("TG_TOKEN=").count(), 1);
     }
 
-    /// 新版 timer 已进入 BOIL_SERVERS，全局 CHANGE_CRON 不再写入新配置。
     #[test]
-    fn does_not_keep_global_cron_when_configuring_new_servers() {
+    fn setup_without_existing_servers_writes_empty_server_list() {
         let existing = "BOIL_SERVERS='[]'\nCHANGE_CRON='0 */6 * * *'\n";
-        let out = build_config_content(
-            existing,
-            "primary",
-            "Primary VPS",
-            "token",
-            Some(tg_setup("t")),
-        )
-        .unwrap();
+        let out = build_tg_config_content(existing, tg_setup("t")).unwrap();
+
+        assert!(out.contains("BOIL_SERVERS='[]'"));
         assert!(!out.contains("CHANGE_CRON="));
     }
 
-    /// token 含单引号时应被正确转义。
     #[test]
-    fn escapes_single_quote_in_token() {
-        let out = build_config_content("", "primary", "Primary VPS", "to'ken", None).unwrap();
+    fn escapes_single_quote_in_tg_token() {
+        let out = build_tg_config_content("", tg_setup("to'ken")).unwrap();
         assert!(out.contains(r"to'\''ken"));
     }
 

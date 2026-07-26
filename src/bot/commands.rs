@@ -50,7 +50,14 @@ pub(super) async fn handle_command(
     shared: BotShared,
 ) -> ResponseResult<()> {
     if let Command::Pair(code) = cmd {
-        handle_pair_command(&bot, msg.chat.id, &shared.config, code.trim()).await;
+        handle_pair_command(
+            &bot,
+            msg.chat.id,
+            &shared.config,
+            &shared.server_wizards,
+            code.trim(),
+        )
+        .await;
         return Ok(());
     }
 
@@ -107,9 +114,6 @@ pub(super) async fn handle_message(
         return Ok(());
     };
     let text = text.trim();
-    if text.starts_with('/') {
-        return Ok(());
-    }
 
     if handle_server_edit_input(
         &bot,
@@ -136,6 +140,10 @@ pub(super) async fn handle_message(
     )
     .await
     {
+        return Ok(());
+    }
+
+    if text.starts_with('/') {
         return Ok(());
     }
 

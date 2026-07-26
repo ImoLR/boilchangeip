@@ -51,13 +51,15 @@ pub(super) struct TimerInputStore {
 
 #[derive(Clone, Debug)]
 pub(super) enum ServerWizardStep {
-    Name,
+    Token,
+    Name {
+        current_ip: String,
+        token: SecretToken,
+    },
     Address {
         name: String,
-    },
-    Token {
-        name: String,
-        address: String,
+        current_ip: String,
+        token: SecretToken,
         geo: GeoLabel,
         resolved_ip: Option<String>,
     },
@@ -73,7 +75,8 @@ pub(super) struct PendingServerWizard {
 pub(super) struct PendingServerDraft {
     pub(super) chat_id: ChatId,
     pub(super) name: String,
-    pub(super) address: String,
+    pub(super) address: Option<String>,
+    pub(super) current_ip: String,
     pub(super) token: SecretToken,
     pub(super) geo: GeoLabel,
     pub(super) resolved_ip: Option<String>,
@@ -145,7 +148,7 @@ impl ServerWizardStore {
         self.pending.insert(
             chat_id,
             PendingServerWizard {
-                step: ServerWizardStep::Name,
+                step: ServerWizardStep::Token,
                 expires_at: now + SERVER_WIZARD_TTL,
             },
         );
@@ -306,7 +309,8 @@ mod tests {
             PendingServerDraft {
                 chat_id,
                 name: "Server".to_string(),
-                address: "example.com".to_string(),
+                address: Some("example.com".to_string()),
+                current_ip: "203.0.113.10".to_string(),
                 token: SecretToken::from_test_value("temporary-token"),
                 geo: GeoLabel::unknown(),
                 resolved_ip: None,
@@ -329,7 +333,8 @@ mod tests {
             PendingServerDraft {
                 chat_id,
                 name: "Server".to_string(),
-                address: "example.com".to_string(),
+                address: Some("example.com".to_string()),
+                current_ip: "203.0.113.10".to_string(),
                 token: SecretToken::from_test_value("temporary-token"),
                 geo: GeoLabel::unknown(),
                 resolved_ip: None,

@@ -11,12 +11,15 @@ use crate::config::{save_app_config, AppConfig};
 use super::{
     commands::{send_start_menu, sync_bot_menu},
     formatting::html_escape,
+    server_wizard::start_add_server_wizard,
+    state::ServerWizardStore,
 };
 
 pub(super) async fn handle_pair_command(
     bot: &Bot,
     chat_id: ChatId,
     config: &Arc<Mutex<AppConfig>>,
+    server_wizards: &Arc<Mutex<ServerWizardStore>>,
     code: &str,
 ) {
     let chat_id_str = chat_id.to_string();
@@ -34,10 +37,20 @@ pub(super) async fn handle_pair_command(
     match result {
         PairingApplyResult::Paired => {
             sync_bot_menu(bot).await;
-            let _ = bot
-                .send_message(chat_id, "✅ 配对成功，已启用 Telegram 菜单。")
-                .await;
-            let _ = send_start_menu(bot, chat_id).await;
+            if config.lock().await.servers.is_empty() {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "✅ 配对成功\n\n欢迎使用 boilchangeip。\n现在开始配置第一台 Boil VPS。",
+                    )
+                    .await;
+                start_add_server_wizard(bot, chat_id, server_wizards).await;
+            } else {
+                let _ = bot
+                    .send_message(chat_id, "✅ 配对成功，已启用 Telegram 菜单。")
+                    .await;
+                let _ = send_start_menu(bot, chat_id).await;
+            }
         }
         PairingApplyResult::InvalidOrExpired => {
             let _ = bot.send_message(chat_id, "配对码无效或已过期").await;

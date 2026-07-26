@@ -232,7 +232,21 @@ EOF
 configure_if_missing() {
   run_privileged install -d -m 0750 "$CONFIG_DIR"
   if [[ -f "$CONFIG_DIR/config.env" ]]; then
-    echo "已保留现有配置: $CONFIG_DIR/config.env"
+    if [[ -r /dev/tty ]]; then
+      echo "检测到已有配置: $CONFIG_DIR/config.env"
+      echo "默认保留并继续使用现有配置。"
+      read -r -p "是否重新配置 Telegram Bot? [y/N] " answer </dev/tty
+      case "$answer" in
+        y|Y|yes|YES)
+          BOIL_SETUP_FORCE=1 BOIL_SETUP_SUPPRESS_PAIR=1 "$INSTALL_DIR/$BIN_NAME" setup </dev/tty >/dev/tty
+          ;;
+        *)
+          echo "已保留现有配置: $CONFIG_DIR/config.env"
+          ;;
+      esac
+    else
+      echo "已保留现有配置: $CONFIG_DIR/config.env"
+    fi
     return
   fi
 
@@ -240,8 +254,8 @@ configure_if_missing() {
     die "缺少 $CONFIG_DIR/config.env，且当前环境无法交互配置"
   fi
 
-  echo "首次安装需要配置 Boil Token 和可选 Telegram 信息。"
-  "$INSTALL_DIR/$BIN_NAME" setup </dev/tty >/dev/tty
+  echo "首次安装只需要配置 Telegram Bot。Boil Token 和 VPS 信息将在 Telegram Bot 内完成。"
+  BOIL_SETUP_FORCE=1 BOIL_SETUP_SUPPRESS_PAIR=1 "$INSTALL_DIR/$BIN_NAME" setup </dev/tty >/dev/tty
   [[ -f "$CONFIG_DIR/config.env" ]] || die "配置向导未生成 $CONFIG_DIR/config.env"
 }
 
@@ -256,11 +270,30 @@ start_and_verify_service() {
   require_command systemctl
   run_privileged systemctl restart "$SERVICE_NAME"
   sleep 2
-  systemctl is-active --quiet "$SERVICE_NAME" ||
-    die "服务启动失败，请运行 journalctl -u $SERVICE_NAME -n 80 --no-pager 查看日志"
+  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "服务启动失败，最近日志如下:" >&2
+    journalctl -u "$SERVICE_NAME" -n 80 --no-pager >&2 || true
+    die "服务启动失败"
+  fi
 }
 
 print_summary() {
+  local pair_code=""
+  local pair_expires_at=""
+  if [[ -f "$CONFIG_DIR/config.env" ]]; then
+    pair_code="$(
+      awk -F= '/^TG_PAIR_CODE=/ {
+        value=$2
+        sub(/^'\''/, "", value)
+        sub(/'\''$/, "", value)
+        print value
+      }' "$CONFIG_DIR/config.env" 2>/dev/null || true
+    )"
+    pair_expires_at="$(
+      awk -F= '/^TG_PAIR_EXPIRES_AT=/ { print $2 }' "$CONFIG_DIR/config.env" 2>/dev/null || true
+    )"
+  fi
+
   echo
   echo "安装完成。"
   echo "程序路径: $INSTALL_DIR/$BIN_NAME"
@@ -268,6 +301,26 @@ print_summary() {
   echo "服务名称: $SERVICE_NAME"
   echo "安装来源: $ARTIFACT_SOURCE ($ARTIFACT_REF)"
   echo "程序版本: $("${INSTALL_DIR}/${BIN_NAME}" --version)"
+  if [[ -n "$pair_code" ]]; then
+    echo
+    echo "========================================"
+    echo
+    echo "Telegram Bot 已启动"
+    echo
+    echo "请打开你的 Telegram Bot，然后发送："
+    echo
+    echo "/pair $pair_code"
+    echo
+    if [[ -n "$pair_expires_at" ]]; then
+      echo "配对码有效期：5 分钟（Unix: $pair_expires_at）"
+    else
+      echo "配对码有效期：5 分钟"
+    fi
+    echo
+    echo "请在 Telegram 中完成后续 Boil Token 和服务器配置。"
+    echo
+    echo "========================================"
+  fi
   echo "后续升级: curl -fsSL https://raw.githubusercontent.com/ImoLR/boilchangeip/main/update.sh | sudo bash"
   echo "查看服务: systemctl status $SERVICE_NAME"
   echo "查看日志: journalctl -fu $SERVICE_NAME"

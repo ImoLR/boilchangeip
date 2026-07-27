@@ -29,6 +29,9 @@ pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, ar
             return;
         }
     };
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+        .await;
 
     for server in selected_servers(selected) {
         let (status, detail, current_ip) = match client.get_ip(&server.token).await {

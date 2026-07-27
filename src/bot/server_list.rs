@@ -30,6 +30,11 @@ pub(super) async fn show_servers(bot: &Bot, chat_id: ChatId, config: &AppConfig)
             None
         }
     };
+    if client.is_some() {
+        let _ = bot
+            .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+            .await;
+    }
 
     for server in &config.servers {
         let current_ip = match &client {

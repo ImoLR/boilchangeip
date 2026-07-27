@@ -28,6 +28,12 @@ pub(super) async fn show_timer_panel(
         let timer = timer.lock().await;
         (timer.status(), timer.config().clone())
     };
+    if !config.servers.is_empty() {
+        let sent = bot
+            .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+            .await;
+        record_sent_timer_message(chat_id, sent, timer_messages).await;
+    }
     let current_ips = query_timer_current_ips(&config).await;
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![

@@ -81,36 +81,54 @@ pub(super) async fn handle_callback(
             start_add_server_wizard(&bot, chat_id, &shared.server_wizards).await;
         }
         CallbackAction::MenuServers => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             shared.server_edits.lock().await.cancel(chat_id);
             let config_snapshot = shared.config.lock().await.clone();
             show_servers(&bot, chat_id, &config_snapshot).await;
         }
         CallbackAction::MenuStatus => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             tg_status(&bot, chat_id, &config_snapshot, "").await;
         }
         CallbackAction::MenuChange => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             tg_change(&bot, chat_id, &config_snapshot, &shared.confirmations, "").await;
         }
         CallbackAction::MenuTimer => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             show_timer_panel(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::MenuHelp => {
             let _ = send_help(&bot, chat_id).await;
         }
         CallbackAction::SelectStatus(server_id) => {
-            let _ = bot
-                .send_message(chat_id, "⚙️ 正在查询服务器状态，请稍候…")
-                .await;
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             tg_status(&bot, chat_id, &config_snapshot, server_id).await;
         }
         CallbackAction::SelectCheck(server_id) => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             tg_check(&bot, chat_id, &config_snapshot, server_id).await;
         }
         CallbackAction::SelectChange(server_id) => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             show_change_confirmation(
                 &bot,
@@ -122,6 +140,9 @@ pub(super) async fn handle_callback(
             .await;
         }
         CallbackAction::ConfirmChange { server_id, nonce } => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             let config_snapshot = shared.config.lock().await.clone();
             confirm_and_change(
                 &bot,
@@ -170,6 +191,9 @@ pub(super) async fn handle_callback(
             show_timer_close_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::TimerRefresh => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             if let Some(message) = &q.message {
                 record_timer_message(chat_id, message.id, &shared.timer_messages).await;
             }
@@ -310,6 +334,9 @@ pub(super) async fn handle_callback(
             let _ = bot.send_message(chat_id, "请输入新的服务器 Token：").await;
         }
         CallbackAction::ServerRevalidate(server_id) => {
+            let Some(_busy) = shared.try_enter_busy(chat_id) else {
+                return Ok(());
+            };
             revalidate_server(&bot, chat_id, &shared.config, &shared.timer, server_id).await;
         }
         CallbackAction::ServerDelete(server_id) => {

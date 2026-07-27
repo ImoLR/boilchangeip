@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -90,6 +90,16 @@ pub(super) struct ServerEditStore {
     pending: HashMap<ChatId, PendingServerEdit>,
 }
 
+#[derive(Default)]
+pub(super) struct BotBusyStore {
+    busy_chats: StdMutex<HashSet<ChatId>>,
+}
+
+pub(super) struct BotBusyGuard {
+    chat_id: ChatId,
+    busy_chats: Arc<BotBusyStore>,
+}
+
 #[derive(Clone)]
 pub(super) struct BotShared {
     pub(super) config: Arc<Mutex<AppConfig>>,
@@ -99,6 +109,34 @@ pub(super) struct BotShared {
     pub(super) timer_messages: Arc<Mutex<TimerMessageStore>>,
     pub(super) server_wizards: Arc<Mutex<ServerWizardStore>>,
     pub(super) server_edits: Arc<Mutex<ServerEditStore>>,
+    pub(super) busy: Arc<BotBusyStore>,
+}
+
+impl BotShared {
+    pub(super) fn try_enter_busy(&self, chat_id: ChatId) -> Option<BotBusyGuard> {
+        self.busy.try_enter(chat_id)
+    }
+}
+
+impl BotBusyStore {
+    fn try_enter(self: &Arc<Self>, chat_id: ChatId) -> Option<BotBusyGuard> {
+        let mut busy_chats = self.busy_chats.try_lock().ok()?;
+        if !busy_chats.insert(chat_id) {
+            return None;
+        }
+        Some(BotBusyGuard {
+            chat_id,
+            busy_chats: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for BotBusyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut busy_chats) = self.busy_chats.busy_chats.lock() {
+            busy_chats.remove(&self.chat_id);
+        }
+    }
 }
 
 impl TimerInputStore {
@@ -121,6 +159,32 @@ impl TimerInputStore {
 
     pub(super) fn prune(&mut self, now: Instant) {
         self.pending.retain(|_, pending| pending.expires_at > now);
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    #[test]
+    fn busy_store_drops_second_request_without_queueing() {
+        let busy = Arc::new(BotBusyStore::default());
+        let chat = ChatId(10);
+
+        let first = busy.try_enter(chat);
+        assert!(first.is_some());
+        assert!(busy.try_enter(chat).is_none());
+
+        drop(first);
+        assert!(busy.try_enter(chat).is_some());
+    }
+
+    #[test]
+    fn busy_store_is_scoped_per_chat() {
+        let busy = Arc::new(BotBusyStore::default());
+
+        let _first = busy.try_enter(ChatId(10)).unwrap();
+        assert!(busy.try_enter(ChatId(11)).is_some());
     }
 }
 

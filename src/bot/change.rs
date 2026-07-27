@@ -10,7 +10,10 @@ use crate::{
     boil::BoilClient,
     config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
     core::check_ip_quality,
-    reconnect::{reconnect_one, ReconnectPolicy, ReconnectResult},
+    reconnect::{
+        reconnect_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
+        ReconnectResult,
+    },
 };
 
 use super::{
@@ -35,6 +38,9 @@ pub(super) async fn tg_check(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg
         }
     };
 
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+        .await;
     for server in selected_servers(selected) {
         let _ = bot
             .send_message(chat_id, format!("🔍 检测中: {}", html_escape(&server.name)))
@@ -197,7 +203,27 @@ pub(super) async fn confirm_and_change(
             return;
         }
     };
-    let result = reconnect_one(&client, server, &ReconnectPolicy::default()).await;
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+        .await;
+    let progress_bot = bot.clone();
+    let result = reconnect_one_with_current_ip_and_progress(
+        &client,
+        server,
+        &ReconnectPolicy::default(),
+        None,
+        move |progress| {
+            let bot = progress_bot.clone();
+            async move {
+                match progress {
+                    ReconnectProgress::VerifyingNewIp { .. } => {
+                        let _ = bot.send_message(chat_id, "⚙️ 正在查询新 IP，请稍候…").await;
+                    }
+                }
+            }
+        },
+    )
+    .await;
     send_reconnect_result(bot, chat_id, &result).await;
 }
 

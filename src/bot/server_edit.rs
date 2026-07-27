@@ -92,6 +92,9 @@ pub(super) async fn handle_server_edit_input(
                     return true;
                 }
             };
+            let _ = bot
+                .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+                .await;
             if let Err(error) = client.get_ip(&token).await {
                 let _ = bot
                     .send_message(
@@ -227,6 +230,9 @@ pub(super) async fn revalidate_server(
             return;
         }
     };
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+        .await;
     if let Err(error) = client.get_ip(&token).await {
         let _ = bot
             .send_message(

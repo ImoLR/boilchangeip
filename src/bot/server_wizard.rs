@@ -98,6 +98,9 @@ async fn handle_token_step(
     let _ = bot
         .send_message(chat_id, "⚙️ 正在验证 Token，请稍候…")
         .await;
+    let _ = bot
+        .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
+        .await;
     let current_ip = match client.get_ip(&token).await {
         Ok(response) => response.ip.to_string(),
         Err(_) => {

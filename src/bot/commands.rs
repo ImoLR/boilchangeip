@@ -78,9 +78,22 @@ pub(super) async fn handle_command(
         Command::Help => {
             send_help(&bot, msg.chat.id).await?;
         }
-        Command::Status(arg) => tg_status(&bot, msg.chat.id, &config_snapshot, arg.trim()).await,
-        Command::Check(arg) => tg_check(&bot, msg.chat.id, &config_snapshot, arg.trim()).await,
+        Command::Status(arg) => {
+            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
+                return Ok(());
+            };
+            tg_status(&bot, msg.chat.id, &config_snapshot, arg.trim()).await
+        }
+        Command::Check(arg) => {
+            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
+                return Ok(());
+            };
+            tg_check(&bot, msg.chat.id, &config_snapshot, arg.trim()).await
+        }
         Command::Change(arg) => {
+            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
+                return Ok(());
+            };
             tg_change(
                 &bot,
                 msg.chat.id,
@@ -91,9 +104,17 @@ pub(super) async fn handle_command(
             .await
         }
         Command::Timer => {
+            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
+                return Ok(());
+            };
             show_timer_panel(&bot, msg.chat.id, &shared.timer, &shared.timer_messages).await
         }
-        Command::Servers => show_servers(&bot, msg.chat.id, &config_snapshot).await,
+        Command::Servers => {
+            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
+                return Ok(());
+            };
+            show_servers(&bot, msg.chat.id, &config_snapshot).await
+        }
         Command::Addserver => {
             start_add_server_wizard(&bot, msg.chat.id, &shared.server_wizards).await
         }

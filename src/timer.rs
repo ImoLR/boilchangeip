@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     boil::BoilClient,
     config::{save_app_config, AppConfig, ServerSelection, ServerTimerConfig},
-    reconnect::{reconnect_one, reconnect_selected, ReconnectPolicy},
+    reconnect::{reconnect_one, reconnect_selected, ReconnectPolicy, ReconnectStatus},
 };
 
 const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
@@ -349,6 +349,8 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
         }
     };
 
+    tg_notify(config, "⏰ 定时换 IP 开始\n\n共 1 台 VPS，开始处理...").await;
+
     let result = reconnect_one(&client, selected, &ReconnectPolicy::default()).await;
     log::info!(
         "定时换 IP 完成: server_id={} status={:?} changed={}",
@@ -369,6 +371,18 @@ async fn run_auto_change_all(config: &AppConfig) {
 }
 
 async fn run_auto_change_all_locked(config: &AppConfig) {
+    let selected_count = match config.resolve_servers(ServerSelection::All) {
+        Ok(crate::config::ResolvedSelection::All(servers)) => servers.len(),
+        Ok(crate::config::ResolvedSelection::One(_)) => {
+            log::error!("全局定时换 IP 配置错误: 全部 Server 解析为单台选择");
+            return;
+        }
+        Err(e) => {
+            log::warn!("全局定时换 IP 跳过: {e}");
+            return;
+        }
+    };
+
     let client = match BoilClient::new() {
         Ok(client) => client,
         Err(e) => {
@@ -376,6 +390,12 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
             return;
         }
     };
+
+    tg_notify(
+        config,
+        &format!("⏰ 定时换 IP 开始\n\n共 {selected_count} 台 VPS，开始逐台处理..."),
+    )
+    .await;
 
     let batch = match reconnect_selected(
         &client,
@@ -410,45 +430,68 @@ where
 }
 
 fn format_timer_result(result: &crate::reconnect::ReconnectResult) -> String {
-    let mut lines = vec![
-        format!("⏰ 定时换 IP: {}", result.server_name),
-        format!("状态: {:?}", result.status),
-    ];
-    if let Some(old_ip) = result.old_ip {
-        lines.push(format!("旧 IP: {old_ip}"));
-    }
-    if let Some(new_ip) = result.new_ip {
-        lines.push(format!("新 IP: {new_ip}"));
-    }
-    if let Some(uses_left) = result.uses_left {
-        lines.push(format!("剩余次数: {uses_left}"));
-    }
-    if let Some(next_allowed_at) = result.next_allowed_at {
-        lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
-    }
-    if let Some(message) = &result.message {
-        lines.push(format!("信息: {message}"));
-    }
+    let mut lines = vec!["⏰ 定时换 IP 完成".to_string(), String::new()];
+    append_timer_result_lines(&mut lines, result);
     lines.join("\n")
 }
 
 fn format_timer_batch_result(result: &crate::reconnect::BatchReconnectResult) -> String {
-    let mut lines = vec![format!(
-        "⏰ 全部 Server 定时换 IP: success={} unconfirmed={} failed={}",
-        result.success_count(),
-        result.unconfirmed_count(),
-        result.failure_count()
-    )];
+    let mut lines = vec![
+        "⏰ 定时换 IP 完成".to_string(),
+        String::new(),
+        format!("✅ 成功：{}", result.success_count()),
+        format!("⚠️ 待确认：{}", result.unconfirmed_count()),
+        format!("❌ 失败：{}", result.failure_count()),
+    ];
+
     for item in &result.results {
-        lines.push(format!(
-            "{} ({}) | {:?} | changed={}",
-            item.server_name, item.server_id, item.status, item.changed
-        ));
-        if let Some(message) = &item.message {
-            lines.push(format!("信息: {message}"));
-        }
+        lines.push(String::new());
+        append_timer_result_lines(&mut lines, item);
     }
     lines.join("\n")
+}
+
+fn append_timer_result_lines(lines: &mut Vec<String>, result: &crate::reconnect::ReconnectResult) {
+    lines.push(format!("📡 {}", result.server_name));
+    lines.push(timer_status_message(result).to_string());
+    if let Some(old_ip) = result.old_ip {
+        lines.push(format!("旧 IP：{old_ip}"));
+    }
+    if let Some(new_ip) = result.new_ip {
+        lines.push(format!("新 IP：{new_ip}"));
+    }
+    if let Some(uses_left) = result.uses_left {
+        lines.push(format!("剩余次数：{uses_left}"));
+    }
+    if result.status != ReconnectStatus::Success {
+        lines.push(format!("原因：{}", timer_reason(result)));
+    }
+}
+
+fn timer_status_message(result: &crate::reconnect::ReconnectResult) -> &'static str {
+    match result.status {
+        ReconnectStatus::Success => "✅ 换 IP 成功",
+        ReconnectStatus::ChangeAcceptedButUnconfirmed => "⚠️ 换 IP 已提交，但暂时无法确认结果",
+        _ => "❌ 换 IP 失败",
+    }
+}
+
+fn timer_reason(result: &crate::reconnect::ReconnectResult) -> String {
+    match result.status {
+        ReconnectStatus::Success => "换 IP 已完成".to_string(),
+        ReconnectStatus::Disabled => "这台 VPS 已禁用".to_string(),
+        ReconnectStatus::PreflightFailed => {
+            "换 IP 前查询当前 IP 失败，未发送换 IP 请求".to_string()
+        }
+        ReconnectStatus::ApiRejected => result
+            .message
+            .clone()
+            .unwrap_or_else(|| "Boil API 拒绝请求".to_string()),
+        ReconnectStatus::ChangeAcceptedButUnconfirmed => {
+            "查询新 IP 超时或暂时失败，请稍后使用 /status 查看".to_string()
+        }
+        ReconnectStatus::InvalidResponse => "Boil API 响应无效".to_string(),
+    }
 }
 
 async fn tg_notify(config: &AppConfig, msg: &str) {
@@ -525,6 +568,21 @@ mod tests {
                 enabled: timer_enabled,
                 cron: Some(cron.to_string()),
             }),
+        }
+    }
+
+    fn reconnect_result(name: &str, status: ReconnectStatus) -> crate::reconnect::ReconnectResult {
+        crate::reconnect::ReconnectResult {
+            server_id: name.to_lowercase(),
+            server_name: name.to_string(),
+            old_ip: Some("42.1.1.1".parse().unwrap()),
+            new_ip: (status == ReconnectStatus::Success).then(|| "42.1.1.2".parse().unwrap()),
+            changed: status == ReconnectStatus::Success,
+            uses_left: (status == ReconnectStatus::Success).then_some(997),
+            next_allowed_at: Some(1785100089),
+            status,
+            message: Some("Boil API 请求超时".to_string()),
+            poll_attempts: 3,
         }
     }
 
@@ -851,5 +909,46 @@ mod tests {
         second.await.unwrap();
 
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timer_single_result_uses_human_readable_text() {
+        let text = format_timer_result(&reconnect_result("Taiwan VPS", ReconnectStatus::Success));
+
+        assert!(text.contains("⏰ 定时换 IP 完成"));
+        assert!(text.contains("📡 Taiwan VPS"));
+        assert!(text.contains("✅ 换 IP 成功"));
+        assert!(text.contains("旧 IP：42.1.1.1"));
+        assert!(text.contains("新 IP：42.1.1.2"));
+        assert!(text.contains("剩余次数：997"));
+        assert!(!text.contains("Success"));
+        assert!(!text.contains("changed=false"));
+        assert!(!text.contains("1785100089"));
+    }
+
+    #[test]
+    fn timer_batch_result_summarizes_success_unconfirmed_and_failed() {
+        let batch = crate::reconnect::BatchReconnectResult {
+            results: vec![
+                reconnect_result("Taiwan VPS", ReconnectStatus::Success),
+                reconnect_result("Hong Kong VPS", ReconnectStatus::ApiRejected),
+                reconnect_result("Japan VPS", ReconnectStatus::ChangeAcceptedButUnconfirmed),
+            ],
+        };
+
+        let text = format_timer_batch_result(&batch);
+
+        assert!(text.contains("✅ 成功：1"));
+        assert!(text.contains("⚠️ 待确认：1"));
+        assert!(text.contains("❌ 失败：1"));
+        assert!(text.contains("📡 Taiwan VPS"));
+        assert!(text.contains("📡 Hong Kong VPS"));
+        assert!(text.contains("📡 Japan VPS"));
+        assert!(text.contains("⚠️ 换 IP 已提交，但暂时无法确认结果"));
+        assert!(text.contains("原因：查询新 IP 超时或暂时失败，请稍后使用 /status 查看"));
+        assert!(!text.contains("success="));
+        assert!(!text.contains("NetworkError"));
+        assert!(!text.contains("PreflightFailed"));
+        assert!(!text.contains("changed=false"));
     }
 }

@@ -17,6 +17,8 @@ static CHANGE_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 const SUCCESS_MESSAGE: &str = "换 IP 已完成";
 const UNCONFIRMED_MESSAGE: &str =
     "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 boil status 或 Telegram /status 查看。";
+const CHANGE_RESPONSE_UNCONFIRMED_MESSAGE: &str =
+    "换 IP 请求已发出，但 Boil API 响应暂时无法确认，正在查询最终 IP。";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconnectPolicy {
@@ -43,7 +45,6 @@ pub enum ReconnectStatus {
     ApiRejected,
     ChangeAcceptedButUnconfirmed,
     InvalidResponse,
-    NetworkError,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,27 +141,32 @@ async fn reconnect_one_locked(
     };
 
     let change = with_change_ip_lock(client.change_ip(&server.token)).await;
-    let change = match change {
-        Ok(response) => response,
-        Err(error) => {
+    let mut result = match change {
+        Ok(response) => {
             let mut result = base_result(
                 server,
-                change_error_status(&error),
-                Some(&error.to_string()),
+                ReconnectStatus::ChangeAcceptedButUnconfirmed,
+                Some(UNCONFIRMED_MESSAGE),
             );
             result.old_ip = Some(old_ip);
-            return result;
+            result.uses_left = response.uses_left;
+            result.next_allowed_at = response.next_allowed_at.filter(|timestamp| *timestamp >= 0);
+            result
+        }
+        Err(error) => {
+            let status = change_error_status(&error);
+            if status == ReconnectStatus::ChangeAcceptedButUnconfirmed {
+                let mut result =
+                    base_result(server, status, Some(CHANGE_RESPONSE_UNCONFIRMED_MESSAGE));
+                result.old_ip = Some(old_ip);
+                result
+            } else {
+                let mut result = base_result(server, status, Some(&error.to_string()));
+                result.old_ip = Some(old_ip);
+                return result;
+            }
         }
     };
-
-    let mut result = base_result(
-        server,
-        ReconnectStatus::ChangeAcceptedButUnconfirmed,
-        Some(UNCONFIRMED_MESSAGE),
-    );
-    result.old_ip = Some(old_ip);
-    result.uses_left = change.uses_left;
-    result.next_allowed_at = change.next_allowed_at.filter(|timestamp| *timestamp >= 0);
 
     tokio::time::sleep(policy.initial_delay).await;
 
@@ -239,7 +245,7 @@ fn change_error_status(error: &BoilApiError) -> ReconnectStatus {
             ReconnectStatus::InvalidResponse
         }
         BoilApiError::Transport(_) | BoilApiError::HttpStatus { .. } => {
-            ReconnectStatus::NetworkError
+            ReconnectStatus::ChangeAcceptedButUnconfirmed
         }
     }
 }
@@ -622,6 +628,33 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("quota exhausted"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_change_response_polls_and_can_confirm_success() {
+        let mock = MockServer::start(vec![
+            ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
+            disconnect(),
+            ip(r#"{"ok":true,"ip":"42.1.1.2"}"#),
+        ])
+        .await;
+        let client = BoilClient::with_api_base_url(&mock.base_url).unwrap();
+
+        let result = reconnect_one(&client, &server("uncertain-change", true), &policy(3)).await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert!(result.changed);
+        assert_eq!(
+            result.old_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("42.1.1.1")
+        );
+        assert_eq!(
+            result.new_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("42.1.1.2")
+        );
+        assert_eq!(result.poll_attempts, 1);
+        assert_eq!(mock.change_count(), 1);
+        assert_eq!(mock.request_count(), 3);
     }
 
     #[tokio::test]

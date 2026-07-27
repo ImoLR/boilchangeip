@@ -280,7 +280,6 @@ fn status_text(status: &ReconnectStatus) -> &'static str {
         ReconnectStatus::ApiRejected => "API 拒绝",
         ReconnectStatus::ChangeAcceptedButUnconfirmed => "已接受但未确认",
         ReconnectStatus::InvalidResponse => "响应无效",
-        ReconnectStatus::NetworkError => "网络错误",
     }
 }
 

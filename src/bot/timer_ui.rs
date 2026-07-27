@@ -40,10 +40,7 @@ pub(super) async fn show_timer_panel(
             InlineKeyboardButton::callback("➕ 新建", "timer_new"),
             InlineKeyboardButton::callback("✏️ 编辑", "timer_edit"),
         ],
-        vec![
-            InlineKeyboardButton::callback("⏸ 关闭", "timer_close"),
-            InlineKeyboardButton::callback("🔄 刷新", "timer_refresh"),
-        ],
+        vec![InlineKeyboardButton::callback("⏸ 关闭", "timer_close")],
     ]);
     let sent = bot
         .send_message(chat_id, format_timer_panel(&status, &current_ips))

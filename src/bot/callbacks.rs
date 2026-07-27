@@ -36,7 +36,6 @@ pub(super) enum CallbackAction<'a> {
     TimerNew,
     TimerEdit,
     TimerClose,
-    TimerRefresh,
     TimerCreateAll { hhmm: &'a str },
     TimerCreateServer { server_id: &'a str, hhmm: &'a str },
     TimerEditTargetAll,
@@ -81,78 +80,104 @@ pub(super) async fn handle_callback(
             start_add_server_wizard(&bot, chat_id, &shared.server_wizards).await;
         }
         CallbackAction::MenuServers => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            shared.server_edits.lock().await.cancel(chat_id);
-            let config_snapshot = shared.config.lock().await.clone();
-            show_servers(&bot, chat_id, &config_snapshot).await;
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                task_shared.server_edits.lock().await.cancel(chat_id);
+                let config_snapshot = task_shared.config.lock().await.clone();
+                show_servers(&task_bot, chat_id, &config_snapshot).await;
+            });
         }
         CallbackAction::MenuStatus => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            tg_status(&bot, chat_id, &config_snapshot, "").await;
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_status(&task_bot, chat_id, &config_snapshot, "").await;
+            });
         }
         CallbackAction::MenuChange => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            tg_change(&bot, chat_id, &config_snapshot, &shared.confirmations, "").await;
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_change(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &task_shared.confirmations,
+                    "",
+                )
+                .await;
+            });
         }
         CallbackAction::MenuTimer => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            show_timer_panel(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                show_timer_panel(
+                    &task_bot,
+                    chat_id,
+                    &task_shared.timer,
+                    &task_shared.timer_messages,
+                )
+                .await;
+            });
         }
         CallbackAction::MenuHelp => {
             let _ = send_help(&bot, chat_id).await;
         }
         CallbackAction::SelectStatus(server_id) => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            tg_status(&bot, chat_id, &config_snapshot, server_id).await;
+            let server_id = server_id.to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_status(&task_bot, chat_id, &config_snapshot, &server_id).await;
+            });
         }
         CallbackAction::SelectCheck(server_id) => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            tg_check(&bot, chat_id, &config_snapshot, server_id).await;
+            let server_id = server_id.to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_check(&task_bot, chat_id, &config_snapshot, &server_id).await;
+            });
         }
         CallbackAction::SelectChange(server_id) => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            show_change_confirmation(
-                &bot,
-                chat_id,
-                &config_snapshot,
-                &shared.confirmations,
-                server_id,
-            )
-            .await;
+            let server_id = server_id.to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                show_change_confirmation(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &task_shared.confirmations,
+                    &server_id,
+                )
+                .await;
+            });
         }
         CallbackAction::ConfirmChange { server_id, nonce } => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            let config_snapshot = shared.config.lock().await.clone();
-            confirm_and_change(
-                &bot,
-                chat_id,
-                &config_snapshot,
-                &shared.confirmations,
-                server_id,
-                nonce,
-            )
-            .await;
+            let server_id = server_id.to_string();
+            let nonce = nonce.to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                confirm_and_change(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &task_shared.confirmations,
+                    &server_id,
+                    &nonce,
+                )
+                .await;
+            });
         }
         CallbackAction::CancelChange { server_id, nonce } => {
             let _ = shared
@@ -189,15 +214,6 @@ pub(super) async fn handle_callback(
                 record_timer_message(chat_id, message.id, &shared.timer_messages).await;
             }
             show_timer_close_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
-        }
-        CallbackAction::TimerRefresh => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
-            }
-            show_timer_panel(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
         }
         CallbackAction::TimerCreateAll { hhmm } => {
             if let Some(message) = &q.message {
@@ -334,10 +350,19 @@ pub(super) async fn handle_callback(
             let _ = bot.send_message(chat_id, "请输入新的服务器 Token：").await;
         }
         CallbackAction::ServerRevalidate(server_id) => {
-            let Some(_busy) = shared.try_enter_busy(chat_id) else {
-                return Ok(());
-            };
-            revalidate_server(&bot, chat_id, &shared.config, &shared.timer, server_id).await;
+            let server_id = server_id.to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(chat_id, async move {
+                revalidate_server(
+                    &task_bot,
+                    chat_id,
+                    &task_shared.config,
+                    &task_shared.timer,
+                    &server_id,
+                )
+                .await;
+            });
         }
         CallbackAction::ServerDelete(server_id) => {
             let config_snapshot = shared.config.lock().await.clone();
@@ -429,9 +454,6 @@ pub(super) fn parse_callback(data: &str) -> CallbackAction<'_> {
     if data == "timer_close" {
         return CallbackAction::TimerClose;
     }
-    if data == "timer_refresh" {
-        return CallbackAction::TimerRefresh;
-    }
     if let Some(hhmm) = data.strip_prefix("timer_create:all:") {
         return CallbackAction::TimerCreateAll { hhmm };
     }
@@ -515,10 +537,6 @@ mod tests {
         assert_eq!(parse_callback("timer_new"), CallbackAction::TimerNew);
         assert_eq!(parse_callback("timer_edit"), CallbackAction::TimerEdit);
         assert_eq!(parse_callback("timer_close"), CallbackAction::TimerClose);
-        assert_eq!(
-            parse_callback("timer_refresh"),
-            CallbackAction::TimerRefresh
-        );
         assert_eq!(
             parse_callback("timer_create:all:03:30"),
             CallbackAction::TimerCreateAll { hhmm: "03:30" }

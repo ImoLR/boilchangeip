@@ -70,7 +70,6 @@ pub(super) async fn handle_command(
         return Ok(());
     }
 
-    let config_snapshot = shared.config.lock().await.clone();
     match cmd {
         Command::Start => {
             send_start_menu(&bot, msg.chat.id).await?;
@@ -79,41 +78,59 @@ pub(super) async fn handle_command(
             send_help(&bot, msg.chat.id).await?;
         }
         Command::Status(arg) => {
-            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
-                return Ok(());
-            };
-            tg_status(&bot, msg.chat.id, &config_snapshot, arg.trim()).await
+            let arg = arg.trim().to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(msg.chat.id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_status(&task_bot, msg.chat.id, &config_snapshot, &arg).await;
+            });
         }
         Command::Check(arg) => {
-            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
-                return Ok(());
-            };
-            tg_check(&bot, msg.chat.id, &config_snapshot, arg.trim()).await
+            let arg = arg.trim().to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(msg.chat.id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_check(&task_bot, msg.chat.id, &config_snapshot, &arg).await;
+            });
         }
         Command::Change(arg) => {
-            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
-                return Ok(());
-            };
-            tg_change(
-                &bot,
-                msg.chat.id,
-                &config_snapshot,
-                &shared.confirmations,
-                arg.trim(),
-            )
-            .await
+            let arg = arg.trim().to_string();
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(msg.chat.id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                tg_change(
+                    &task_bot,
+                    msg.chat.id,
+                    &config_snapshot,
+                    &task_shared.confirmations,
+                    &arg,
+                )
+                .await;
+            });
         }
         Command::Timer => {
-            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
-                return Ok(());
-            };
-            show_timer_panel(&bot, msg.chat.id, &shared.timer, &shared.timer_messages).await
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(msg.chat.id, async move {
+                show_timer_panel(
+                    &task_bot,
+                    msg.chat.id,
+                    &task_shared.timer,
+                    &task_shared.timer_messages,
+                )
+                .await;
+            });
         }
         Command::Servers => {
-            let Some(_busy) = shared.try_enter_busy(msg.chat.id) else {
-                return Ok(());
-            };
-            show_servers(&bot, msg.chat.id, &config_snapshot).await
+            let task_shared = shared.clone();
+            let task_bot = bot.clone();
+            shared.spawn_if_not_busy(msg.chat.id, async move {
+                let config_snapshot = task_shared.config.lock().await.clone();
+                show_servers(&task_bot, msg.chat.id, &config_snapshot).await;
+            });
         }
         Command::Addserver => {
             start_add_server_wizard(&bot, msg.chat.id, &shared.server_wizards).await
@@ -230,7 +247,7 @@ pub(super) fn start_menu_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("🔄 更换 IP", "menu:change"),
         ],
         vec![
-            InlineKeyboardButton::callback("⏰ 定时任务", "menu:timer"),
+            InlineKeyboardButton::callback("⏰ 定时换 IP", "menu:timer"),
             InlineKeyboardButton::callback("❓ 帮助", "menu:help"),
         ],
     ])
@@ -374,7 +391,7 @@ mod tests {
         assert!(debug.contains("🖥 服务器列表"));
         assert!(debug.contains("📊 查看状态"));
         assert!(debug.contains("🔄 更换 IP"));
-        assert!(debug.contains("⏰ 定时任务"));
+        assert!(debug.contains("⏰ 定时换 IP"));
         assert!(debug.contains("❓ 帮助"));
         assert!(!debug.contains("hidden-token"));
     }

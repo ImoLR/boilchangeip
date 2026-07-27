@@ -439,11 +439,7 @@ async fn notify_timer_processing(
     client: &BoilClient,
     server: &crate::config::ServerConfig,
 ) -> (Option<TimerProgressMessage>, Option<std::net::IpAddr>) {
-    let progress = tg_send(
-        config,
-        &format!("🔄 现在处理：{}\n⚙️ 正在查询当前 IP，请稍候…", server.name),
-    )
-    .await;
+    let progress = tg_send(config, &format!("🔄 现在处理：{}", server.name)).await;
 
     let current_ip = match client.get_ip(&server.token).await {
         Ok(response) => Some(response.ip),
@@ -455,17 +451,6 @@ async fn notify_timer_processing(
             None
         }
     };
-    let current_ip_text = current_ip
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "查询失败".to_string());
-    edit_timer_progress(
-        progress.clone(),
-        &format!(
-            "🔄 现在处理：{}\n当前 IP：{}\n⌛ 正在更换 IP，请稍候…",
-            server.name, current_ip_text
-        ),
-    )
-    .await;
     (progress, current_ip)
 }
 
@@ -479,17 +464,9 @@ struct TimerProgressMessage {
 async fn update_timer_progress(
     progress: Option<TimerProgressMessage>,
     server_name: String,
-    event: ReconnectProgress,
+    _event: ReconnectProgress,
 ) {
-    match event {
-        ReconnectProgress::VerifyingNewIp { old_ip } => {
-            edit_timer_progress(
-                progress,
-                &format!("🔄 现在处理：{server_name}\n旧 IP：{old_ip}\n⚙️ 正在查询新 IP，请稍候…"),
-            )
-            .await;
-        }
-    }
+    edit_timer_progress(progress, &format!("🔄 现在处理：{server_name}")).await;
 }
 
 async fn edit_timer_progress(progress: Option<TimerProgressMessage>, msg: &str) {

@@ -30,24 +30,26 @@ pub(super) async fn show_servers(bot: &Bot, chat_id: ChatId, config: &AppConfig)
             None
         }
     };
-    if client.is_some() {
-        let _ = bot
-            .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
-            .await;
-    }
-
     for server in &config.servers {
         let current_ip = match &client {
-            Some(client) => match client.get_ip(&server.token).await {
-                Ok(response) => response.ip.to_string(),
-                Err(error) => {
-                    log::warn!(
-                        "服务器列表查询当前 IP 失败: server_id={}: {error}",
-                        server.id
-                    );
-                    "查询失败".to_string()
+            Some(client) => {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        format!("⚙️ 正在查询当前 IP，请稍候…\n📡 {}", server.name),
+                    )
+                    .await;
+                match client.get_ip(&server.token).await {
+                    Ok(response) => response.ip.to_string(),
+                    Err(error) => {
+                        log::warn!(
+                            "服务器列表查询当前 IP 失败: server_id={}: {error}",
+                            server.id
+                        );
+                        "查询失败".to_string()
+                    }
                 }
-            },
+            }
             None => "查询失败".to_string(),
         };
         let _ = bot

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -113,8 +114,11 @@ pub(super) struct BotShared {
 }
 
 impl BotShared {
-    pub(super) fn try_enter_busy(&self, chat_id: ChatId) -> Option<BotBusyGuard> {
-        self.busy.try_enter(chat_id)
+    pub(super) fn spawn_if_not_busy<Fut>(&self, chat_id: ChatId, future: Fut) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.busy.spawn_if_not_busy(chat_id, future)
     }
 }
 
@@ -128,6 +132,20 @@ impl BotBusyStore {
             chat_id,
             busy_chats: Arc::clone(self),
         })
+    }
+
+    fn spawn_if_not_busy<Fut>(self: &Arc<Self>, chat_id: ChatId, future: Fut) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let Some(guard) = self.try_enter(chat_id) else {
+            return false;
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            future.await;
+        });
+        true
     }
 }
 
@@ -185,6 +203,40 @@ mod busy_tests {
 
         let _first = busy.try_enter(ChatId(10)).unwrap();
         assert!(busy.try_enter(ChatId(11)).is_some());
+    }
+
+    #[tokio::test]
+    async fn spawned_busy_operation_drops_second_request_without_delayed_execution() {
+        let busy = Arc::new(BotBusyStore::default());
+        let chat = ChatId(10);
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        assert!(busy.spawn_if_not_busy(chat, {
+            let first_started = Arc::clone(&first_started);
+            async move {
+                first_started.store(true, Ordering::SeqCst);
+                let _ = release_first_rx.await;
+            }
+        }));
+
+        while !first_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!busy.spawn_if_not_busy(chat, {
+            let second_executed = Arc::clone(&second_executed);
+            async move {
+                second_executed.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        let _ = release_first_tx.send(());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!second_executed.load(Ordering::SeqCst));
+        assert!(busy.spawn_if_not_busy(chat, async {}));
     }
 }
 

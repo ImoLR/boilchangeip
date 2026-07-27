@@ -9,7 +9,8 @@ use crate::{
     boil::BoilClient,
     config::{save_app_config, AppConfig, ServerSelection, ServerTimerConfig},
     reconnect::{
-        reconnect_one_with_current_ip, BatchReconnectResult, ReconnectPolicy, ReconnectStatus,
+        reconnect_one_with_current_ip_and_progress, BatchReconnectResult, ReconnectPolicy,
+        ReconnectProgress, ReconnectStatus,
     },
 };
 
@@ -353,10 +354,15 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
 
     tg_notify(config, "⏰ 定时换 IP 开始\n\n共 1 台 VPS，开始处理...").await;
 
-    let current_ip = notify_timer_processing(config, &client, selected).await;
-    let result =
-        reconnect_one_with_current_ip(&client, selected, &ReconnectPolicy::default(), current_ip)
-            .await;
+    let (progress, current_ip) = notify_timer_processing(config, &client, selected).await;
+    let result = reconnect_one_with_current_ip_and_progress(
+        &client,
+        selected,
+        &ReconnectPolicy::default(),
+        current_ip,
+        |event| update_timer_progress(progress.clone(), selected.name.clone(), event),
+    )
+    .await;
     log::info!(
         "定时换 IP 完成: server_id={} status={:?} changed={}",
         result.server_id,
@@ -407,10 +413,15 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
 
     let mut batch = BatchReconnectResult::default();
     for server in selected {
-        let current_ip = notify_timer_processing(config, &client, server).await;
-        let result =
-            reconnect_one_with_current_ip(&client, server, &ReconnectPolicy::default(), current_ip)
-                .await;
+        let (progress, current_ip) = notify_timer_processing(config, &client, server).await;
+        let result = reconnect_one_with_current_ip_and_progress(
+            &client,
+            server,
+            &ReconnectPolicy::default(),
+            current_ip,
+            |event| update_timer_progress(progress.clone(), server.name.clone(), event),
+        )
+        .await;
         batch.results.push(result);
     }
 
@@ -427,7 +438,13 @@ async fn notify_timer_processing(
     config: &AppConfig,
     client: &BoilClient,
     server: &crate::config::ServerConfig,
-) -> Option<std::net::IpAddr> {
+) -> (Option<TimerProgressMessage>, Option<std::net::IpAddr>) {
+    let progress = tg_send(
+        config,
+        &format!("🔄 现在处理：{}\n⚙️ 正在查询当前 IP，请稍候…", server.name),
+    )
+    .await;
+
     let current_ip = match client.get_ip(&server.token).await {
         Ok(response) => Some(response.ip),
         Err(error) => {
@@ -441,12 +458,48 @@ async fn notify_timer_processing(
     let current_ip_text = current_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "查询失败".to_string());
-    tg_notify(
-        config,
-        &format!("🔄 现在处理：{}\n当前 IP：{}", server.name, current_ip_text),
+    edit_timer_progress(
+        progress.clone(),
+        &format!(
+            "🔄 现在处理：{}\n当前 IP：{}\n⌛ 正在更换 IP，请稍候…",
+            server.name, current_ip_text
+        ),
     )
     .await;
-    current_ip
+    (progress, current_ip)
+}
+
+#[derive(Clone)]
+struct TimerProgressMessage {
+    bot: Bot,
+    chat_id: ChatId,
+    message_id: teloxide::types::MessageId,
+}
+
+async fn update_timer_progress(
+    progress: Option<TimerProgressMessage>,
+    server_name: String,
+    event: ReconnectProgress,
+) {
+    match event {
+        ReconnectProgress::VerifyingNewIp { old_ip } => {
+            edit_timer_progress(
+                progress,
+                &format!("🔄 现在处理：{server_name}\n旧 IP：{old_ip}\n⚙️ 正在查询新 IP，请稍候…"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn edit_timer_progress(progress: Option<TimerProgressMessage>, msg: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    let _ = progress
+        .bot
+        .edit_message_text(progress.chat_id, progress.message_id, msg)
+        .await;
 }
 
 async fn with_timer_run_lock<F, R>(future: F) -> R
@@ -523,17 +576,32 @@ fn timer_reason(result: &crate::reconnect::ReconnectResult) -> String {
 }
 
 async fn tg_notify(config: &AppConfig, msg: &str) {
+    let _ = tg_send(config, msg).await;
+}
+
+async fn tg_send(config: &AppConfig, msg: &str) -> Option<TimerProgressMessage> {
     let (token, chat_id) = match (&config.tg_token, &config.tg_chat_id) {
         (Some(token), Some(chat_id)) => (token, chat_id),
-        _ => return,
+        _ => return None,
     };
 
     let bot = Bot::new(token);
     let Ok(chat_id) = chat_id.parse::<i64>() else {
         log::warn!("TG_CHAT_ID 无效，跳过定时通知");
-        return;
+        return None;
     };
-    let _ = bot.send_message(ChatId(chat_id), msg).await;
+    let chat_id = ChatId(chat_id);
+    match bot.send_message(chat_id, msg).await {
+        Ok(message) => Some(TimerProgressMessage {
+            bot,
+            chat_id,
+            message_id: message.id,
+        }),
+        Err(error) => {
+            log::warn!("发送定时通知失败: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

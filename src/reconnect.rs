@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     net::IpAddr,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
@@ -61,6 +62,11 @@ pub struct ReconnectResult {
     pub poll_attempts: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectProgress {
+    VerifyingNewIp { old_ip: IpAddr },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchReconnectResult {
     pub results: Vec<ReconnectResult>,
@@ -100,6 +106,21 @@ pub async fn reconnect_one_with_current_ip(
     policy: &ReconnectPolicy,
     current_ip: Option<IpAddr>,
 ) -> ReconnectResult {
+    reconnect_one_with_current_ip_and_progress(client, server, policy, current_ip, |_| async {})
+        .await
+}
+
+pub async fn reconnect_one_with_current_ip_and_progress<F, Fut>(
+    client: &BoilClient,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+    on_progress: F,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+{
     if !server.enabled {
         return base_result(
             server,
@@ -110,7 +131,7 @@ pub async fn reconnect_one_with_current_ip(
 
     let lock = server_lock(&server.id);
     let _guard = lock.lock().await;
-    reconnect_one_locked(client, server, policy, current_ip).await
+    reconnect_one_locked(client, server, policy, current_ip, on_progress).await
 }
 
 pub async fn reconnect_selected(
@@ -136,12 +157,17 @@ pub async fn reconnect_selected(
     Ok(BatchReconnectResult { results })
 }
 
-async fn reconnect_one_locked(
+async fn reconnect_one_locked<F, Fut>(
     client: &BoilClient,
     server: &ServerConfig,
     policy: &ReconnectPolicy,
     current_ip: Option<IpAddr>,
-) -> ReconnectResult {
+    mut on_progress: F,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let old_ip = match current_ip {
         Some(ip) => ip,
         None => match client.get_ip(&server.token).await {
@@ -180,6 +206,8 @@ async fn reconnect_one_locked(
             }
         }
     };
+
+    on_progress(ReconnectProgress::VerifyingNewIp { old_ip }).await;
 
     tokio::time::sleep(policy.initial_delay).await;
 

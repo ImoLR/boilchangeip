@@ -48,9 +48,31 @@ pub(super) struct TimerInputStore {
     pending: HashMap<ChatId, PendingTimerInput>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UiPage {
+    Start,
+    Servers,
+    Status,
+    Check,
+    Change,
+    Timer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UiCleanupBatch {
+    pub(super) page: Option<UiPage>,
+    pub(super) messages: Vec<MessageId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct UiSession {
+    page: Option<UiPage>,
+    messages: Vec<MessageId>,
+}
+
 #[derive(Default)]
-pub(super) struct TimerMessageStore {
-    messages: HashMap<ChatId, Vec<MessageId>>,
+pub(super) struct UiSessionStore {
+    sessions: HashMap<ChatId, UiSession>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,7 +129,7 @@ pub(super) struct BotShared {
     pub(super) timer: Arc<Mutex<TimerManager>>,
     pub(super) confirmations: Arc<Mutex<ConfirmationStore>>,
     pub(super) timer_inputs: Arc<Mutex<TimerInputStore>>,
-    pub(super) timer_messages: Arc<Mutex<TimerMessageStore>>,
+    pub(super) ui_sessions: Arc<Mutex<UiSessionStore>>,
     pub(super) server_wizards: Arc<Mutex<ServerWizardStore>>,
     pub(super) server_edits: Arc<Mutex<ServerEditStore>>,
     pub(super) busy: Arc<BotBusyStore>,
@@ -240,23 +262,52 @@ mod busy_tests {
     }
 }
 
-impl TimerMessageStore {
+impl UiSessionStore {
     pub(super) fn record(&mut self, chat_id: ChatId, message_id: MessageId) {
-        let messages = self.messages.entry(chat_id).or_default();
-        if !messages.contains(&message_id) {
-            messages.push(message_id);
+        let session = self.sessions.entry(chat_id).or_default();
+        if !session.messages.contains(&message_id) {
+            session.messages.push(message_id);
         }
     }
 
-    pub(super) fn take_all(&mut self, chat_id: ChatId) -> Vec<MessageId> {
-        self.messages.remove(&chat_id).unwrap_or_default()
+    pub(super) fn replace_page(
+        &mut self,
+        chat_id: ChatId,
+        page: UiPage,
+        message_id: MessageId,
+    ) -> UiCleanupBatch {
+        let previous = self.sessions.insert(
+            chat_id,
+            UiSession {
+                page: Some(page),
+                messages: vec![message_id],
+            },
+        );
+
+        UiCleanupBatch {
+            page: previous.as_ref().and_then(|session| session.page),
+            messages: previous
+                .map(|session| session.messages)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|id| *id != message_id)
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_messages(&self, chat_id: ChatId) -> Vec<MessageId> {
+        self.sessions
+            .get(&chat_id)
+            .map(|session| session.messages.clone())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
     pub(super) fn count(&self, chat_id: ChatId) -> usize {
-        self.messages
+        self.sessions
             .get(&chat_id)
-            .map(|messages| messages.len())
+            .map(|session| session.messages.len())
             .unwrap_or_default()
     }
 }
@@ -394,16 +445,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timer_message_store_records_deduplicates_and_takes_messages() {
+    fn ui_session_store_replaces_page_without_cleaning_new_page() {
         let chat_id = ChatId(12345);
-        let mut store = TimerMessageStore::default();
+        let mut store = UiSessionStore::default();
         store.record(chat_id, MessageId(10));
         store.record(chat_id, MessageId(10));
         store.record(chat_id, MessageId(11));
 
         assert_eq!(store.count(chat_id), 2);
-        assert_eq!(store.take_all(chat_id), vec![MessageId(10), MessageId(11)]);
-        assert_eq!(store.count(chat_id), 0);
+        let cleanup = store.replace_page(chat_id, UiPage::Timer, MessageId(12));
+        assert_eq!(cleanup.page, None);
+        assert_eq!(cleanup.messages, vec![MessageId(10), MessageId(11)]);
+        assert_eq!(store.current_messages(chat_id), vec![MessageId(12)]);
+    }
+
+    #[test]
+    fn ui_session_store_replaces_consecutive_pages_without_deleting_latest() {
+        let chat_id = ChatId(12345);
+        let mut store = UiSessionStore::default();
+        let first_cleanup = store.replace_page(chat_id, UiPage::Start, MessageId(20));
+        assert!(first_cleanup.messages.is_empty());
+        store.record(chat_id, MessageId(21));
+
+        let second_cleanup = store.replace_page(chat_id, UiPage::Start, MessageId(22));
+        assert_eq!(second_cleanup.page, Some(UiPage::Start));
+        assert_eq!(second_cleanup.messages, vec![MessageId(20), MessageId(21)]);
+        assert_eq!(store.current_messages(chat_id), vec![MessageId(22)]);
     }
 
     #[test]

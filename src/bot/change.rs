@@ -18,10 +18,17 @@ use crate::{
 
 use super::{
     formatting::{format_server_config_card, html_escape},
-    state::{ConfirmConsume, ConfirmationStore},
+    state::{ConfirmConsume, ConfirmationStore, UiPage, UiSessionStore},
+    timer_ui::{record_sent_page_message, record_sent_ui_message},
 };
 
-pub(super) async fn tg_check(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg: &str) {
+pub(super) async fn tg_check(
+    bot: &Bot,
+    chat_id: ChatId,
+    config: &AppConfig,
+    arg: &str,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) {
     let selection = selection_from_tg_arg(arg);
     let selected = match resolve_for_tg(bot, chat_id, config, selection, "check").await {
         Some(selected) => selected,
@@ -38,13 +45,15 @@ pub(super) async fn tg_check(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg
         }
     };
 
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
         .await;
+    record_sent_page_message(bot, chat_id, sent, UiPage::Check, ui_sessions).await;
     for server in selected_servers(selected) {
-        let _ = bot
+        let sent = bot
             .send_message(chat_id, format!("🔍 检测中: {}", html_escape(&server.name)))
             .await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
         let response = match client.get_ip(&server.token).await {
             Ok(response) => response,
             Err(e) => {
@@ -75,10 +84,11 @@ pub(super) async fn tg_check(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg
                 ip
             ),
         };
-        let _ = bot
+        let sent = bot
             .send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
             .await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
     }
 }
 
@@ -88,6 +98,7 @@ pub(super) async fn tg_change(
     config: &AppConfig,
     confirmations: &Arc<Mutex<ConfirmationStore>>,
     arg: &str,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     let selection = selection_from_tg_arg(arg);
     let selected = match config.resolve_servers(selection) {
@@ -110,7 +121,15 @@ pub(super) async fn tg_change(
         }
     };
 
-    show_change_confirmation(bot, chat_id, config, confirmations, &selected.id).await;
+    show_change_confirmation(
+        bot,
+        chat_id,
+        config,
+        confirmations,
+        &selected.id,
+        ui_sessions,
+    )
+    .await;
 }
 
 pub(super) async fn show_change_confirmation(
@@ -119,6 +138,7 @@ pub(super) async fn show_change_confirmation(
     config: &AppConfig,
     confirmations: &Arc<Mutex<ConfirmationStore>>,
     server_id: &str,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     let server = match config.resolve_servers(ServerSelection::Id(server_id)) {
         Ok(ResolvedSelection::One(server)) => server,
@@ -138,7 +158,7 @@ pub(super) async fn show_change_confirmation(
         ),
         InlineKeyboardButton::callback("取消", format!("cancel_change:{}:{}", server.id, nonce)),
     ]]);
-    let _ = bot
+    let sent = bot
         .send_message(
             chat_id,
             format!(
@@ -149,6 +169,7 @@ pub(super) async fn show_change_confirmation(
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)
         .await;
+    record_sent_page_message(bot, chat_id, sent, UiPage::Change, ui_sessions).await;
 }
 
 pub(super) async fn confirm_and_change(
@@ -158,6 +179,7 @@ pub(super) async fn confirm_and_change(
     confirmations: &Arc<Mutex<ConfirmationStore>>,
     server_id: &str,
     nonce: &str,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     let consume = confirmations
         .lock()
@@ -193,7 +215,8 @@ pub(super) async fn confirm_and_change(
         }
     };
 
-    let _ = bot.send_message(chat_id, "⏳ 开始换 IP，请稍候...").await;
+    let sent = bot.send_message(chat_id, "⏳ 开始换 IP，请稍候...").await;
+    record_sent_page_message(bot, chat_id, sent, UiPage::Change, ui_sessions).await;
     let client = match BoilClient::new() {
         Ok(client) => client,
         Err(e) => {
@@ -203,10 +226,12 @@ pub(super) async fn confirm_and_change(
             return;
         }
     };
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
         .await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
     let progress_bot = bot.clone();
+    let progress_ui_sessions = Arc::clone(ui_sessions);
     let result = reconnect_one_with_current_ip_and_progress(
         &client,
         server,
@@ -214,17 +239,19 @@ pub(super) async fn confirm_and_change(
         None,
         move |progress| {
             let bot = progress_bot.clone();
+            let ui_sessions = Arc::clone(&progress_ui_sessions);
             async move {
                 match progress {
                     ReconnectProgress::VerifyingNewIp { .. } => {
-                        let _ = bot.send_message(chat_id, "⚙️ 正在查询新 IP，请稍候…").await;
+                        let sent = bot.send_message(chat_id, "⚙️ 正在查询新 IP，请稍候…").await;
+                        record_sent_ui_message(chat_id, sent, &ui_sessions).await;
                     }
                 }
             }
         },
     )
     .await;
-    send_reconnect_result(bot, chat_id, &result).await;
+    send_reconnect_result(bot, chat_id, &result, ui_sessions).await;
 }
 
 pub(super) async fn resolve_for_tg<'a>(
@@ -274,7 +301,12 @@ async fn show_server_selection(bot: &Bot, chat_id: ChatId, config: &AppConfig, a
         .await;
 }
 
-async fn send_reconnect_result(bot: &Bot, chat_id: ChatId, result: &ReconnectResult) {
+async fn send_reconnect_result(
+    bot: &Bot,
+    chat_id: ChatId,
+    result: &ReconnectResult,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) {
     let mut lines = vec![
         format!("📡 <b>{}</b>", html_escape(&result.server_name)),
         format!("状态: {:?}", result.status),
@@ -292,10 +324,11 @@ async fn send_reconnect_result(bot: &Bot, chat_id: ChatId, result: &ReconnectRes
         lines.push(format!("信息: {}", html_escape(message)));
     }
 
-    let _ = bot
+    let sent = bot
         .send_message(chat_id, lines.join("\n"))
         .parse_mode(ParseMode::Html)
         .await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
 pub(super) fn selection_from_tg_arg(arg: &str) -> ServerSelection<'_> {

@@ -1,6 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::sync::Arc;
+
 use teloxide::{prelude::*, types::ParseMode};
+use tokio::sync::Mutex;
 
 use crate::{
     boil::BoilClient,
@@ -11,9 +14,17 @@ use crate::{
 use super::{
     change::{resolve_for_tg, selected_servers, selection_from_tg_arg},
     formatting::{html_escape, server_geo_label, short_safe_error},
+    state::{UiPage, UiSessionStore},
+    timer_ui::{record_page_message, record_ui_message},
 };
 
-pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, arg: &str) {
+pub(super) async fn tg_status(
+    bot: &Bot,
+    chat_id: ChatId,
+    config: &AppConfig,
+    arg: &str,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) {
     let selection = selection_from_tg_arg(arg);
     let selected = match resolve_for_tg(bot, chat_id, config, selection, "status").await {
         Some(selected) => selected,
@@ -33,7 +44,7 @@ pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, ar
         .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
         .await;
 
-    for server in selected_servers(selected) {
+    for (index, server) in selected_servers(selected).into_iter().enumerate() {
         let (status, detail, current_ip) = match client.get_ip(&server.token).await {
             Ok(response) => (
                 StatusQueryState::Normal,
@@ -47,10 +58,17 @@ pub(super) async fn tg_status(bot: &Bot, chat_id: ChatId, config: &AppConfig, ar
             ),
         };
         let text = status_text(config, server, status, current_ip.as_deref(), detail);
-        let _ = bot
+        let sent = bot
             .send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
             .await;
+        if let Ok(message) = sent {
+            if index == 0 {
+                record_page_message(bot, chat_id, message.id, UiPage::Status, ui_sessions).await;
+            } else {
+                record_ui_message(chat_id, message.id, ui_sessions).await;
+            }
+        }
     }
 }
 

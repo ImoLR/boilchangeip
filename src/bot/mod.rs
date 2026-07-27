@@ -22,7 +22,7 @@ use callbacks::handle_callback;
 use commands::{handle_command, handle_message, sync_bot_menu, Command};
 use state::{
     BotBusyStore, BotShared, ConfirmationStore, ServerEditStore, ServerWizardStore,
-    TimerInputStore, TimerMessageStore,
+    TimerInputStore, UiSessionStore,
 };
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         timer: Arc::new(Mutex::new(TimerManager::new(timer_config).await?)),
         confirmations: Arc::new(Mutex::new(ConfirmationStore::default())),
         timer_inputs: Arc::new(Mutex::new(TimerInputStore::default())),
-        timer_messages: Arc::new(Mutex::new(TimerMessageStore::default())),
+        ui_sessions: Arc::new(Mutex::new(UiSessionStore::default())),
         server_wizards: Arc::new(Mutex::new(ServerWizardStore::default())),
         server_edits: Arc::new(Mutex::new(ServerEditStore::default())),
         busy: Arc::new(BotBusyStore::default()),

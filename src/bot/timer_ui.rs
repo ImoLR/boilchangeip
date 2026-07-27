@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use teloxide::{
     prelude::*,
@@ -14,16 +14,17 @@ use crate::{
 
 use super::{
     formatting::html_escape,
-    state::{TimerInputMode, TimerInputStore, TimerMessageStore},
+    state::{TimerInputMode, TimerInputStore, UiPage, UiSessionStore},
 };
+
+const UI_CLEANUP_DELAY: Duration = Duration::from_millis(1500);
 
 pub(super) async fn show_timer_panel(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
-    clear_timer_messages(bot, chat_id, timer_messages).await;
     let (status, config) = {
         let timer = timer.lock().await;
         (timer.status(), timer.config().clone())
@@ -32,7 +33,7 @@ pub(super) async fn show_timer_panel(
         let sent = bot
             .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
             .await;
-        record_sent_timer_message(chat_id, sent, timer_messages).await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
     }
     let current_ips = query_timer_current_ips(&config).await;
     let keyboard = InlineKeyboardMarkup::new(vec![
@@ -47,14 +48,14 @@ pub(super) async fn show_timer_panel(
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)
         .await;
-    record_sent_timer_message(chat_id, sent, timer_messages).await;
+    record_sent_page_message(bot, chat_id, sent, UiPage::Timer, ui_sessions).await;
 }
 
 pub(super) async fn show_timer_edit_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     let config = timer.lock().await.config().clone();
     let keyboard = timer_target_keyboard(&config, "timer_edit_target");
@@ -62,14 +63,14 @@ pub(super) async fn show_timer_edit_targets(
         .send_message(chat_id, "请选择要编辑定时时间的范围：")
         .reply_markup(keyboard)
         .await;
-    record_sent_timer_message(chat_id, sent, timer_messages).await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
 pub(super) async fn show_timer_close_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     let config = timer.lock().await.config().clone();
     let keyboard = timer_target_keyboard(&config, "timer_close");
@@ -77,7 +78,7 @@ pub(super) async fn show_timer_close_targets(
         .send_message(chat_id, "请选择要关闭定时换 IP 的范围：")
         .reply_markup(keyboard)
         .await;
-    record_sent_timer_message(chat_id, sent, timer_messages).await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
 pub(super) async fn handle_timer_time_input(
@@ -94,20 +95,20 @@ pub(super) async fn handle_timer_time_input(
     else {
         return;
     };
-    record_timer_message(chat_id, message_id, ctx.timer_messages).await;
+    record_ui_message(chat_id, message_id, ctx.ui_sessions).await;
 
     if let Err(error) = parse_hhmm(text) {
         let sent = ctx
             .bot
             .send_message(chat_id, format!("❌ {}", html_escape(&error.to_string())))
             .await;
-        record_sent_timer_message(chat_id, sent, ctx.timer_messages).await;
+        record_sent_ui_message(chat_id, sent, ctx.ui_sessions).await;
         return;
     }
 
     match mode {
         TimerInputMode::New => {
-            show_timer_create_targets(ctx.bot, chat_id, ctx.timer, ctx.timer_messages, text).await
+            show_timer_create_targets(ctx.bot, chat_id, ctx.timer, ctx.ui_sessions, text).await
         }
         TimerInputMode::Edit(target) => {
             apply_timer_change(
@@ -115,7 +116,7 @@ pub(super) async fn handle_timer_time_input(
                 chat_id,
                 ctx.config,
                 ctx.timer,
-                ctx.timer_messages,
+                ctx.ui_sessions,
                 TimerUpdate::Enable {
                     target,
                     hhmm: text.to_string(),
@@ -131,14 +132,14 @@ pub(super) struct TimerUiContext<'a> {
     pub(super) bot: &'a Bot,
     pub(super) config: &'a Arc<Mutex<AppConfig>>,
     pub(super) timer: &'a Arc<Mutex<TimerManager>>,
-    pub(super) timer_messages: &'a Arc<Mutex<TimerMessageStore>>,
+    pub(super) ui_sessions: &'a Arc<Mutex<UiSessionStore>>,
 }
 
 async fn show_timer_create_targets(
     bot: &Bot,
     chat_id: ChatId,
     timer: &Arc<Mutex<TimerManager>>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
     hhmm: &str,
 ) {
     let config = timer.lock().await.config().clone();
@@ -147,7 +148,7 @@ async fn show_timer_create_targets(
         .send_message(chat_id, "请选择定时换 IP 目标：")
         .reply_markup(keyboard)
         .await;
-    record_sent_timer_message(chat_id, sent, timer_messages).await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
 pub(super) async fn apply_timer_change(
@@ -155,7 +156,7 @@ pub(super) async fn apply_timer_change(
     chat_id: ChatId,
     config: &Arc<Mutex<AppConfig>>,
     timer: &Arc<Mutex<TimerManager>>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
     update: TimerUpdate,
 ) {
     let result = timer.lock().await.apply_update(update).await;
@@ -166,8 +167,8 @@ pub(super) async fn apply_timer_change(
             let sent = bot
                 .send_message(chat_id, "✅ 定时配置已保存并重新调度")
                 .await;
-            record_sent_timer_message(chat_id, sent, timer_messages).await;
-            show_timer_panel(bot, chat_id, timer, timer_messages).await;
+            record_sent_ui_message(chat_id, sent, ui_sessions).await;
+            show_timer_panel(bot, chat_id, timer, ui_sessions).await;
         }
         Err(error) => {
             let sent = bot
@@ -176,7 +177,7 @@ pub(super) async fn apply_timer_change(
                     format!("❌ 保存失败: {}", html_escape(&error.to_string())),
                 )
                 .await;
-            record_sent_timer_message(chat_id, sent, timer_messages).await;
+            record_sent_ui_message(chat_id, sent, ui_sessions).await;
         }
     }
 }
@@ -259,33 +260,60 @@ fn server_current_ip_text(current_ip: Option<&String>) -> String {
     format!("当前 IP：{value}")
 }
 
-pub(super) async fn record_timer_message(
+pub(super) async fn record_ui_message(
     chat_id: ChatId,
     message_id: MessageId,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
-    timer_messages.lock().await.record(chat_id, message_id);
+    ui_sessions.lock().await.record(chat_id, message_id);
 }
 
-async fn record_sent_timer_message(
+pub(super) async fn record_sent_ui_message(
     chat_id: ChatId,
     sent: ResponseResult<Message>,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     if let Ok(message) = sent {
-        record_timer_message(chat_id, message.id, timer_messages).await;
+        record_ui_message(chat_id, message.id, ui_sessions).await;
     }
 }
 
-async fn clear_timer_messages(
+pub(super) async fn record_sent_page_message(
     bot: &Bot,
     chat_id: ChatId,
-    timer_messages: &Arc<Mutex<TimerMessageStore>>,
+    sent: ResponseResult<Message>,
+    page: UiPage,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
-    let messages = timer_messages.lock().await.take_all(chat_id);
-    for message_id in messages {
-        let _ = bot.delete_message(chat_id, message_id).await;
+    if let Ok(message) = sent {
+        record_page_message(bot, chat_id, message.id, page, ui_sessions).await;
     }
+}
+
+pub(super) async fn record_page_message(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    page: UiPage,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) {
+    let cleanup = ui_sessions
+        .lock()
+        .await
+        .replace_page(chat_id, page, message_id);
+    cleanup_ui_messages_later(bot.clone(), chat_id, cleanup.messages);
+}
+
+fn cleanup_ui_messages_later(bot: Bot, chat_id: ChatId, messages: Vec<MessageId>) {
+    if messages.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(UI_CLEANUP_DELAY).await;
+        for message_id in messages {
+            let _ = bot.delete_message(chat_id, message_id).await;
+        }
+    });
 }
 
 pub(super) fn timer_target_keyboard(config: &AppConfig, prefix: &str) -> InlineKeyboardMarkup {

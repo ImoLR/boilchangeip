@@ -12,7 +12,7 @@ use super::{
     commands::{send_start_menu, sync_bot_menu},
     formatting::html_escape,
     server_wizard::start_add_server_wizard,
-    state::ServerWizardStore,
+    state::{ServerWizardStore, UiSessionStore},
 };
 
 pub(super) async fn handle_pair_command(
@@ -20,6 +20,7 @@ pub(super) async fn handle_pair_command(
     chat_id: ChatId,
     config: &Arc<Mutex<AppConfig>>,
     server_wizards: &Arc<Mutex<ServerWizardStore>>,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
     code: &str,
 ) {
     let chat_id_str = chat_id.to_string();
@@ -49,7 +50,7 @@ pub(super) async fn handle_pair_command(
                 let _ = bot
                     .send_message(chat_id, "✅ 配对成功，已启用 Telegram 菜单。")
                     .await;
-                let _ = send_start_menu(bot, chat_id).await;
+                let _ = send_start_menu(bot, chat_id, ui_sessions).await;
             }
         }
         PairingApplyResult::InvalidOrExpired => {

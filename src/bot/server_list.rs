@@ -13,13 +13,23 @@ use crate::{
 use super::{
     formatting::{format_server_card, html_escape},
     server_edit::save_config_and_reload,
+    state::{UiPage, UiSessionStore},
+    timer_ui::{record_page_message, record_ui_message},
 };
 
-pub(super) async fn show_servers(bot: &Bot, chat_id: ChatId, config: &AppConfig) {
+pub(super) async fn show_servers(
+    bot: &Bot,
+    chat_id: ChatId,
+    config: &AppConfig,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) {
     if config.servers.is_empty() {
-        let _ = bot
+        let sent = bot
             .send_message(chat_id, "尚未添加服务器，请点击“添加服务器”。")
             .await;
+        if let Ok(message) = sent {
+            record_page_message(bot, chat_id, message.id, UiPage::Servers, ui_sessions).await;
+        }
         return;
     }
 
@@ -30,32 +40,50 @@ pub(super) async fn show_servers(bot: &Bot, chat_id: ChatId, config: &AppConfig)
             None
         }
     };
-    for server in &config.servers {
-        let current_ip = match &client {
-            Some(client) => {
-                let _ = bot
-                    .send_message(
-                        chat_id,
-                        format!("⚙️ 正在查询当前 IP，请稍候…\n📡 {}", server.name),
-                    )
-                    .await;
-                match client.get_ip(&server.token).await {
-                    Ok(response) => response.ip.to_string(),
-                    Err(error) => {
-                        log::warn!(
-                            "服务器列表查询当前 IP 失败: server_id={}: {error}",
-                            server.id
-                        );
-                        "查询失败".to_string()
-                    }
-                }
-            }
-            None => "查询失败".to_string(),
-        };
-        let _ = bot
-            .send_message(chat_id, format_server_card(server, &current_ip))
+    for (index, server) in config.servers.iter().enumerate() {
+        let sent = bot
+            .send_message(chat_id, format_server_card(server, "⚙️ 正在查询 IP..."))
             .parse_mode(ParseMode::Html)
             .await;
+        let message_id = match sent {
+            Ok(message) => {
+                if index == 0 {
+                    record_page_message(bot, chat_id, message.id, UiPage::Servers, ui_sessions)
+                        .await;
+                } else {
+                    record_ui_message(chat_id, message.id, ui_sessions).await;
+                }
+                Some(message.id)
+            }
+            Err(error) => {
+                log::warn!(
+                    "服务器列表发送查询卡片失败: server_id={}: {error}",
+                    server.id
+                );
+                None
+            }
+        };
+
+        let current_ip = match &client {
+            Some(client) => match client.get_ip(&server.token).await {
+                Ok(response) => response.ip.to_string(),
+                Err(error) => {
+                    log::warn!(
+                        "服务器列表查询当前 IP 失败: server_id={}: {error}",
+                        server.id
+                    );
+                    "查询失败".to_string()
+                }
+            },
+            None => "查询失败".to_string(),
+        };
+
+        if let Some(message_id) = message_id {
+            let _ = bot
+                .edit_message_text(chat_id, message_id, format_server_card(server, &current_ip))
+                .parse_mode(ParseMode::Html)
+                .await;
+        }
     }
 }
 

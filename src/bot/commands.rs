@@ -15,9 +15,11 @@ use super::{
     server_edit::handle_server_edit_input,
     server_list::show_servers,
     server_wizard::{handle_add_server_input, start_add_server_wizard},
-    state::BotShared,
+    state::{BotShared, UiPage, UiSessionStore},
     status::tg_status,
-    timer_ui::{handle_timer_time_input, show_timer_panel, TimerUiContext},
+    timer_ui::{
+        handle_timer_time_input, record_sent_page_message, show_timer_panel, TimerUiContext,
+    },
 };
 
 #[derive(BotCommands, Clone)]
@@ -55,6 +57,7 @@ pub(super) async fn handle_command(
             msg.chat.id,
             &shared.config,
             &shared.server_wizards,
+            &shared.ui_sessions,
             code.trim(),
         )
         .await;
@@ -72,7 +75,7 @@ pub(super) async fn handle_command(
 
     match cmd {
         Command::Start => {
-            send_start_menu(&bot, msg.chat.id).await?;
+            send_start_menu(&bot, msg.chat.id, &shared.ui_sessions).await?;
         }
         Command::Help => {
             send_help(&bot, msg.chat.id).await?;
@@ -83,7 +86,14 @@ pub(super) async fn handle_command(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(msg.chat.id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                tg_status(&task_bot, msg.chat.id, &config_snapshot, &arg).await;
+                tg_status(
+                    &task_bot,
+                    msg.chat.id,
+                    &config_snapshot,
+                    &arg,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         Command::Check(arg) => {
@@ -92,7 +102,14 @@ pub(super) async fn handle_command(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(msg.chat.id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                tg_check(&task_bot, msg.chat.id, &config_snapshot, &arg).await;
+                tg_check(
+                    &task_bot,
+                    msg.chat.id,
+                    &config_snapshot,
+                    &arg,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         Command::Change(arg) => {
@@ -107,6 +124,7 @@ pub(super) async fn handle_command(
                     &config_snapshot,
                     &task_shared.confirmations,
                     &arg,
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -119,7 +137,7 @@ pub(super) async fn handle_command(
                     &task_bot,
                     msg.chat.id,
                     &task_shared.timer,
-                    &task_shared.timer_messages,
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -129,7 +147,13 @@ pub(super) async fn handle_command(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(msg.chat.id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                show_servers(&task_bot, msg.chat.id, &config_snapshot).await;
+                show_servers(
+                    &task_bot,
+                    msg.chat.id,
+                    &config_snapshot,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         Command::Addserver => {
@@ -192,7 +216,7 @@ pub(super) async fn handle_message(
             bot: &bot,
             config: &shared.config,
             timer: &shared.timer,
-            timer_messages: &shared.timer_messages,
+            ui_sessions: &shared.ui_sessions,
         },
         msg.chat.id,
         msg.id,
@@ -253,10 +277,16 @@ pub(super) fn start_menu_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-pub(super) async fn send_start_menu(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
-    bot.send_message(chat_id, start_text())
+pub(super) async fn send_start_menu(
+    bot: &Bot,
+    chat_id: ChatId,
+    ui_sessions: &Arc<Mutex<UiSessionStore>>,
+) -> ResponseResult<()> {
+    let sent = bot
+        .send_message(chat_id, start_text())
         .reply_markup(start_menu_keyboard())
-        .await?;
+        .await;
+    record_sent_page_message(bot, chat_id, sent, UiPage::Start, ui_sessions).await;
     Ok(())
 }
 

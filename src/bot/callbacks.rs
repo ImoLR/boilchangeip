@@ -15,8 +15,8 @@ use super::{
     state::{BotShared, ServerEditMode, TimerInputMode},
     status::tg_status,
     timer_ui::{
-        apply_timer_change, record_timer_message, show_timer_close_targets,
-        show_timer_edit_targets, show_timer_panel,
+        apply_timer_change, record_ui_message, show_timer_close_targets, show_timer_edit_targets,
+        show_timer_panel,
     },
 };
 
@@ -85,7 +85,13 @@ pub(super) async fn handle_callback(
             shared.spawn_if_not_busy(chat_id, async move {
                 task_shared.server_edits.lock().await.cancel(chat_id);
                 let config_snapshot = task_shared.config.lock().await.clone();
-                show_servers(&task_bot, chat_id, &config_snapshot).await;
+                show_servers(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         CallbackAction::MenuStatus => {
@@ -93,7 +99,14 @@ pub(super) async fn handle_callback(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(chat_id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                tg_status(&task_bot, chat_id, &config_snapshot, "").await;
+                tg_status(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    "",
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         CallbackAction::MenuChange => {
@@ -107,6 +120,7 @@ pub(super) async fn handle_callback(
                     &config_snapshot,
                     &task_shared.confirmations,
                     "",
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -119,7 +133,7 @@ pub(super) async fn handle_callback(
                     &task_bot,
                     chat_id,
                     &task_shared.timer,
-                    &task_shared.timer_messages,
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -133,7 +147,14 @@ pub(super) async fn handle_callback(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(chat_id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                tg_status(&task_bot, chat_id, &config_snapshot, &server_id).await;
+                tg_status(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &server_id,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         CallbackAction::SelectCheck(server_id) => {
@@ -142,7 +163,14 @@ pub(super) async fn handle_callback(
             let task_bot = bot.clone();
             shared.spawn_if_not_busy(chat_id, async move {
                 let config_snapshot = task_shared.config.lock().await.clone();
-                tg_check(&task_bot, chat_id, &config_snapshot, &server_id).await;
+                tg_check(
+                    &task_bot,
+                    chat_id,
+                    &config_snapshot,
+                    &server_id,
+                    &task_shared.ui_sessions,
+                )
+                .await;
             });
         }
         CallbackAction::SelectChange(server_id) => {
@@ -157,6 +185,7 @@ pub(super) async fn handle_callback(
                     &config_snapshot,
                     &task_shared.confirmations,
                     &server_id,
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -175,6 +204,7 @@ pub(super) async fn handle_callback(
                     &task_shared.confirmations,
                     &server_id,
                     &nonce,
+                    &task_shared.ui_sessions,
                 )
                 .await;
             });
@@ -189,7 +219,7 @@ pub(super) async fn handle_callback(
         }
         CallbackAction::TimerNew => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             shared
                 .timer_inputs
@@ -200,31 +230,31 @@ pub(super) async fn handle_callback(
                 .send_message(chat_id, "请输入每天执行时间（HH:MM），例如 03:30")
                 .await;
             if let Ok(message) = sent {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
         }
         CallbackAction::TimerEdit => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
-            show_timer_edit_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
+            show_timer_edit_targets(&bot, chat_id, &shared.timer, &shared.ui_sessions).await;
         }
         CallbackAction::TimerClose => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
-            show_timer_close_targets(&bot, chat_id, &shared.timer, &shared.timer_messages).await;
+            show_timer_close_targets(&bot, chat_id, &shared.timer, &shared.ui_sessions).await;
         }
         CallbackAction::TimerCreateAll { hhmm } => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             apply_timer_change(
                 &bot,
                 chat_id,
                 &shared.config,
                 &shared.timer,
-                &shared.timer_messages,
+                &shared.ui_sessions,
                 TimerUpdate::Enable {
                     target: TimerTarget::AllEnabled,
                     hhmm: hhmm.to_string(),
@@ -234,14 +264,14 @@ pub(super) async fn handle_callback(
         }
         CallbackAction::TimerCreateServer { server_id, hhmm } => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             apply_timer_change(
                 &bot,
                 chat_id,
                 &shared.config,
                 &shared.timer,
-                &shared.timer_messages,
+                &shared.ui_sessions,
                 TimerUpdate::Enable {
                     target: TimerTarget::Server(server_id.to_string()),
                     hhmm: hhmm.to_string(),
@@ -251,7 +281,7 @@ pub(super) async fn handle_callback(
         }
         CallbackAction::TimerEditTargetAll => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             shared.timer_inputs.lock().await.set(
                 chat_id,
@@ -262,12 +292,12 @@ pub(super) async fn handle_callback(
                 .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
                 .await;
             if let Ok(message) = sent {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
         }
         CallbackAction::TimerEditTargetServer(server_id) => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             shared.timer_inputs.lock().await.set(
                 chat_id,
@@ -278,19 +308,19 @@ pub(super) async fn handle_callback(
                 .send_message(chat_id, "请输入新的每天执行时间（HH:MM），例如 03:30")
                 .await;
             if let Ok(message) = sent {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
         }
         CallbackAction::TimerCloseAll => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             apply_timer_change(
                 &bot,
                 chat_id,
                 &shared.config,
                 &shared.timer,
-                &shared.timer_messages,
+                &shared.ui_sessions,
                 TimerUpdate::Disable {
                     target: TimerTarget::AllEnabled,
                 },
@@ -299,14 +329,14 @@ pub(super) async fn handle_callback(
         }
         CallbackAction::TimerCloseServer(server_id) => {
             if let Some(message) = &q.message {
-                record_timer_message(chat_id, message.id, &shared.timer_messages).await;
+                record_ui_message(chat_id, message.id, &shared.ui_sessions).await;
             }
             apply_timer_change(
                 &bot,
                 chat_id,
                 &shared.config,
                 &shared.timer,
-                &shared.timer_messages,
+                &shared.ui_sessions,
                 TimerUpdate::Disable {
                     target: TimerTarget::Server(server_id.to_string()),
                 },

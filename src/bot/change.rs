@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-    formatting::{format_server_card, html_escape},
+    formatting::{format_server_config_card, html_escape},
     state::{ConfirmConsume, ConfirmationStore},
 };
 
@@ -137,7 +137,7 @@ pub(super) async fn show_change_confirmation(
             chat_id,
             format!(
                 "确认更换这台服务器的 IP？\n\n{}",
-                format_server_card(server)
+                format_server_config_card(server)
             ),
         )
         .reply_markup(keyboard)
@@ -261,9 +261,6 @@ async fn send_reconnect_result(bot: &Bot, chat_id: ChatId, result: &ReconnectRes
     }
     if let Some(uses_left) = result.uses_left {
         lines.push(format!("剩余次数: {uses_left}"));
-    }
-    if let Some(next_allowed_at) = result.next_allowed_at {
-        lines.push(format!("下次允许时间: {next_allowed_at} (Unix)"));
     }
     if let Some(message) = &result.message {
         lines.push(format!("信息: {}", html_escape(message)));

@@ -362,7 +362,11 @@ mod tests {
     fn timer_panel_shows_timezone_servers_and_actions_without_tokens() {
         let config = app_config();
         let status = crate::timer::timer_status(&config);
-        let text = super::super::timer_ui::format_timer_panel(&status);
+        let current_ips = std::collections::HashMap::from([
+            ("hk-01".to_string(), "203.0.113.10".to_string()),
+            ("jp_02".to_string(), "203.0.113.20".to_string()),
+        ]);
+        let text = super::super::timer_ui::format_timer_panel(&status, &current_ips);
 
         assert!(text.contains("Asia/Shanghai"));
         assert!(text.contains("🌐 全部 Server"));

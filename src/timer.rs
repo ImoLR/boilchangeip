@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::{
     boil::BoilClient,
     config::{save_app_config, AppConfig, ServerSelection, ServerTimerConfig},
-    reconnect::{reconnect_one, reconnect_selected, ReconnectPolicy, ReconnectStatus},
+    reconnect::{
+        reconnect_one_with_current_ip, BatchReconnectResult, ReconnectPolicy, ReconnectStatus,
+    },
 };
 
 const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
@@ -351,7 +353,10 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
 
     tg_notify(config, "⏰ 定时换 IP 开始\n\n共 1 台 VPS，开始处理...").await;
 
-    let result = reconnect_one(&client, selected, &ReconnectPolicy::default()).await;
+    let current_ip = notify_timer_processing(config, &client, selected).await;
+    let result =
+        reconnect_one_with_current_ip(&client, selected, &ReconnectPolicy::default(), current_ip)
+            .await;
     log::info!(
         "定时换 IP 完成: server_id={} status={:?} changed={}",
         result.server_id,
@@ -371,8 +376,8 @@ async fn run_auto_change_all(config: &AppConfig) {
 }
 
 async fn run_auto_change_all_locked(config: &AppConfig) {
-    let selected_count = match config.resolve_servers(ServerSelection::All) {
-        Ok(crate::config::ResolvedSelection::All(servers)) => servers.len(),
+    let selected = match config.resolve_servers(ServerSelection::All) {
+        Ok(crate::config::ResolvedSelection::All(servers)) => servers,
         Ok(crate::config::ResolvedSelection::One(_)) => {
             log::error!("全局定时换 IP 配置错误: 全部 Server 解析为单台选择");
             return;
@@ -393,24 +398,21 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
 
     tg_notify(
         config,
-        &format!("⏰ 定时换 IP 开始\n\n共 {selected_count} 台 VPS，开始逐台处理..."),
+        &format!(
+            "⏰ 定时换 IP 开始\n\n共 {} 台 VPS，开始逐台处理...",
+            selected.len()
+        ),
     )
     .await;
 
-    let batch = match reconnect_selected(
-        &client,
-        config,
-        ServerSelection::All,
-        &ReconnectPolicy::default(),
-    )
-    .await
-    {
-        Ok(batch) => batch,
-        Err(e) => {
-            log::warn!("全局定时换 IP 跳过: {e}");
-            return;
-        }
-    };
+    let mut batch = BatchReconnectResult::default();
+    for server in selected {
+        let current_ip = notify_timer_processing(config, &client, server).await;
+        let result =
+            reconnect_one_with_current_ip(&client, server, &ReconnectPolicy::default(), current_ip)
+                .await;
+        batch.results.push(result);
+    }
 
     log::info!(
         "全局定时换 IP 完成: success={} unconfirmed={} failed={}",
@@ -419,6 +421,32 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
         batch.failure_count()
     );
     tg_notify(config, &format_timer_batch_result(&batch)).await;
+}
+
+async fn notify_timer_processing(
+    config: &AppConfig,
+    client: &BoilClient,
+    server: &crate::config::ServerConfig,
+) -> Option<std::net::IpAddr> {
+    let current_ip = match client.get_ip(&server.token).await {
+        Ok(response) => Some(response.ip),
+        Err(error) => {
+            log::warn!(
+                "定时换 IP 查询当前 IP 失败: server_id={}: {error}",
+                server.id
+            );
+            None
+        }
+    };
+    let current_ip_text = current_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "查询失败".to_string());
+    tg_notify(
+        config,
+        &format!("🔄 现在处理：{}\n当前 IP：{}", server.name, current_ip_text),
+    )
+    .await;
+    current_ip
 }
 
 async fn with_timer_run_lock<F, R>(future: F) -> R

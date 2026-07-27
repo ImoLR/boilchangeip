@@ -27,20 +27,30 @@ impl GeoLabel {
     }
 }
 
-pub(super) fn format_server_card(server: &ServerConfig) -> String {
+pub(super) fn format_server_card(server: &ServerConfig, current_ip: &str) -> String {
     let geo = server_geo_label(server);
-    let current_ip = server
-        .resolved_ip
+    format_server_display_parts(&server.name, current_ip, &geo)
+}
+
+pub(super) fn format_server_config_card(server: &ServerConfig) -> String {
+    let geo = server_geo_label(server);
+    let endpoint = server
+        .address
         .as_deref()
-        .filter(|ip| !ip.trim().is_empty())
+        .filter(|address| !address.trim().is_empty())
         .or_else(|| {
             server
-                .address
+                .resolved_ip
                 .as_deref()
-                .filter(|address| !address.trim().is_empty())
+                .filter(|ip| !ip.trim().is_empty())
         })
         .unwrap_or("N/A");
-    format_server_display_parts(&server.name, current_ip, &geo)
+    format!(
+        "📡 <b>{}</b>\n\n{}\n配置地址：{}",
+        html_escape(&server.name),
+        html_escape(&geo.display()),
+        html_escape(endpoint)
+    )
 }
 
 pub(super) fn format_server_display_parts(name: &str, current_ip: &str, geo: &GeoLabel) -> String {
@@ -163,7 +173,7 @@ mod tests {
     #[test]
     fn server_card_uses_public_display_fields_only() {
         let config = app_config();
-        let text = format_server_card(&config.servers[0]);
+        let text = format_server_card(&config.servers[0], "203.0.113.10");
 
         assert!(text.contains("📡 <b>Hong Kong 01</b>"));
         assert!(text.contains("🇭🇰 中国香港"));

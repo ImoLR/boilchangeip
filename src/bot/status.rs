@@ -65,10 +65,7 @@ pub(super) fn status_text(
             .map(|detail| format!("验证失败（{}）", html_escape(detail)))
             .unwrap_or_else(|| "验证失败".to_string()),
     };
-    let ip = current_ip
-        .or(server.resolved_ip.as_deref())
-        .or(server.address.as_deref())
-        .unwrap_or("N/A");
+    let ip = current_ip.unwrap_or("查询失败");
 
     format!(
         "✅ 服务器状态\n\n📡 <b>{}</b>\n\n{}\n当前 IP：{}\n\n状态：{}\n下次换 IP：{}",

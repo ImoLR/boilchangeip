@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::{config::AppConfig, server_manage::delete_server, timer::TimerManager};
 
 use super::{
-    formatting::{format_server_card, html_escape},
+    formatting::{format_server_config_card, html_escape},
     server_edit::save_config_and_reload,
     server_list::find_configured_server,
 };
@@ -36,7 +36,7 @@ pub(super) async fn show_server_delete_confirmation(
             chat_id,
             format!(
                 "⚠️ 确定删除这台服务器吗？\n\n{}",
-                format_server_card(server)
+                format_server_config_card(server)
             ),
         )
         .reply_markup(keyboard)

@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     formatting::{
-        detect_address_metadata, format_server_card, html_escape, normalize_server_address,
+        detect_address_metadata, format_server_config_card, html_escape, normalize_server_address,
         short_safe_error,
     },
     server_list::find_configured_server,
@@ -187,7 +187,10 @@ pub(super) async fn show_server_edit_menu(
     let _ = bot
         .send_message(
             chat_id,
-            format!("请选择要编辑的项目：\n\n{}", format_server_card(server)),
+            format!(
+                "请选择要编辑的项目：\n\n{}",
+                format_server_config_card(server)
+            ),
         )
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)

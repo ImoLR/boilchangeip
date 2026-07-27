@@ -4,6 +4,7 @@ use teloxide::{prelude::*, types::ParseMode};
 use tokio::sync::Mutex;
 
 use crate::{
+    boil::BoilClient,
     config::{AppConfig, ServerConfig},
     server_manage::{move_server_down, move_server_up},
     timer::TimerManager,
@@ -22,9 +23,30 @@ pub(super) async fn show_servers(bot: &Bot, chat_id: ChatId, config: &AppConfig)
         return;
     }
 
+    let client = match BoilClient::new() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            log::warn!("服务器列表初始化 Boil API 客户端失败: {error}");
+            None
+        }
+    };
+
     for server in &config.servers {
+        let current_ip = match &client {
+            Some(client) => match client.get_ip(&server.token).await {
+                Ok(response) => response.ip.to_string(),
+                Err(error) => {
+                    log::warn!(
+                        "服务器列表查询当前 IP 失败: server_id={}: {error}",
+                        server.id
+                    );
+                    "查询失败".to_string()
+                }
+            },
+            None => "查询失败".to_string(),
+        };
         let _ = bot
-            .send_message(chat_id, format_server_card(server))
+            .send_message(chat_id, format_server_card(server, &current_ip))
             .parse_mode(ParseMode::Html)
             .await;
     }
@@ -71,7 +93,7 @@ mod tests {
     #[test]
     fn server_card_has_no_action_buttons_or_missing_address_text() {
         let config = app_config();
-        let card = format_server_card(&config.servers[0]);
+        let card = format_server_card(&config.servers[0], "203.0.113.10");
 
         assert!(card.contains("📡"));
         assert!(card.contains("Hong Kong 01"));

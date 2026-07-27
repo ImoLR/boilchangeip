@@ -91,6 +91,15 @@ pub async fn reconnect_one(
     server: &ServerConfig,
     policy: &ReconnectPolicy,
 ) -> ReconnectResult {
+    reconnect_one_with_current_ip(client, server, policy, None).await
+}
+
+pub async fn reconnect_one_with_current_ip(
+    client: &BoilClient,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+) -> ReconnectResult {
     if !server.enabled {
         return base_result(
             server,
@@ -101,7 +110,7 @@ pub async fn reconnect_one(
 
     let lock = server_lock(&server.id);
     let _guard = lock.lock().await;
-    reconnect_one_locked(client, server, policy).await
+    reconnect_one_locked(client, server, policy, current_ip).await
 }
 
 pub async fn reconnect_selected(
@@ -131,13 +140,17 @@ async fn reconnect_one_locked(
     client: &BoilClient,
     server: &ServerConfig,
     policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
 ) -> ReconnectResult {
-    let old_ip = match client.get_ip(&server.token).await {
-        Ok(response) => response.ip,
-        Err(error) => {
-            let status = preflight_error_status(&error);
-            return base_result(server, status, Some(&error.to_string()));
-        }
+    let old_ip = match current_ip {
+        Some(ip) => ip,
+        None => match client.get_ip(&server.token).await {
+            Ok(response) => response.ip,
+            Err(error) => {
+                let status = preflight_error_status(&error);
+                return base_result(server, status, Some(&error.to_string()));
+            }
+        },
     };
 
     let change = with_change_ip_lock(client.change_ip(&server.token)).await;
@@ -655,6 +668,26 @@ mod tests {
         assert_eq!(result.poll_attempts, 1);
         assert_eq!(mock.change_count(), 1);
         assert_eq!(mock.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn provided_current_ip_skips_duplicate_preflight_get_ip() {
+        let mock = MockServer::start(vec![accepted(), ip(r#"{"ok":true,"ip":"42.1.1.2"}"#)]).await;
+        let client = BoilClient::with_api_base_url(&mock.base_url).unwrap();
+
+        let result = reconnect_one_with_current_ip(
+            &client,
+            &server("prefetched", true),
+            &policy(3),
+            Some("42.1.1.1".parse().unwrap()),
+        )
+        .await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert_eq!(
+            mock.records(),
+            vec!["/api/v1/changeIP/".to_string(), "/api/v1/getIP".to_string()]
+        );
     }
 
     #[tokio::test]

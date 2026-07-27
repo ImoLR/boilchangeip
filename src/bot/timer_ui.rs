@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use teloxide::{
     prelude::*,
@@ -7,6 +7,7 @@ use teloxide::{
 use tokio::sync::Mutex;
 
 use crate::{
+    boil::BoilClient,
     config::AppConfig,
     timer::{parse_hhmm, TimerManager, TimerStatus, TimerUpdate},
 };
@@ -23,7 +24,11 @@ pub(super) async fn show_timer_panel(
     timer_messages: &Arc<Mutex<TimerMessageStore>>,
 ) {
     clear_timer_messages(bot, chat_id, timer_messages).await;
-    let status = timer.lock().await.status();
+    let (status, config) = {
+        let timer = timer.lock().await;
+        (timer.status(), timer.config().clone())
+    };
+    let current_ips = query_timer_current_ips(&config).await;
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![
             InlineKeyboardButton::callback("➕ 新建", "timer_new"),
@@ -35,7 +40,7 @@ pub(super) async fn show_timer_panel(
         ],
     ]);
     let sent = bot
-        .send_message(chat_id, format_timer_panel(&status))
+        .send_message(chat_id, format_timer_panel(&status, &current_ips))
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Html)
         .await;
@@ -173,7 +178,37 @@ pub(super) async fn apply_timer_change(
     }
 }
 
-pub(super) fn format_timer_panel(status: &TimerStatus) -> String {
+async fn query_timer_current_ips(config: &AppConfig) -> HashMap<String, String> {
+    let client = match BoilClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            log::warn!("定时面板初始化 Boil API 客户端失败: {error}");
+            return config
+                .servers
+                .iter()
+                .map(|server| (server.id.clone(), "查询失败".to_string()))
+                .collect();
+        }
+    };
+
+    let mut current_ips = HashMap::new();
+    for server in &config.servers {
+        let current_ip = match client.get_ip(&server.token).await {
+            Ok(response) => response.ip.to_string(),
+            Err(error) => {
+                log::warn!("定时面板查询当前 IP 失败: server_id={}: {error}", server.id);
+                "查询失败".to_string()
+            }
+        };
+        current_ips.insert(server.id.clone(), current_ip);
+    }
+    current_ips
+}
+
+pub(super) fn format_timer_panel(
+    status: &TimerStatus,
+    current_ips: &HashMap<String, String>,
+) -> String {
     let mut lines = vec![
         "⏰ <b>定时换 IP</b>".to_string(),
         format!("当前时区: <code>{}</code>", html_escape(status.timezone)),
@@ -197,11 +232,7 @@ pub(super) fn format_timer_panel(status: &TimerStatus) -> String {
             html_escape(&server.server_name),
             html_escape(server.flag.as_deref().unwrap_or("🌐")),
             html_escape(server.country.as_deref().unwrap_or("未知地区")),
-            html_escape(&server_endpoint_text(
-                server.resolved_ip.as_deref(),
-                server.address.as_deref(),
-                server.server_enabled
-            )),
+            html_escape(&server_current_ip_text(current_ips.get(&server.server_id))),
             state
         ));
     }
@@ -220,16 +251,8 @@ fn timer_state_text(enabled: bool, time: Option<&str>) -> String {
     }
 }
 
-fn server_endpoint_text(
-    resolved_ip: Option<&str>,
-    address: Option<&str>,
-    _server_enabled: bool,
-) -> String {
-    let value = resolved_ip
-        .filter(|ip| !ip.trim().is_empty())
-        .or_else(|| address.filter(|address| !address.trim().is_empty()))
-        .filter(|address| !address.trim().is_empty())
-        .unwrap_or("N/A");
+fn server_current_ip_text(current_ip: Option<&String>) -> String {
+    let value = current_ip.map(String::as_str).unwrap_or("查询失败");
     format!("当前 IP：{value}")
 }
 
@@ -343,10 +366,12 @@ mod tests {
             cron: Some("0 5 * * *".to_string()),
         });
         let status = crate::timer::timer_status(&config);
-        let text = format_timer_panel(&status);
+        let current_ips = HashMap::from([("jp_02".to_string(), "203.0.113.200".to_string())]);
+        let text = format_timer_panel(&status, &current_ips);
 
         assert!(text.contains("Japan 02"));
-        assert!(text.contains("当前 IP：198.51.100.20"));
+        assert!(text.contains("当前 IP：203.0.113.200"));
+        assert!(!text.contains("198.51.100.20"));
         assert!(text.contains("未开启"));
         assert!(!text.contains("地址未设置"));
         assert!(!text.contains("已关闭"));

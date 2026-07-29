@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::Duration,
+};
 
 use teloxide::prelude::*;
 use tokio::sync::Mutex;
@@ -7,7 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     boil::BoilClient,
-    config::{save_app_config, AppConfig, ServerSelection, ServerTimerConfig},
+    config::{
+        load_app_config, save_app_config, AppConfig, SecretToken, ServerSelection,
+        ServerTimerConfig,
+    },
     reconnect::{
         reconnect_one_with_current_ip_and_progress, BatchReconnectResult, ReconnectPolicy,
         ReconnectProgress, ReconnectStatus,
@@ -16,6 +23,13 @@ use crate::{
 
 const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
 static TIMER_RUN_LOCK: Mutex<()> = Mutex::const_new(());
+static PENDING_TIMER_RETRIES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+const TIMER_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(60 * 60),
+];
 
 /// 定时换 IP 管理器：每个任务绑定明确 server_id。
 pub struct TimerManager {
@@ -112,7 +126,7 @@ impl TimerManager {
                         move |_uuid, _lock| {
                             let config = Arc::clone(&config);
                             Box::pin(async move {
-                                run_auto_change_all(&config).await;
+                                run_auto_change_all(Arc::clone(&config)).await;
                             })
                         },
                     )?;
@@ -150,7 +164,7 @@ impl TimerManager {
                     let config = Arc::clone(&config);
                     let server_id = server_id.clone();
                     Box::pin(async move {
-                        run_auto_change(&config, &server_id).await;
+                        run_auto_change(Arc::clone(&config), &server_id).await;
                     })
                 },
             )?;
@@ -324,9 +338,9 @@ pub async fn start(config: Arc<AppConfig>) -> anyhow::Result<TimerManager> {
     TimerManager::new(config).await
 }
 
-async fn run_auto_change(config: &AppConfig, server_id: &str) {
+async fn run_auto_change(config: Arc<AppConfig>, server_id: &str) {
     with_timer_run_lock(async {
-        run_auto_change_locked(config, server_id).await;
+        run_auto_change_locked(&config, server_id).await;
     })
     .await;
 }
@@ -355,6 +369,17 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
     tg_notify(config, "⏰ 定时换 IP 开始\n\n共 1 台 VPS，开始处理...").await;
 
     let (progress, current_ip) = notify_timer_processing(config, &client, selected).await;
+    if current_ip.is_none() {
+        tg_notify(config, &timer_preflight_failed_message()).await;
+        schedule_timer_preflight_retry(
+            selected.id.clone(),
+            selected.name.clone(),
+            selected.token.clone(),
+            TimerRetrySource::SingleServer,
+        );
+        return;
+    }
+
     let result = reconnect_one_with_current_ip_and_progress(
         &client,
         selected,
@@ -374,9 +399,9 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
     tg_notify(config, &message).await;
 }
 
-async fn run_auto_change_all(config: &AppConfig) {
+async fn run_auto_change_all(config: Arc<AppConfig>) {
     with_timer_run_lock(async {
-        run_auto_change_all_locked(config).await;
+        run_auto_change_all_locked(&config).await;
     })
     .await;
 }
@@ -414,6 +439,18 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
     let mut batch = BatchReconnectResult::default();
     for server in selected {
         let (progress, current_ip) = notify_timer_processing(config, &client, server).await;
+        if current_ip.is_none() {
+            tg_notify(config, &timer_preflight_failed_message()).await;
+            schedule_timer_preflight_retry(
+                server.id.clone(),
+                server.name.clone(),
+                server.token.clone(),
+                TimerRetrySource::GlobalTimer,
+            );
+            batch.results.push(timer_preflight_failed_result(server));
+            continue;
+        }
+
         let result = reconnect_one_with_current_ip_and_progress(
             &client,
             server,
@@ -452,6 +489,300 @@ async fn notify_timer_processing(
         }
     };
     (progress, current_ip)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerRetrySource {
+    SingleServer,
+    GlobalTimer,
+}
+
+impl TimerRetrySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SingleServer => "single",
+            Self::GlobalTimer => "global",
+        }
+    }
+}
+
+fn schedule_timer_preflight_retry(
+    server_id: String,
+    server_name: String,
+    original_token: SecretToken,
+    source: TimerRetrySource,
+) {
+    let retry_key = timer_retry_key(&server_id, source);
+    if !mark_timer_retry_pending(&retry_key) {
+        log::info!("定时换 IP 重试已存在，跳过重复调度: server_id={server_id}");
+        return;
+    }
+
+    tokio::spawn(async move {
+        run_timer_preflight_retry(server_id, server_name, original_token, source, retry_key).await;
+    });
+}
+
+async fn run_timer_preflight_retry(
+    server_id: String,
+    _server_name: String,
+    original_token: SecretToken,
+    source: TimerRetrySource,
+    retry_key: String,
+) {
+    let _pending = TimerRetryPending::new(retry_key);
+
+    for (index, delay) in TIMER_RETRY_DELAYS.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
+
+        let _guard = TIMER_RUN_LOCK.lock().await;
+        let attempt = TimerRetryAttempt::from_index(index);
+        let config = match load_app_config() {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("定时换 IP 重试取消: 无法重新读取配置: {error}");
+                return;
+            }
+        };
+
+        let Some(server) =
+            retry_server_if_still_valid(&config, &server_id, &original_token, source).cloned()
+        else {
+            log::info!("定时换 IP 重试取消: server_id={server_id} 已变更或定时任务已关闭");
+            return;
+        };
+
+        tg_notify(&config, &timer_retry_start_message(attempt, &server.name)).await;
+
+        let client = match BoilClient::new() {
+            Ok(client) => client,
+            Err(error) => {
+                log::error!("定时换 IP 重试初始化客户端失败: {error}");
+                return;
+            }
+        };
+
+        let old_ip = match client.get_ip(&server.token).await {
+            Ok(response) => response.ip,
+            Err(error) => {
+                log::warn!("定时换 IP 重试查询当前 IP 失败: server_id={server_id}: {error}");
+                tg_notify(&config, &timer_retry_get_ip_failed_message(attempt)).await;
+                if attempt.is_final() {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        let progress = tg_send(&config, &format!("🔄 现在处理：{}", server.name)).await;
+        let result = reconnect_one_with_current_ip_and_progress(
+            &client,
+            &server,
+            &ReconnectPolicy::default(),
+            Some(old_ip),
+            |event| update_timer_progress(progress.clone(), server.name.clone(), event),
+        )
+        .await;
+
+        if result.status == ReconnectStatus::Success {
+            tg_notify(&config, &format_timer_retry_success(&result)).await;
+        } else {
+            tg_notify(&config, &format_timer_result(&result)).await;
+        }
+        return;
+    }
+}
+
+struct TimerRetryPending {
+    key: String,
+}
+
+impl TimerRetryPending {
+    fn new(key: String) -> Self {
+        Self { key }
+    }
+}
+
+impl Drop for TimerRetryPending {
+    fn drop(&mut self) {
+        clear_timer_retry_pending(&self.key);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerRetryAttempt {
+    First,
+    Second,
+    Third,
+}
+
+impl TimerRetryAttempt {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::First,
+            1 => Self::Second,
+            _ => Self::Third,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::First => "第一次",
+            Self::Second => "第二次",
+            Self::Third => "第三次",
+        }
+    }
+
+    fn next_delay_text(self) -> Option<&'static str> {
+        match self {
+            Self::First => Some("30 分钟"),
+            Self::Second => Some("1 小时"),
+            Self::Third => None,
+        }
+    }
+
+    fn next_attempt_label(self) -> Option<&'static str> {
+        match self {
+            Self::First => Some("第二次"),
+            Self::Second => Some("第三次"),
+            Self::Third => None,
+        }
+    }
+
+    fn is_final(self) -> bool {
+        self == Self::Third
+    }
+}
+
+fn timer_retry_key(server_id: &str, source: TimerRetrySource) -> String {
+    format!("{}:{server_id}", source.label())
+}
+
+fn pending_timer_retries() -> &'static StdMutex<HashSet<String>> {
+    PENDING_TIMER_RETRIES.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn mark_timer_retry_pending(key: &str) -> bool {
+    let mut pending = pending_timer_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.insert(key.to_string())
+}
+
+fn clear_timer_retry_pending(key: &str) {
+    let mut pending = pending_timer_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.remove(key);
+}
+
+fn retry_server_if_still_valid<'a>(
+    config: &'a AppConfig,
+    server_id: &str,
+    original_token: &SecretToken,
+    source: TimerRetrySource,
+) -> Option<&'a crate::config::ServerConfig> {
+    let server = config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id && server.enabled)?;
+    if server.token.expose_secret() != original_token.expose_secret() {
+        return None;
+    }
+
+    let timer_enabled = match source {
+        TimerRetrySource::SingleServer => server
+            .timer
+            .as_ref()
+            .is_some_and(|timer| timer.enabled && timer.cron.is_some()),
+        TimerRetrySource::GlobalTimer => config
+            .global_timer
+            .as_ref()
+            .is_some_and(|timer| timer.enabled && timer.cron.is_some()),
+    };
+    timer_enabled.then_some(server)
+}
+
+fn timer_preflight_failed_result(
+    server: &crate::config::ServerConfig,
+) -> crate::reconnect::ReconnectResult {
+    crate::reconnect::ReconnectResult {
+        server_id: server.id.clone(),
+        server_name: server.name.clone(),
+        old_ip: None,
+        new_ip: None,
+        changed: false,
+        uses_left: None,
+        next_allowed_at: None,
+        status: ReconnectStatus::PreflightFailed,
+        message: Some("换 IP 前查询当前 IP 失败，未发送换 IP 请求".to_string()),
+        poll_attempts: 0,
+    }
+}
+
+fn timer_preflight_failed_message() -> String {
+    [
+        "❌ 换 IP失败",
+        "",
+        "原因：",
+        "",
+        "换 IP 前查询当前 IP 失败，",
+        "",
+        "未发送换 IP 请求。",
+        "",
+        "⏳ 将于 5 分钟后开始第一次重新获取 IP。",
+    ]
+    .join("\n")
+}
+
+fn timer_retry_start_message(attempt: TimerRetryAttempt, server_name: &str) -> String {
+    format!(
+        "🔄 现在开始{}重新获取 IP……\n\n📡 {server_name}",
+        attempt.label()
+    )
+}
+
+fn timer_retry_get_ip_failed_message(attempt: TimerRetryAttempt) -> String {
+    if attempt.is_final() {
+        return [
+            "❌ 第三次重新获取 IP 失败。",
+            "",
+            "流程结束，",
+            "",
+            "请管理员手动处理。",
+        ]
+        .join("\n");
+    }
+
+    format!(
+        "⚠️ {}重新获取 IP 失败。\n\n⏳ 将于 {}后开始{}重新获取 IP。",
+        attempt.label(),
+        attempt.next_delay_text().unwrap_or_default(),
+        attempt.next_attempt_label().unwrap_or_default()
+    )
+}
+
+fn format_timer_retry_success(result: &crate::reconnect::ReconnectResult) -> String {
+    let lines = vec![
+        "✅ 重试换 IP 成功".to_string(),
+        String::new(),
+        format!("📡 {}", result.server_name),
+        String::new(),
+        "旧 IP：".to_string(),
+        String::new(),
+        result
+            .old_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+        String::new(),
+        "新 IP：".to_string(),
+        String::new(),
+        result
+            .new_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+    ];
+    lines.join("\n")
 }
 
 #[derive(Clone)]
@@ -1023,5 +1354,138 @@ mod tests {
         assert!(!text.contains("NetworkError"));
         assert!(!text.contains("PreflightFailed"));
         assert!(!text.contains("changed=false"));
+    }
+
+    #[test]
+    fn timer_preflight_retry_messages_match_background_retry_flow() {
+        assert_eq!(
+            timer_preflight_failed_message(),
+            [
+                "❌ 换 IP失败",
+                "",
+                "原因：",
+                "",
+                "换 IP 前查询当前 IP 失败，",
+                "",
+                "未发送换 IP 请求。",
+                "",
+                "⏳ 将于 5 分钟后开始第一次重新获取 IP。",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            timer_retry_start_message(TimerRetryAttempt::First, "Taiwan VPS"),
+            "🔄 现在开始第一次重新获取 IP……\n\n📡 Taiwan VPS"
+        );
+        assert_eq!(
+            timer_retry_get_ip_failed_message(TimerRetryAttempt::First),
+            "⚠️ 第一次重新获取 IP 失败。\n\n⏳ 将于 30 分钟后开始第二次重新获取 IP。"
+        );
+        assert_eq!(
+            timer_retry_get_ip_failed_message(TimerRetryAttempt::Second),
+            "⚠️ 第二次重新获取 IP 失败。\n\n⏳ 将于 1 小时后开始第三次重新获取 IP。"
+        );
+        assert_eq!(
+            timer_retry_get_ip_failed_message(TimerRetryAttempt::Third),
+            "❌ 第三次重新获取 IP 失败。\n\n流程结束，\n\n请管理员手动处理。"
+        );
+    }
+
+    #[test]
+    fn timer_retry_success_message_hides_internal_details() {
+        let text =
+            format_timer_retry_success(&reconnect_result("Taiwan VPS", ReconnectStatus::Success));
+
+        assert!(text.contains("✅ 重试换 IP 成功"));
+        assert!(text.contains("📡 Taiwan VPS"));
+        assert!(text.contains("旧 IP：\n\n42.1.1.1"));
+        assert!(text.contains("新 IP：\n\n42.1.1.2"));
+        assert!(!text.contains("剩余次数"));
+        assert!(!text.contains("997"));
+        assert!(!text.contains("Success"));
+        assert!(!text.contains("Boil API"));
+    }
+
+    #[test]
+    fn timer_retry_registry_rejects_duplicate_pending_retry() {
+        let key = "test-duplicate-retry:a";
+        clear_timer_retry_pending(key);
+
+        assert!(mark_timer_retry_pending(key));
+        assert!(!mark_timer_retry_pending(key));
+        clear_timer_retry_pending(key);
+        assert!(mark_timer_retry_pending(key));
+        clear_timer_retry_pending(key);
+    }
+
+    #[test]
+    fn timer_retry_recheck_requires_server_token_and_timer_to_match() {
+        let original = SecretToken::from_test_value("token-a");
+        let mut config = app_config();
+
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::SingleServer
+        )
+        .is_some());
+
+        config.servers[0].enabled = false;
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::SingleServer
+        )
+        .is_none());
+
+        config = app_config();
+        config.servers[0].token = SecretToken::from_test_value("new-token-a");
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::SingleServer
+        )
+        .is_none());
+
+        config = app_config();
+        config.servers[0].timer.as_mut().unwrap().enabled = false;
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::SingleServer
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn timer_retry_recheck_uses_global_timer_for_global_retry() {
+        let original = SecretToken::from_test_value("token-a");
+        let mut config = app_config();
+        config.global_timer = Some(ServerTimerConfig {
+            enabled: true,
+            cron: Some("0 3 * * *".to_string()),
+        });
+        config.servers[0].timer = None;
+
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::GlobalTimer
+        )
+        .is_some());
+
+        config.global_timer.as_mut().unwrap().enabled = false;
+        assert!(retry_server_if_still_valid(
+            &config,
+            "a",
+            &original,
+            TimerRetrySource::GlobalTimer
+        )
+        .is_none());
     }
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.2.13 - 2026-08-03
+
+### 修复
+
+- `/change` 确认页改为实时调用 `getIP` 查询当前 IP，不再使用配置中的旧地址作为当前 IP。
+- Timer / Retry 增加全局 `changeIP` cooldown 学习与节流，遇到频率限制时会记录下次可用时间并持久化。
+- cooldown 会根据 Boil 返回的下次可用时间动态向上修正，并加入安全余量，避免后台任务反复撞频率限制。
+- 手动 `/change` 命中 cooldown 时保持 FailFast：提示剩余等待时间后结束本次操作。
+- 后台 Timer / Retry 命中 cooldown 时会先通知 Telegram，然后等待 cooldown 结束并继续当前 VPS。
+
 ## v2.2.12 - 2026-07-29
 
 ### 修复

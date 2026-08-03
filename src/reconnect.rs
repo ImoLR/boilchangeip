@@ -3,23 +3,25 @@ use std::{
     future::Future,
     net::IpAddr,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     boil::{BoilApiError, BoilClient},
-    config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
+    config::{AppConfig, ChangeIpCooldownConfig, ResolvedSelection, ServerConfig, ServerSelection},
 };
 
 static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 static CHANGE_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CHANGE_IP_COOLDOWN: OnceLock<Mutex<ChangeIpCooldownState>> = OnceLock::new();
 
 const SUCCESS_MESSAGE: &str = "换 IP 已完成";
 const UNCONFIRMED_MESSAGE: &str =
     "换 IP 请求已被接受，Boil 后端仍在切换，请稍后使用 boil status 或 Telegram /status 查看。";
 const CHANGE_RESPONSE_UNCONFIRMED_MESSAGE: &str =
     "换 IP 请求已发出，但 Boil API 响应暂时无法确认，正在查询最终 IP。";
+const CHANGE_IP_COOLDOWN_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconnectPolicy {
@@ -43,6 +45,7 @@ pub enum ReconnectStatus {
     Success,
     Disabled,
     PreflightFailed,
+    RateLimited,
     ApiRejected,
     ChangeAcceptedButUnconfirmed,
     InvalidResponse,
@@ -65,6 +68,18 @@ pub struct ReconnectResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconnectProgress {
     VerifyingNewIp { old_ip: IpAddr },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeIpCooldownMode {
+    FailFast,
+    Wait,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectCooldown {
+    pub remaining: Duration,
+    pub available_at: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -121,6 +136,56 @@ where
     F: FnMut(ReconnectProgress) -> Fut,
     Fut: Future<Output = ()>,
 {
+    reconnect_one_with_current_ip_progress_and_cooldown(
+        client,
+        server,
+        policy,
+        current_ip,
+        ChangeIpCooldownMode::FailFast,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn reconnect_one_with_current_ip_progress_and_cooldown<F, Fut>(
+    client: &BoilClient,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+    cooldown_mode: ChangeIpCooldownMode,
+    on_progress: F,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    reconnect_one_with_current_ip_progress_cooldown_notify(
+        client,
+        server,
+        policy,
+        current_ip,
+        cooldown_mode,
+        on_progress,
+        |_| async {},
+    )
+    .await
+}
+
+pub async fn reconnect_one_with_current_ip_progress_cooldown_notify<F, Fut, C, CFut>(
+    client: &BoilClient,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+    cooldown_mode: ChangeIpCooldownMode,
+    on_progress: F,
+    on_cooldown: C,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+    C: FnMut(ReconnectCooldown) -> CFut,
+    CFut: Future<Output = ()>,
+{
     if !server.enabled {
         return base_result(
             server,
@@ -131,7 +196,16 @@ where
 
     let lock = server_lock(&server.id);
     let _guard = lock.lock().await;
-    reconnect_one_locked(client, server, policy, current_ip, on_progress).await
+    reconnect_one_locked(
+        client,
+        server,
+        policy,
+        current_ip,
+        cooldown_mode,
+        on_progress,
+        on_cooldown,
+    )
+    .await
 }
 
 pub async fn reconnect_selected(
@@ -157,16 +231,20 @@ pub async fn reconnect_selected(
     Ok(BatchReconnectResult { results })
 }
 
-async fn reconnect_one_locked<F, Fut>(
+async fn reconnect_one_locked<F, Fut, C, CFut>(
     client: &BoilClient,
     server: &ServerConfig,
     policy: &ReconnectPolicy,
     current_ip: Option<IpAddr>,
+    cooldown_mode: ChangeIpCooldownMode,
     mut on_progress: F,
+    on_cooldown: C,
 ) -> ReconnectResult
 where
     F: FnMut(ReconnectProgress) -> Fut,
     Fut: Future<Output = ()>,
+    C: FnMut(ReconnectCooldown) -> CFut,
+    CFut: Future<Output = ()>,
 {
     let old_ip = match current_ip {
         Some(ip) => ip,
@@ -179,7 +257,7 @@ where
         },
     };
 
-    let change = with_change_ip_lock(client.change_ip(&server.token)).await;
+    let change = change_ip_with_cooldown(client, server, cooldown_mode, on_cooldown).await;
     let mut result = match change {
         Ok(response) => {
             let mut result = base_result(
@@ -192,7 +270,17 @@ where
             result.next_allowed_at = response.next_allowed_at.filter(|timestamp| *timestamp >= 0);
             result
         }
-        Err(error) => {
+        Err(ChangeIpAttemptError::Cooldown(cooldown)) => {
+            let mut result = base_result(
+                server,
+                ReconnectStatus::RateLimited,
+                Some(&manual_cooldown_message(cooldown.remaining)),
+            );
+            result.old_ip = Some(old_ip);
+            result.next_allowed_at = Some(cooldown.available_at);
+            return result;
+        }
+        Err(ChangeIpAttemptError::Api(error)) => {
             let status = change_error_status(&error);
             if status == ReconnectStatus::ChangeAcceptedButUnconfirmed {
                 let mut result =
@@ -237,6 +325,177 @@ where
     }
 
     result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChangeIpCooldownHit {
+    remaining: Duration,
+    available_at: i64,
+}
+
+impl From<ChangeIpCooldownHit> for ReconnectCooldown {
+    fn from(hit: ChangeIpCooldownHit) -> Self {
+        Self {
+            remaining: hit.remaining,
+            available_at: hit.available_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChangeIpAttemptError {
+    Api(BoilApiError),
+    Cooldown(ChangeIpCooldownHit),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChangeIpCooldownState {
+    cooldown: Option<Duration>,
+    last_changeip_at: Option<i64>,
+    next_changeip_available_at: Option<i64>,
+}
+
+impl From<&ChangeIpCooldownConfig> for ChangeIpCooldownState {
+    fn from(config: &ChangeIpCooldownConfig) -> Self {
+        Self {
+            cooldown: config.cooldown_seconds.map(Duration::from_secs),
+            last_changeip_at: config.last_changeip_at,
+            next_changeip_available_at: config.next_changeip_available_at,
+        }
+    }
+}
+
+impl ChangeIpCooldownState {
+    #[cfg(not(test))]
+    fn to_config(&self) -> Option<ChangeIpCooldownConfig> {
+        (self.cooldown.is_some()
+            || self.last_changeip_at.is_some()
+            || self.next_changeip_available_at.is_some())
+        .then(|| ChangeIpCooldownConfig {
+            cooldown_seconds: self.cooldown.map(|duration| duration.as_secs()),
+            last_changeip_at: self.last_changeip_at,
+            next_changeip_available_at: self.next_changeip_available_at,
+        })
+    }
+
+    fn cooldown_hit_at(&self, now: i64) -> Option<ChangeIpCooldownHit> {
+        let available_at = self.next_changeip_available_at?;
+        let remaining_seconds = available_at.saturating_sub(now);
+        (remaining_seconds > 0).then(|| ChangeIpCooldownHit {
+            remaining: Duration::from_secs(remaining_seconds as u64),
+            available_at,
+        })
+    }
+
+    fn record_success(&mut self, request_at: i64) {
+        self.last_changeip_at = Some(request_at);
+        if let Some(cooldown) = self.cooldown {
+            self.next_changeip_available_at = request_at.checked_add(duration_secs_i64(cooldown));
+        }
+    }
+
+    fn record_rate_limit(&mut self, request_at: i64, api_next_available_at: i64) {
+        let adjusted_available_at = api_next_available_at
+            .saturating_add(duration_secs_i64(CHANGE_IP_COOLDOWN_SAFETY_MARGIN));
+        let base_at = self.last_changeip_at.unwrap_or(request_at);
+        let observed_seconds = adjusted_available_at.saturating_sub(base_at);
+        let observed = Duration::from_secs(observed_seconds.max(1) as u64);
+        let previous = self.cooldown.unwrap_or_default();
+        if observed > previous {
+            log::info!(
+                "changeIP cooldown 修正: previous={}s observed={}s api_next_available_at={api_next_available_at}",
+                previous.as_secs(),
+                observed.as_secs()
+            );
+            self.cooldown = Some(observed);
+        }
+        self.next_changeip_available_at = Some(adjusted_available_at);
+    }
+}
+
+async fn change_ip_with_cooldown<F, Fut>(
+    client: &BoilClient,
+    server: &ServerConfig,
+    mode: ChangeIpCooldownMode,
+    mut on_cooldown: F,
+) -> Result<crate::boil::ChangeIpResponse, ChangeIpAttemptError>
+where
+    F: FnMut(ReconnectCooldown) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        let request_at = unix_now();
+        let wait = {
+            let _change_guard = CHANGE_IP_LOCK.lock().await;
+            let state = change_ip_cooldown_state();
+            let state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.cooldown_hit_at(request_at)
+        };
+
+        if let Some(cooldown) = wait {
+            log::info!(
+                "changeIP cooldown active: server_id={} cooldown_wait={}s next_available_at={}",
+                server.id,
+                cooldown.remaining.as_secs(),
+                cooldown.available_at
+            );
+            match mode {
+                ChangeIpCooldownMode::FailFast => {
+                    return Err(ChangeIpAttemptError::Cooldown(cooldown));
+                }
+                ChangeIpCooldownMode::Wait => {
+                    on_cooldown(cooldown.into()).await;
+                    tokio::time::sleep(cooldown.remaining).await;
+                    continue;
+                }
+            }
+        }
+
+        let _change_guard = CHANGE_IP_LOCK.lock().await;
+        let request_at = unix_now();
+        log::info!(
+            "changeIP request: server_id={} cooldown={}s last_changeip_at={:?} next_available_at={:?}",
+            server.id,
+            current_cooldown_seconds(),
+            current_last_changeip_at(),
+            current_next_changeip_available_at()
+        );
+        match client.change_ip(&server.token).await {
+            Ok(response) => {
+                update_change_ip_cooldown(|state| state.record_success(request_at));
+                return Ok(response);
+            }
+            Err(error) => {
+                if let Some(api_next_available_at) = parse_rate_limit_next_available_at(&error) {
+                    update_change_ip_cooldown(|state| {
+                        state.record_rate_limit(request_at, api_next_available_at)
+                    });
+                    let cooldown = cooldown_hit_or_zero(unix_now(), api_next_available_at);
+                    log::info!(
+                        "changeIP rate limited: server_id={} api_next_available_at={} wait={}s",
+                        server.id,
+                        api_next_available_at,
+                        cooldown.remaining.as_secs()
+                    );
+                    match mode {
+                        ChangeIpCooldownMode::FailFast => {
+                            return Err(ChangeIpAttemptError::Cooldown(cooldown));
+                        }
+                        ChangeIpCooldownMode::Wait => {
+                            if cooldown.remaining > Duration::ZERO {
+                                on_cooldown(cooldown.into()).await;
+                                tokio::time::sleep(cooldown.remaining).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                return Err(ChangeIpAttemptError::Api(error));
+            }
+        }
+    }
 }
 
 fn base_result(
@@ -291,12 +550,144 @@ fn change_error_status(error: &BoilApiError) -> ReconnectStatus {
     }
 }
 
+#[cfg(test)]
 async fn with_change_ip_lock<F, R>(future: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
     let _change_guard = CHANGE_IP_LOCK.lock().await;
     future.await
+}
+
+fn change_ip_cooldown_state() -> &'static Mutex<ChangeIpCooldownState> {
+    CHANGE_IP_COOLDOWN.get_or_init(|| Mutex::new(load_persisted_change_ip_cooldown()))
+}
+
+#[cfg(not(test))]
+fn load_persisted_change_ip_cooldown() -> ChangeIpCooldownState {
+    crate::config::load_app_config()
+        .ok()
+        .and_then(|config| config.change_ip_cooldown)
+        .as_ref()
+        .map(ChangeIpCooldownState::from)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn load_persisted_change_ip_cooldown() -> ChangeIpCooldownState {
+    ChangeIpCooldownState::default()
+}
+
+#[cfg(not(test))]
+fn update_change_ip_cooldown(update: impl FnOnce(&mut ChangeIpCooldownState)) {
+    let snapshot = {
+        let state = change_ip_cooldown_state();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut state);
+        state.clone()
+    };
+
+    if let Some(config) = snapshot.to_config() {
+        if let Err(error) = crate::config::persist_change_ip_cooldown(&config) {
+            log::warn!("changeIP cooldown 持久化失败: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+fn update_change_ip_cooldown(_update: impl FnOnce(&mut ChangeIpCooldownState)) {}
+
+fn current_cooldown_seconds() -> u64 {
+    let state = change_ip_cooldown_state();
+    let state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state
+        .cooldown
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn current_last_changeip_at() -> Option<i64> {
+    let state = change_ip_cooldown_state();
+    let state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.last_changeip_at
+}
+
+fn current_next_changeip_available_at() -> Option<i64> {
+    let state = change_ip_cooldown_state();
+    let state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.next_changeip_available_at
+}
+
+fn parse_rate_limit_next_available_at(error: &BoilApiError) -> Option<i64> {
+    let BoilApiError::ApiRejected { message, .. } = error else {
+        return None;
+    };
+    if !(message.contains("频率限制") && message.contains("下次可用时间")) {
+        return None;
+    }
+    last_integer_in_text(message)
+}
+
+fn last_integer_in_text(text: &str) -> Option<i64> {
+    text.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<i64>().ok())
+        .next_back()
+}
+
+fn cooldown_hit_or_zero(now: i64, api_next_available_at: i64) -> ChangeIpCooldownHit {
+    let available_at =
+        api_next_available_at.saturating_add(duration_secs_i64(CHANGE_IP_COOLDOWN_SAFETY_MARGIN));
+    let remaining = available_at.saturating_sub(now).max(0) as u64;
+    ChangeIpCooldownHit {
+        remaining: Duration::from_secs(remaining),
+        available_at,
+    }
+}
+
+fn manual_cooldown_message(remaining: Duration) -> String {
+    format!(
+        "⏳ 换 IP 频率限制中\n\n预计 {}后可再次换 IP",
+        format_wait_duration(remaining)
+    )
+}
+
+fn format_wait_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else if seconds < 3600 {
+        format!("{} 分钟", seconds.div_ceil(60))
+    } else {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600).div_ceil(60);
+        if minutes == 0 {
+            format!("{hours} 小时")
+        } else {
+            format!("{hours} 小时 {minutes} 分钟")
+        }
+    }
+}
+
+fn duration_secs_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 fn server_lock(server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -521,6 +912,7 @@ mod tests {
         AppConfig {
             servers,
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -539,6 +931,73 @@ mod tests {
 
     fn test_credential() -> String {
         ["phase", "three", "credential"].join("-")
+    }
+
+    fn rate_limited(next_available_at: i64) -> MockResponse {
+        response(
+            400,
+            Box::leak(
+                format!(r#"{{"error":"频率限制中，下次可用时间: {next_available_at}"}}"#)
+                    .into_boxed_str(),
+            ),
+        )
+    }
+
+    #[test]
+    fn rate_limit_parser_extracts_next_available_timestamp() {
+        let error = BoilApiError::ApiRejected {
+            status: Some(reqwest::StatusCode::BAD_REQUEST),
+            message: "频率限制中，下次可用时间: 1785704991".to_string(),
+        };
+
+        assert_eq!(parse_rate_limit_next_available_at(&error), Some(1785704991));
+    }
+
+    #[test]
+    fn cooldown_state_only_increases_when_api_proves_it_is_too_short() {
+        let mut state = ChangeIpCooldownState {
+            cooldown: Some(Duration::from_secs(30)),
+            last_changeip_at: Some(100),
+            next_changeip_available_at: None,
+        };
+
+        state.record_rate_limit(130, 120);
+        assert_eq!(state.cooldown, Some(Duration::from_secs(30)));
+
+        state.record_rate_limit(130, 160);
+        assert_eq!(state.cooldown, Some(Duration::from_secs(63)));
+        assert_eq!(state.next_changeip_available_at, Some(163));
+    }
+
+    #[test]
+    fn successful_change_sets_next_available_when_cooldown_is_known() {
+        let mut state = ChangeIpCooldownState {
+            cooldown: Some(Duration::from_secs(60)),
+            last_changeip_at: None,
+            next_changeip_available_at: None,
+        };
+
+        state.record_success(1000);
+
+        assert_eq!(state.last_changeip_at, Some(1000));
+        assert_eq!(state.next_changeip_available_at, Some(1060));
+    }
+
+    #[test]
+    fn known_cooldown_can_be_reported_without_requesting_api() {
+        let state = ChangeIpCooldownState {
+            cooldown: Some(Duration::from_secs(60)),
+            last_changeip_at: Some(1000),
+            next_changeip_available_at: Some(1060),
+        };
+
+        let hit = state.cooldown_hit_at(1001).unwrap();
+
+        assert_eq!(hit.remaining, Duration::from_secs(59));
+        assert_eq!(
+            manual_cooldown_message(hit.remaining),
+            "⏳ 换 IP 频率限制中\n\n预计 59 秒后可再次换 IP"
+        );
     }
 
     #[tokio::test]
@@ -669,6 +1128,55 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("quota exhausted"));
+    }
+
+    #[tokio::test]
+    async fn background_change_waits_and_retries_current_server_after_rate_limit() {
+        let mock = MockServer::start(vec![
+            ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
+            rate_limited(unix_now().saturating_sub(2)),
+            accepted(),
+            ip(r#"{"ok":true,"ip":"42.1.1.2"}"#),
+        ])
+        .await;
+        let client = BoilClient::with_api_base_url(&mock.base_url).unwrap();
+        let cooldown_events = Arc::new(Mutex::new(Vec::new()));
+
+        let result = reconnect_one_with_current_ip_progress_cooldown_notify(
+            &client,
+            &server("rate-limit", true),
+            &policy(3),
+            None,
+            ChangeIpCooldownMode::Wait,
+            |_| async {},
+            |cooldown| {
+                let cooldown_events = Arc::clone(&cooldown_events);
+                let change_count_before_wait = mock.change_count();
+                async move {
+                    cooldown_events
+                        .lock()
+                        .unwrap()
+                        .push((cooldown.remaining, change_count_before_wait));
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert_eq!(mock.change_count(), 2);
+        let cooldown_events = cooldown_events.lock().unwrap();
+        assert_eq!(cooldown_events.len(), 1);
+        assert!(cooldown_events[0].0 > Duration::ZERO);
+        assert_eq!(cooldown_events[0].1, 1);
+        assert_eq!(
+            mock.records(),
+            vec![
+                "/api/v1/getIP",
+                "/api/v1/changeIP/",
+                "/api/v1/changeIP/",
+                "/api/v1/getIP",
+            ]
+        );
     }
 
     #[tokio::test]

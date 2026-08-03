@@ -102,6 +102,7 @@ pub(super) mod test_support {
                 enabled: true,
                 cron: Some("45 4 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: Some("12345".to_string()),
             tg_pair_code: None,

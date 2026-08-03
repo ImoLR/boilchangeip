@@ -16,8 +16,8 @@ use crate::{
         ServerTimerConfig,
     },
     reconnect::{
-        reconnect_one_with_current_ip_and_progress, BatchReconnectResult, ReconnectPolicy,
-        ReconnectProgress, ReconnectStatus,
+        reconnect_one_with_current_ip_progress_cooldown_notify, BatchReconnectResult,
+        ChangeIpCooldownMode, ReconnectPolicy, ReconnectProgress, ReconnectStatus,
     },
 };
 
@@ -380,12 +380,19 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
         return;
     }
 
-    let result = reconnect_one_with_current_ip_and_progress(
+    let result = reconnect_one_with_current_ip_progress_cooldown_notify(
         &client,
         selected,
         &ReconnectPolicy::default(),
         current_ip,
+        ChangeIpCooldownMode::Wait,
         |event| update_timer_progress(progress.clone(), selected.name.clone(), event),
+        |cooldown| {
+            let message = timer_cooldown_wait_message(&selected.name, cooldown.remaining);
+            async move {
+                tg_notify(config, &message).await;
+            }
+        },
     )
     .await;
     log::info!(
@@ -451,12 +458,19 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
             continue;
         }
 
-        let result = reconnect_one_with_current_ip_and_progress(
+        let result = reconnect_one_with_current_ip_progress_cooldown_notify(
             &client,
             server,
             &ReconnectPolicy::default(),
             current_ip,
+            ChangeIpCooldownMode::Wait,
             |event| update_timer_progress(progress.clone(), server.name.clone(), event),
+            |cooldown| {
+                let message = timer_cooldown_wait_message(&server.name, cooldown.remaining);
+                async move {
+                    tg_notify(config, &message).await;
+                }
+            },
         )
         .await;
         batch.results.push(result);
@@ -575,12 +589,20 @@ async fn run_timer_preflight_retry(
         };
 
         let progress = tg_send(&config, &format!("🔄 现在处理：{}", server.name)).await;
-        let result = reconnect_one_with_current_ip_and_progress(
+        let result = reconnect_one_with_current_ip_progress_cooldown_notify(
             &client,
             &server,
             &ReconnectPolicy::default(),
             Some(old_ip),
+            ChangeIpCooldownMode::Wait,
             |event| update_timer_progress(progress.clone(), server.name.clone(), event),
+            |cooldown| {
+                let notify_config = config.clone();
+                let message = timer_cooldown_wait_message(&server.name, cooldown.remaining);
+                async move {
+                    tg_notify(&notify_config, &message).await;
+                }
+            },
         )
         .await;
 
@@ -762,6 +784,30 @@ fn timer_retry_get_ip_failed_message(attempt: TimerRetryAttempt) -> String {
     )
 }
 
+fn timer_cooldown_wait_message(server_name: &str, remaining: Duration) -> String {
+    format!(
+        "⏳ 换 IP 频率限制中\n\n📡 {server_name}\n\n预计 {}后继续换 IP",
+        format_timer_wait_duration(remaining)
+    )
+}
+
+fn format_timer_wait_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else if seconds < 3600 {
+        format!("{} 分钟", seconds.div_ceil(60))
+    } else {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600).div_ceil(60);
+        if minutes == 0 {
+            format!("{hours} 小时")
+        } else {
+            format!("{hours} 小时 {minutes} 分钟")
+        }
+    }
+}
+
 fn format_timer_retry_success(result: &crate::reconnect::ReconnectResult) -> String {
     let lines = vec![
         "✅ 重试换 IP 成功".to_string(),
@@ -860,6 +906,7 @@ fn append_timer_result_lines(lines: &mut Vec<String>, result: &crate::reconnect:
 fn timer_status_message(result: &crate::reconnect::ReconnectResult) -> &'static str {
     match result.status {
         ReconnectStatus::Success => "✅ 换 IP 成功",
+        ReconnectStatus::RateLimited => "⏳ 换 IP 频率限制中",
         ReconnectStatus::ChangeAcceptedButUnconfirmed => "⚠️ 换 IP 已提交，但暂时无法确认结果",
         _ => "❌ 换 IP 失败",
     }
@@ -872,6 +919,10 @@ fn timer_reason(result: &crate::reconnect::ReconnectResult) -> String {
         ReconnectStatus::PreflightFailed => {
             "换 IP 前查询当前 IP 失败，未发送换 IP 请求".to_string()
         }
+        ReconnectStatus::RateLimited => result
+            .message
+            .clone()
+            .unwrap_or_else(|| "换 IP 频率限制中，请稍后再试".to_string()),
         ReconnectStatus::ApiRejected => result
             .message
             .clone()
@@ -950,6 +1001,7 @@ mod tests {
                 },
             ],
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1081,6 +1133,7 @@ mod tests {
         let mut config = AppConfig {
             servers: vec![enabled_server("a", Some("0 8 * * *"), true)],
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1124,6 +1177,7 @@ mod tests {
                 enabled: true,
                 cron: Some("30 3 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1171,6 +1225,7 @@ mod tests {
                 enabled: true,
                 cron: Some("0 1 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1200,6 +1255,7 @@ mod tests {
                 enabled: true,
                 cron: Some("30 3 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1229,6 +1285,7 @@ mod tests {
                 enabled: true,
                 cron: Some("45 4 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1263,6 +1320,7 @@ mod tests {
                 enabled: true,
                 cron: Some("57 23 * * *".to_string()),
             }),
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -1388,6 +1446,18 @@ mod tests {
         assert_eq!(
             timer_retry_get_ip_failed_message(TimerRetryAttempt::Third),
             "❌ 第三次重新获取 IP 失败。\n\n流程结束，\n\n请管理员手动处理。"
+        );
+    }
+
+    #[test]
+    fn timer_cooldown_wait_message_says_background_will_continue() {
+        assert_eq!(
+            timer_cooldown_wait_message("Taiwan VPS", Duration::from_secs(59)),
+            "⏳ 换 IP 频率限制中\n\n📡 Taiwan VPS\n\n预计 59 秒后继续换 IP"
+        );
+        assert_eq!(
+            timer_cooldown_wait_message("Taiwan VPS", Duration::from_secs(61)),
+            "⏳ 换 IP 频率限制中\n\n📡 Taiwan VPS\n\n预计 2 分钟后继续换 IP"
         );
     }
 

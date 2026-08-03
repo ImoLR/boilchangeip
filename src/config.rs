@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const BOIL_SERVERS_ENV: &str = "BOIL_SERVERS";
 const BOIL_GLOBAL_TIMER_ENV: &str = "BOIL_GLOBAL_TIMER";
+const BOIL_CHANGEIP_COOLDOWN_ENV: &str = "BOIL_CHANGEIP_COOLDOWN";
 const TG_PAIR_CODE_ENV: &str = "TG_PAIR_CODE";
 const TG_PAIR_EXPIRES_AT_ENV: &str = "TG_PAIR_EXPIRES_AT";
 const TG_PAIR_TTL_SECONDS: u64 = 300;
@@ -87,6 +88,16 @@ pub struct ServerTimerConfig {
     pub cron: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ChangeIpCooldownConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changeip_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_changeip_available_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ServerConfig {
     pub id: String,
@@ -109,6 +120,7 @@ pub struct ServerConfig {
 pub struct AppConfig {
     pub servers: Vec<ServerConfig>,
     pub global_timer: Option<ServerTimerConfig>,
+    pub change_ip_cooldown: Option<ChangeIpCooldownConfig>,
     pub tg_token: Option<String>,
     pub tg_chat_id: Option<String>,
     pub tg_pair_code: Option<PairingCode>,
@@ -121,6 +133,7 @@ impl fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("servers", &self.servers)
             .field("global_timer", &self.global_timer)
+            .field("change_ip_cooldown", &self.change_ip_cooldown)
             .field("tg_token", &self.tg_token.as_ref().map(|_| "<redacted>"))
             .field("tg_chat_id", &self.tg_chat_id)
             .field(
@@ -161,6 +174,7 @@ impl AppConfig {
                 return Ok(Self {
                     servers: Vec::new(),
                     global_timer: parse_global_timer(&vars)?,
+                    change_ip_cooldown: parse_change_ip_cooldown(&vars)?,
                     tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
                     tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
                     tg_pair_code: parse_pairing_code(&vars)?,
@@ -178,6 +192,7 @@ impl AppConfig {
         Ok(Self {
             servers,
             global_timer: parse_global_timer(&vars)?,
+            change_ip_cooldown: parse_change_ip_cooldown(&vars)?,
             tg_token: find_var(&vars, "TG_TOKEN").map(str::to_string),
             tg_chat_id: find_var(&vars, "TG_CHAT_ID").map(str::to_string),
             tg_pair_code: parse_pairing_code(&vars)?,
@@ -220,6 +235,13 @@ pub fn save_app_config(config: &AppConfig) -> anyhow::Result<()> {
     save_app_config_to_path(config, &config_path())
 }
 
+#[cfg(not(test))]
+pub fn persist_change_ip_cooldown(cooldown: &ChangeIpCooldownConfig) -> anyhow::Result<()> {
+    let mut config = load_app_config()?;
+    config.change_ip_cooldown = Some(cooldown.clone());
+    save_app_config(&config)
+}
+
 pub(crate) fn save_app_config_to_path(
     config: &AppConfig,
     path: &std::path::Path,
@@ -227,6 +249,9 @@ pub(crate) fn save_app_config_to_path(
     validate_servers(&config.servers)?;
     if let Some(timer) = &config.global_timer {
         validate_timer_config(timer).context("BOIL_GLOBAL_TIMER 配置无效")?;
+    }
+    if let Some(cooldown) = &config.change_ip_cooldown {
+        validate_change_ip_cooldown(cooldown).context("BOIL_CHANGEIP_COOLDOWN 配置无效")?;
     }
 
     let existing = std::fs::read_to_string(path).unwrap_or_default();
@@ -238,6 +263,16 @@ pub(crate) fn save_app_config_to_path(
             Some(format!(
                 "{BOIL_GLOBAL_TIMER_ENV}={}",
                 shell_single_quote(&timer_json)
+            ))
+        }
+        None => None,
+    };
+    let change_ip_cooldown_line = match &config.change_ip_cooldown {
+        Some(cooldown) => {
+            let cooldown_json = serde_json::to_string_pretty(cooldown)?;
+            Some(format!(
+                "{BOIL_CHANGEIP_COOLDOWN_ENV}={}",
+                shell_single_quote(&cooldown_json)
             ))
         }
         None => None,
@@ -257,6 +292,7 @@ pub(crate) fn save_app_config_to_path(
         .map(|expires_at| format!("{TG_PAIR_EXPIRES_AT_ENV}={expires_at}"));
     let mut replaced = false;
     let mut global_replaced = false;
+    let mut cooldown_replaced = false;
     let mut tg_chat_id_replaced = false;
     let mut tg_pair_code_replaced = false;
     let mut tg_pair_expires_at_replaced = false;
@@ -275,6 +311,14 @@ pub(crate) fn save_app_config_to_path(
             }
             skip_multiline_single_quoted_value(trimmed, &mut existing_lines);
             global_replaced = true;
+        } else if trimmed.starts_with(&format!("{BOIL_CHANGEIP_COOLDOWN_ENV}=")) {
+            if let Some(line) = &change_ip_cooldown_line {
+                lines.push(line.clone());
+                skip_multiline_single_quoted_value(trimmed, &mut existing_lines);
+            } else {
+                lines.push(line.to_string());
+            }
+            cooldown_replaced = true;
         } else if trimmed.starts_with("TG_CHAT_ID=") {
             if let Some(line) = &tg_chat_id_line {
                 lines.push(line.clone());
@@ -303,6 +347,11 @@ pub(crate) fn save_app_config_to_path(
     if !global_replaced {
         if let Some(line) = global_timer_line {
             lines.insert(1.min(lines.len()), line);
+        }
+    }
+    if !cooldown_replaced {
+        if let Some(line) = change_ip_cooldown_line {
+            lines.insert(2.min(lines.len()), line);
         }
     }
     if !tg_chat_id_replaced {
@@ -468,6 +517,22 @@ fn parse_global_timer(vars: &[(&str, &str)]) -> anyhow::Result<Option<ServerTime
     Ok(Some(timer))
 }
 
+fn parse_change_ip_cooldown(
+    vars: &[(&str, &str)],
+) -> anyhow::Result<Option<ChangeIpCooldownConfig>> {
+    let Some(cooldown_json) = find_var(vars, BOIL_CHANGEIP_COOLDOWN_ENV) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !cooldown_json.trim().is_empty(),
+        "BOIL_CHANGEIP_COOLDOWN 不能为空；未学习到 cooldown 时请删除该配置项"
+    );
+    let cooldown = serde_json::from_str(cooldown_json)
+        .context("BOIL_CHANGEIP_COOLDOWN JSON 解析失败，请检查 changeIP cooldown 配置格式")?;
+    validate_change_ip_cooldown(&cooldown).context("BOIL_CHANGEIP_COOLDOWN 配置无效")?;
+    Ok(Some(cooldown))
+}
+
 fn validate_timer_config(timer: &ServerTimerConfig) -> anyhow::Result<()> {
     if let Some(cron) = &timer.cron {
         validate_timer_cron(cron)?;
@@ -482,6 +547,13 @@ fn validate_timer_cron(cron: &str) -> anyhow::Result<()> {
         parts.iter().all(|part| !part.trim().is_empty()),
         "cron 字段不能为空"
     );
+    Ok(())
+}
+
+fn validate_change_ip_cooldown(cooldown: &ChangeIpCooldownConfig) -> anyhow::Result<()> {
+    if let Some(seconds) = cooldown.cooldown_seconds {
+        anyhow::ensure!(seconds > 0, "cooldown_seconds 必须大于 0");
+    }
     Ok(())
 }
 
@@ -1144,6 +1216,40 @@ mod tests {
         assert!(!saved.contains("Japan 02"));
         assert!(saved.contains("TG_TOKEN='keep'"));
         assert!(saved.contains("TG_CHAT_ID='123'"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_app_config_preserves_existing_changeip_cooldown_when_not_loaded() {
+        let dir = std::env::temp_dir().join(format!(
+            "boilchangeip-config-cooldown-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        let cooldown = r#"{
+  "cooldown_seconds": 63,
+  "last_changeip_at": 100,
+  "next_changeip_available_at": 163
+}"#;
+        std::fs::write(
+            &path,
+            format!(
+                "BOIL_SERVERS='[]'\nBOIL_CHANGEIP_COOLDOWN={}\nTG_TOKEN='keep'\n",
+                shell_single_quote(cooldown)
+            ),
+        )
+        .unwrap();
+
+        let app = app_from_servers_json(ONE_SERVER).unwrap();
+        save_app_config_to_path(&app, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+
+        assert!(saved.contains("BOIL_CHANGEIP_COOLDOWN='"));
+        assert!(saved.contains("\"cooldown_seconds\": 63"));
+        assert!(saved.contains("TG_TOKEN='keep'"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

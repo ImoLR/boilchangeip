@@ -111,6 +111,7 @@ mod tests {
                 },
             ],
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,

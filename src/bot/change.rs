@@ -12,12 +12,12 @@ use crate::{
     core::check_ip_quality,
     reconnect::{
         reconnect_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
-        ReconnectResult,
+        ReconnectResult, ReconnectStatus,
     },
 };
 
 use super::{
-    formatting::{format_server_config_card, html_escape},
+    formatting::{format_server_display_parts, html_escape, server_geo_label},
     state::{ConfirmConsume, ConfirmationStore, UiPage, UiSessionStore},
     timer_ui::{record_sent_page_message, record_sent_ui_message},
 };
@@ -158,18 +158,52 @@ pub(super) async fn show_change_confirmation(
         ),
         InlineKeyboardButton::callback("取消", format!("cancel_change:{}:{}", server.id, nonce)),
     ]]);
+    let initial_text = format!(
+        "确认更换这台服务器的 IP？\n\n{}",
+        format_server_display_parts(&server.name, "⚙️ 正在查询 IP...", &server_geo_label(server))
+    );
     let sent = bot
-        .send_message(
-            chat_id,
-            format!(
-                "确认更换这台服务器的 IP？\n\n{}",
-                format_server_config_card(server)
-            ),
-        )
-        .reply_markup(keyboard)
+        .send_message(chat_id, initial_text)
+        .reply_markup(keyboard.clone())
         .parse_mode(ParseMode::Html)
         .await;
+    let message_id = sent.as_ref().ok().map(|message| message.id);
     record_sent_page_message(bot, chat_id, sent, UiPage::Change, ui_sessions).await;
+
+    let current_ip = match BoilClient::new() {
+        Ok(client) => match client.get_ip(&server.token).await {
+            Ok(response) => response.ip.to_string(),
+            Err(error) => {
+                log::warn!(
+                    "Telegram /change 确认页查询当前 IP 失败: server_id={}: {error}",
+                    server.id
+                );
+                "查询失败".to_string()
+            }
+        },
+        Err(error) => {
+            log::warn!("Telegram /change 确认页初始化客户端失败: {error}");
+            "查询失败".to_string()
+        }
+    };
+    if let Some(message_id) = message_id {
+        let _ = bot
+            .edit_message_text(
+                chat_id,
+                message_id,
+                format!(
+                    "确认更换这台服务器的 IP？\n\n{}",
+                    format_server_display_parts(
+                        &server.name,
+                        &current_ip,
+                        &server_geo_label(server)
+                    )
+                ),
+            )
+            .reply_markup(keyboard)
+            .parse_mode(ParseMode::Html)
+            .await;
+    }
 }
 
 pub(super) async fn confirm_and_change(
@@ -307,6 +341,28 @@ async fn send_reconnect_result(
     result: &ReconnectResult,
     ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
+    if result.status == ReconnectStatus::RateLimited {
+        let mut lines = vec!["⏳ 换 IP 频率限制中".to_string(), String::new()];
+        lines.push(format!("📡 <b>{}</b>", html_escape(&result.server_name)));
+        if let Some(message) = &result.message {
+            let message = message
+                .lines()
+                .filter(|line| !line.trim().starts_with('⏳'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !message.trim().is_empty() {
+                lines.push(String::new());
+                lines.push(html_escape(message.trim()));
+            }
+        }
+        let sent = bot
+            .send_message(chat_id, lines.join("\n"))
+            .parse_mode(ParseMode::Html)
+            .await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
+        return;
+    }
+
     let mut lines = vec![
         format!("📡 <b>{}</b>", html_escape(&result.server_name)),
         format!("状态: {:?}", result.status),

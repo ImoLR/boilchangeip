@@ -277,6 +277,7 @@ fn status_text(status: &ReconnectStatus) -> &'static str {
         ReconnectStatus::Success => "成功",
         ReconnectStatus::Disabled => "已禁用",
         ReconnectStatus::PreflightFailed => "预检查失败",
+        ReconnectStatus::RateLimited => "频率限制中",
         ReconnectStatus::ApiRejected => "API 拒绝",
         ReconnectStatus::ChangeAcceptedButUnconfirmed => "已接受但未确认",
         ReconnectStatus::InvalidResponse => "响应无效",
@@ -302,6 +303,7 @@ mod tests {
                 timer: None,
             }],
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,
@@ -328,6 +330,7 @@ mod tests {
         let config = AppConfig {
             servers: Vec::new(),
             global_timer: None,
+            change_ip_cooldown: None,
             tg_token: None,
             tg_chat_id: None,
             tg_pair_code: None,

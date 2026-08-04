@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.2.14 - 2026-08-04
+
+### 修复
+
+- 修复 Boil API 返回繁体「下次可用時間」时无法识别 rate-limit cooldown 的问题。
+- 修复 Timer 将繁体 rate-limit 响应误当普通 HTTP 400，导致批量任务直接进入下一台 VPS 并继续撞相同 cooldown 的问题。
+
 ## v2.2.13 - 2026-08-03
 
 ### 修复

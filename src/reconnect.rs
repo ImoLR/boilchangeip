@@ -630,10 +630,10 @@ fn parse_rate_limit_next_available_at(error: &BoilApiError) -> Option<i64> {
     let BoilApiError::ApiRejected { message, .. } = error else {
         return None;
     };
-    if !(message.contains("频率限制") && message.contains("下次可用时间")) {
+    if !message.contains("频率限制") {
         return None;
     }
-    last_integer_in_text(message)
+    last_integer_in_text(message).filter(|timestamp| *timestamp >= 1_000_000_000)
 }
 
 fn last_integer_in_text(text: &str) -> Option<i64> {
@@ -933,24 +933,54 @@ mod tests {
         ["phase", "three", "credential"].join("-")
     }
 
-    fn rate_limited(next_available_at: i64) -> MockResponse {
+    fn rate_limited_traditional(next_available_at: i64) -> MockResponse {
         response(
             400,
             Box::leak(
-                format!(r#"{{"error":"频率限制中，下次可用时间: {next_available_at}"}}"#)
+                format!(r#"{{"error":"频率限制中，下次可用時間: {next_available_at}"}}"#)
                     .into_boxed_str(),
             ),
         )
     }
 
     #[test]
-    fn rate_limit_parser_extracts_next_available_timestamp() {
+    fn rate_limit_parser_extracts_simplified_next_available_timestamp() {
         let error = BoilApiError::ApiRejected {
             status: Some(reqwest::StatusCode::BAD_REQUEST),
             message: "频率限制中，下次可用时间: 1785704991".to_string(),
         };
 
         assert_eq!(parse_rate_limit_next_available_at(&error), Some(1785704991));
+    }
+
+    #[test]
+    fn rate_limit_parser_extracts_traditional_next_available_timestamp() {
+        let error = BoilApiError::ApiRejected {
+            status: Some(reqwest::StatusCode::BAD_REQUEST),
+            message: "频率限制中，下次可用時間: 1785790838".to_string(),
+        };
+
+        assert_eq!(parse_rate_limit_next_available_at(&error), Some(1785790838));
+    }
+
+    #[test]
+    fn ordinary_http_400_is_not_treated_as_rate_limit() {
+        let error = BoilApiError::ApiRejected {
+            status: Some(reqwest::StatusCode::BAD_REQUEST),
+            message: "Bad Request: invalid token format 400".to_string(),
+        };
+
+        assert_eq!(parse_rate_limit_next_available_at(&error), None);
+    }
+
+    #[test]
+    fn rate_limit_without_unix_timestamp_is_not_treated_as_cooldown() {
+        let error = BoilApiError::ApiRejected {
+            status: Some(reqwest::StatusCode::BAD_REQUEST),
+            message: "频率限制中，请稍后重试，错误码 400".to_string(),
+        };
+
+        assert_eq!(parse_rate_limit_next_available_at(&error), None);
     }
 
     #[test]
@@ -1134,7 +1164,7 @@ mod tests {
     async fn background_change_waits_and_retries_current_server_after_rate_limit() {
         let mock = MockServer::start(vec![
             ip(r#"{"ok":true,"ip":"42.1.1.1"}"#),
-            rate_limited(unix_now().saturating_sub(2)),
+            rate_limited_traditional(unix_now().saturating_sub(2)),
             accepted(),
             ip(r#"{"ok":true,"ip":"42.1.1.2"}"#),
         ])

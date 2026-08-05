@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.2.15 - 2026-08-05
+
+### 修复
+
+- `changeIP` 成功后直接使用 `next_allowed_at` 建立全局 cooldown，不再等下一台 VPS 撞频率限制后才学习。
+- 修复 `ChangeAcceptedButUnconfirmed` 场景下已经成功提交换 IP 请求但未建立 cooldown 的问题。
+- 兼容 Boil API 返回繁体「頻率限制」的 rate-limit fallback 文案。
+- 防止批量 Timer 在上一台成功提交后继续让后续 VPS 立即撞相同的 `changeIP` 频率限制。
+
 ## v2.2.14 - 2026-08-04
 
 ### 修复

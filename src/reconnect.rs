@@ -387,17 +387,26 @@ impl ChangeIpCooldownState {
         })
     }
 
-    fn record_success(&mut self, request_at: i64) {
+    fn record_success(&mut self, request_at: i64, next_allowed_at: Option<i64>) {
         self.last_changeip_at = Some(request_at);
-        if let Some(cooldown) = self.cooldown {
+
+        if let Some(next_allowed_at) =
+            next_allowed_at.filter(|timestamp| is_unix_timestamp(*timestamp))
+        {
+            self.record_next_available_at(request_at, next_allowed_at);
+        } else if let Some(cooldown) = self.cooldown {
             self.next_changeip_available_at = request_at.checked_add(duration_secs_i64(cooldown));
         }
     }
 
     fn record_rate_limit(&mut self, request_at: i64, api_next_available_at: i64) {
+        let base_at = self.last_changeip_at.unwrap_or(request_at);
+        self.record_next_available_at(base_at, api_next_available_at);
+    }
+
+    fn record_next_available_at(&mut self, base_at: i64, api_next_available_at: i64) {
         let adjusted_available_at = api_next_available_at
             .saturating_add(duration_secs_i64(CHANGE_IP_COOLDOWN_SAFETY_MARGIN));
-        let base_at = self.last_changeip_at.unwrap_or(request_at);
         let observed_seconds = adjusted_available_at.saturating_sub(base_at);
         let observed = Duration::from_secs(observed_seconds.max(1) as u64);
         let previous = self.cooldown.unwrap_or_default();
@@ -464,7 +473,9 @@ where
         );
         match client.change_ip(&server.token).await {
             Ok(response) => {
-                update_change_ip_cooldown(|state| state.record_success(request_at));
+                update_change_ip_cooldown(|state| {
+                    state.record_success(request_at, response.next_allowed_at)
+                });
                 return Ok(response);
             }
             Err(error) => {
@@ -630,10 +641,18 @@ fn parse_rate_limit_next_available_at(error: &BoilApiError) -> Option<i64> {
     let BoilApiError::ApiRejected { message, .. } = error else {
         return None;
     };
-    if !message.contains("频率限制") {
+    if !is_rate_limit_message(message) {
         return None;
     }
-    last_integer_in_text(message).filter(|timestamp| *timestamp >= 1_000_000_000)
+    last_integer_in_text(message).filter(|timestamp| is_unix_timestamp(*timestamp))
+}
+
+fn is_rate_limit_message(message: &str) -> bool {
+    message.contains("频率限制") || message.contains("頻率限制")
+}
+
+fn is_unix_timestamp(timestamp: i64) -> bool {
+    timestamp >= 1_000_000_000
 }
 
 fn last_integer_in_text(text: &str) -> Option<i64> {
@@ -937,7 +956,7 @@ mod tests {
         response(
             400,
             Box::leak(
-                format!(r#"{{"error":"频率限制中，下次可用時間: {next_available_at}"}}"#)
+                format!(r#"{{"error":"頻率限制中，下次可用時間: {next_available_at}"}}"#)
                     .into_boxed_str(),
             ),
         )
@@ -961,6 +980,16 @@ mod tests {
         };
 
         assert_eq!(parse_rate_limit_next_available_at(&error), Some(1785790838));
+    }
+
+    #[test]
+    fn rate_limit_parser_extracts_fully_traditional_next_available_timestamp() {
+        let error = BoilApiError::ApiRejected {
+            status: Some(reqwest::StatusCode::BAD_REQUEST),
+            message: "頻率限制中，下次可用時間: 1785877240".to_string(),
+        };
+
+        assert_eq!(parse_rate_limit_next_available_at(&error), Some(1785877240));
     }
 
     #[test]
@@ -1007,10 +1036,36 @@ mod tests {
             next_changeip_available_at: None,
         };
 
-        state.record_success(1000);
+        state.record_success(1000, None);
 
         assert_eq!(state.last_changeip_at, Some(1000));
         assert_eq!(state.next_changeip_available_at, Some(1060));
+    }
+
+    #[test]
+    fn successful_change_learns_cooldown_from_next_allowed_at() {
+        let mut state = ChangeIpCooldownState::default();
+
+        state.record_success(1785877206, Some(1785877240));
+
+        assert_eq!(state.last_changeip_at, Some(1785877206));
+        assert_eq!(state.cooldown, Some(Duration::from_secs(37)));
+        assert_eq!(state.next_changeip_available_at, Some(1785877243));
+        let hit = state.cooldown_hit_at(1785877207).unwrap();
+        assert_eq!(hit.remaining, Duration::from_secs(36));
+        assert_eq!(hit.available_at, 1785877243);
+    }
+
+    #[test]
+    fn unconfirmed_change_still_keeps_successful_submission_cooldown() {
+        let mut state = ChangeIpCooldownState::default();
+
+        state.record_success(1785877206, Some(1785877240));
+
+        assert_eq!(
+            state.cooldown_hit_at(1785877207).unwrap().available_at,
+            1785877243
+        );
     }
 
     #[test]

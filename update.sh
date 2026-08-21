@@ -17,6 +17,8 @@ BACKUP_ROOT="${BOIL_BACKUP_ROOT:-/var/backups/boilchangeip}"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 RELEASE_API_URL="${BOIL_RELEASE_API_URL:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
 RELEASE_DOWNLOAD_BASE="${BOIL_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO_SLUG}/releases/download}"
+IPQUALITY_DIR="${BOIL_IPQUALITY_DIR:-${CONFIG_DIR}/ipquality}"
+IPQUALITY_SCRIPT_URL="${BOIL_IPQUALITY_SCRIPT_URL:-https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh}"
 TMP_DIR=""
 CARGO_BIN=""
 CONFIG_BACKUP=""
@@ -348,6 +350,40 @@ install_artifact() {
   INSTALL_DONE=true
 }
 
+install_ipquality_dependencies() {
+  local missing=()
+  for command_name in jq bc nc dig ip timeout; do
+    command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+  done
+  [[ "${#missing[@]}" -eq 0 ]] && return
+
+  echo "正在安装 IPQuality 解锁检测依赖..." >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    run_privileged apt-get update
+    run_privileged apt-get install -y jq bc netcat-openbsd dnsutils iproute2 coreutils
+  elif command -v dnf >/dev/null 2>&1; then
+    run_privileged dnf install -y jq bc nmap-ncat bind-utils iproute coreutils
+  elif command -v yum >/dev/null 2>&1; then
+    run_privileged yum install -y jq bc nmap-ncat bind-utils iproute coreutils
+  elif command -v pacman >/dev/null 2>&1; then
+    run_privileged pacman -Sy --noconfirm jq bc openbsd-netcat bind iproute2 coreutils
+  elif command -v apk >/dev/null 2>&1; then
+    run_privileged apk add --no-cache jq bc netcat-openbsd bind-tools iproute2 coreutils
+  else
+    die "缺少 IPQuality 依赖: ${missing[*]}，且无法识别包管理器"
+  fi
+}
+
+install_ipquality_script() {
+  local destination="$IPQUALITY_DIR/ip.sh"
+  local tmp="$TMP_DIR/ipquality.sh"
+
+  curl -fL --silent --show-error "$IPQUALITY_SCRIPT_URL" -o "$tmp"
+  [[ -s "$tmp" ]] || die "下载的 IPQuality 脚本为空"
+  run_privileged install -d -m 0750 "$IPQUALITY_DIR"
+  run_privileged install -m 0755 "$tmp" "$destination"
+}
+
 installed_version() {
   local binary="$INSTALL_DIR/$BIN_NAME"
   if [[ -x "$binary" ]]; then
@@ -383,6 +419,8 @@ main() {
   backup_binary
   trap rollback_on_error ERR
 
+  install_ipquality_dependencies
+  install_ipquality_script
   stop_service_if_needed
   install_artifact
   "$INSTALL_DIR/$BIN_NAME" --version >/dev/null

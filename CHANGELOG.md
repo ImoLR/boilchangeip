@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.2.16 - 2026-08-21
+
+### 新增
+
+- 换 IP 成功并确认新 IP 后，自动执行 IPv4 解锁检测。
+- 解锁检测支持 TikTok、Disney+、Netflix、YouTube、Amazon Prime Video、Reddit 和 ChatGPT。
+- 解锁检测使用 IPQuality 的 JSON 输出解析结果，只展示精简的流媒体/AI 解锁状态。
+- IPQuality 检测失败、超时或单项失败不会影响换 IP 成功状态。
+- `install.sh` 和 `update.sh` 会自动准备本地 IPQuality 脚本和所需依赖。
+
 ## v2.2.15 - 2026-08-05
 
 ### 修复

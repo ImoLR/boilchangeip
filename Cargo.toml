@@ -1,6 +1,6 @@
 [package]
 name = "boil"
-version = "2.2.15"
+version = "2.2.16"
 edition = "2021"
 
 [[bin]]

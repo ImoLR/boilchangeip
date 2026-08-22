@@ -14,7 +14,6 @@ use crate::{
         reconnect_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
         ReconnectResult, ReconnectStatus,
     },
-    unlock_check::{run_ipv4_unlock_check_message, should_run_unlock_check},
 };
 
 use super::{
@@ -286,28 +285,7 @@ pub(super) async fn confirm_and_change(
         },
     )
     .await;
-    let unlock_text = run_unlock_check_for_success(bot, chat_id, &result).await;
-    send_reconnect_result(bot, chat_id, &result, ui_sessions, unlock_text.as_deref()).await;
-}
-
-async fn run_unlock_check_for_success(
-    bot: &Bot,
-    chat_id: ChatId,
-    result: &ReconnectResult,
-) -> Option<String> {
-    if !should_run_unlock_check(&result.status) {
-        return None;
-    }
-
-    let notice = bot
-        .send_message(chat_id, "🔍 正在检测新 IP 解锁情况，请稍候…")
-        .await
-        .ok();
-    let text = run_ipv4_unlock_check_message().await;
-    if let Some(notice) = notice {
-        let _ = bot.delete_message(chat_id, notice.id).await;
-    }
-    Some(text)
+    send_reconnect_result(bot, chat_id, &result, ui_sessions).await;
 }
 
 pub(super) async fn resolve_for_tg<'a>(
@@ -362,17 +340,7 @@ async fn send_reconnect_result(
     chat_id: ChatId,
     result: &ReconnectResult,
     ui_sessions: &Arc<Mutex<UiSessionStore>>,
-    unlock_text: Option<&str>,
 ) {
-    let text = format_reconnect_result_message(result, unlock_text);
-    let sent = bot
-        .send_message(chat_id, text)
-        .parse_mode(ParseMode::Html)
-        .await;
-    record_sent_ui_message(chat_id, sent, ui_sessions).await;
-}
-
-fn format_reconnect_result_message(result: &ReconnectResult, unlock_text: Option<&str>) -> String {
     if result.status == ReconnectStatus::RateLimited {
         let mut lines = vec!["⏳ 换 IP 频率限制中".to_string(), String::new()];
         lines.push(format!("📡 <b>{}</b>", html_escape(&result.server_name)));
@@ -387,30 +355,12 @@ fn format_reconnect_result_message(result: &ReconnectResult, unlock_text: Option
                 lines.push(html_escape(message.trim()));
             }
         }
-        return lines.join("\n");
-    }
-
-    if result.status == ReconnectStatus::Success {
-        let mut lines = vec![
-            "✅ 换 IP 成功".to_string(),
-            String::new(),
-            format!("📡 <b>{}</b>", html_escape(&result.server_name)),
-        ];
-        if let Some(old_ip) = result.old_ip {
-            lines.push(String::new());
-            lines.push(format!("旧 IP：<code>{old_ip}</code>"));
-        }
-        if let Some(new_ip) = result.new_ip {
-            lines.push(format!("新 IP：<code>{new_ip}</code>"));
-        }
-        if let Some(uses_left) = result.uses_left {
-            lines.push(format!("剩余次数：{uses_left}"));
-        }
-        if let Some(unlock_text) = unlock_text {
-            lines.push(String::new());
-            lines.push(html_escape(unlock_text));
-        }
-        return lines.join("\n");
+        let sent = bot
+            .send_message(chat_id, lines.join("\n"))
+            .parse_mode(ParseMode::Html)
+            .await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
+        return;
     }
 
     let mut lines = vec![
@@ -429,7 +379,12 @@ fn format_reconnect_result_message(result: &ReconnectResult, unlock_text: Option
     if let Some(message) = &result.message {
         lines.push(format!("信息: {}", html_escape(message)));
     }
-    lines.join("\n")
+
+    let sent = bot
+        .send_message(chat_id, lines.join("\n"))
+        .parse_mode(ParseMode::Html)
+        .await;
+    record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
 pub(super) fn selection_from_tg_arg(arg: &str) -> ServerSelection<'_> {
@@ -445,50 +400,5 @@ pub(super) fn selected_servers(selected: ResolvedSelection<'_>) -> Vec<&ServerCo
     match selected {
         ResolvedSelection::One(server) => vec![server],
         ResolvedSelection::All(servers) => servers,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn reconnect_result(status: ReconnectStatus) -> ReconnectResult {
-        ReconnectResult {
-            server_id: "server-1".to_string(),
-            server_name: "Taiwan VPS".to_string(),
-            old_ip: Some("42.1.1.1".parse().unwrap()),
-            new_ip: (status == ReconnectStatus::Success).then(|| "42.1.1.2".parse().unwrap()),
-            changed: status == ReconnectStatus::Success,
-            uses_left: (status == ReconnectStatus::Success).then_some(997),
-            next_allowed_at: None,
-            status,
-            message: Some("换 IP 已完成".to_string()),
-            poll_attempts: 1,
-        }
-    }
-
-    #[test]
-    fn manual_success_result_includes_unlock_section() {
-        let text = format_reconnect_result_message(
-            &reconnect_result(ReconnectStatus::Success),
-            Some("🌐 解锁检测\n\nNetflix：✅ 台湾"),
-        );
-
-        assert!(text.contains("✅ 换 IP 成功"));
-        assert!(text.contains("📡 <b>Taiwan VPS</b>"));
-        assert!(text.contains("旧 IP：<code>42.1.1.1</code>"));
-        assert!(text.contains("新 IP：<code>42.1.1.2</code>"));
-        assert!(text.contains("Netflix：✅ 台湾"));
-    }
-
-    #[test]
-    fn manual_non_success_result_ignores_unlock_section() {
-        let text = format_reconnect_result_message(
-            &reconnect_result(ReconnectStatus::ChangeAcceptedButUnconfirmed),
-            Some("🌐 解锁检测\n\nNetflix：✅ 台湾"),
-        );
-
-        assert!(text.contains("ChangeAcceptedButUnconfirmed"));
-        assert!(!text.contains("Netflix：✅ 台湾"));
     }
 }

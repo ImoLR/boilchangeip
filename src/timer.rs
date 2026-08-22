@@ -19,7 +19,6 @@ use crate::{
         reconnect_one_with_current_ip_progress_cooldown_notify, BatchReconnectResult,
         ChangeIpCooldownMode, ReconnectPolicy, ReconnectProgress, ReconnectStatus,
     },
-    unlock_check::{run_ipv4_unlock_check_message, should_run_unlock_check},
 };
 
 const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
@@ -403,8 +402,7 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
         result.changed
     );
 
-    let unlock_text = run_timer_unlock_check(config, &result).await;
-    let message = format_timer_result_with_unlock(&result, unlock_text.as_deref());
+    let message = format_timer_result(&result);
     tg_notify(config, &message).await;
 }
 
@@ -446,7 +444,6 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
     .await;
 
     let mut batch = BatchReconnectResult::default();
-    let mut unlock_texts = Vec::new();
     for server in selected {
         let (progress, current_ip) = notify_timer_processing(config, &client, server).await;
         if current_ip.is_none() {
@@ -458,7 +455,6 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
                 TimerRetrySource::GlobalTimer,
             );
             batch.results.push(timer_preflight_failed_result(server));
-            unlock_texts.push(None);
             continue;
         }
 
@@ -477,9 +473,7 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
             },
         )
         .await;
-        let unlock_text = run_timer_unlock_check(config, &result).await;
         batch.results.push(result);
-        unlock_texts.push(unlock_text);
     }
 
     log::info!(
@@ -488,11 +482,7 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
         batch.unconfirmed_count(),
         batch.failure_count()
     );
-    tg_notify(
-        config,
-        &format_timer_batch_result_with_unlocks(&batch, &unlock_texts),
-    )
-    .await;
+    tg_notify(config, &format_timer_batch_result(&batch)).await;
 }
 
 async fn notify_timer_processing(
@@ -617,12 +607,7 @@ async fn run_timer_preflight_retry(
         .await;
 
         if result.status == ReconnectStatus::Success {
-            let unlock_text = run_timer_unlock_check(&config, &result).await;
-            tg_notify(
-                &config,
-                &format_timer_retry_success_with_unlock(&result, unlock_text.as_deref()),
-            )
-            .await;
+            tg_notify(&config, &format_timer_retry_success(&result)).await;
         } else {
             tg_notify(&config, &format_timer_result(&result)).await;
         }
@@ -823,15 +808,7 @@ fn format_timer_wait_duration(duration: Duration) -> String {
     }
 }
 
-#[cfg(test)]
 fn format_timer_retry_success(result: &crate::reconnect::ReconnectResult) -> String {
-    format_timer_retry_success_with_unlock(result, None)
-}
-
-fn format_timer_retry_success_with_unlock(
-    result: &crate::reconnect::ReconnectResult,
-    unlock_text: Option<&str>,
-) -> String {
     let lines = vec![
         "✅ 重试换 IP 成功".to_string(),
         String::new(),
@@ -851,11 +828,6 @@ fn format_timer_retry_success_with_unlock(
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "N/A".to_string()),
     ];
-    let mut lines = lines;
-    if let Some(unlock_text) = unlock_text {
-        lines.push(String::new());
-        lines.push(unlock_text.to_string());
-    }
     lines.join("\n")
 }
 
@@ -884,30 +856,6 @@ async fn edit_timer_progress(progress: Option<TimerProgressMessage>, msg: &str) 
         .await;
 }
 
-async fn delete_timer_progress(progress: Option<TimerProgressMessage>) {
-    let Some(progress) = progress else {
-        return;
-    };
-    let _ = progress
-        .bot
-        .delete_message(progress.chat_id, progress.message_id)
-        .await;
-}
-
-async fn run_timer_unlock_check(
-    config: &AppConfig,
-    result: &crate::reconnect::ReconnectResult,
-) -> Option<String> {
-    if !should_run_unlock_check(&result.status) {
-        return None;
-    }
-
-    let progress = tg_send(config, "🔍 正在检测新 IP 解锁情况，请稍候…").await;
-    let text = run_ipv4_unlock_check_message().await;
-    delete_timer_progress(progress).await;
-    Some(text)
-}
-
 async fn with_timer_run_lock<F, R>(future: F) -> R
 where
     F: std::future::Future<Output = R>,
@@ -917,27 +865,12 @@ where
 }
 
 fn format_timer_result(result: &crate::reconnect::ReconnectResult) -> String {
-    format_timer_result_with_unlock(result, None)
-}
-
-fn format_timer_result_with_unlock(
-    result: &crate::reconnect::ReconnectResult,
-    unlock_text: Option<&str>,
-) -> String {
     let mut lines = vec!["⏰ 定时换 IP 完成".to_string(), String::new()];
-    append_timer_result_lines(&mut lines, result, unlock_text);
+    append_timer_result_lines(&mut lines, result);
     lines.join("\n")
 }
 
-#[cfg(test)]
 fn format_timer_batch_result(result: &crate::reconnect::BatchReconnectResult) -> String {
-    format_timer_batch_result_with_unlocks(result, &[])
-}
-
-fn format_timer_batch_result_with_unlocks(
-    result: &crate::reconnect::BatchReconnectResult,
-    unlock_texts: &[Option<String>],
-) -> String {
     let mut lines = vec![
         "⏰ 定时换 IP 完成".to_string(),
         String::new(),
@@ -946,22 +879,14 @@ fn format_timer_batch_result_with_unlocks(
         format!("❌ 失败：{}", result.failure_count()),
     ];
 
-    for (index, item) in result.results.iter().enumerate() {
+    for item in &result.results {
         lines.push(String::new());
-        append_timer_result_lines(
-            &mut lines,
-            item,
-            unlock_texts.get(index).and_then(Option::as_deref),
-        );
+        append_timer_result_lines(&mut lines, item);
     }
     lines.join("\n")
 }
 
-fn append_timer_result_lines(
-    lines: &mut Vec<String>,
-    result: &crate::reconnect::ReconnectResult,
-    unlock_text: Option<&str>,
-) {
+fn append_timer_result_lines(lines: &mut Vec<String>, result: &crate::reconnect::ReconnectResult) {
     lines.push(format!("📡 {}", result.server_name));
     lines.push(timer_status_message(result).to_string());
     if let Some(old_ip) = result.old_ip {
@@ -975,9 +900,6 @@ fn append_timer_result_lines(
     }
     if result.status != ReconnectStatus::Success {
         lines.push(format!("原因：{}", timer_reason(result)));
-    } else if let Some(unlock_text) = unlock_text {
-        lines.push(String::new());
-        lines.push(unlock_text.to_string());
     }
 }
 
@@ -1467,17 +1389,6 @@ mod tests {
     }
 
     #[test]
-    fn timer_single_success_result_can_include_unlock_section() {
-        let text = format_timer_result_with_unlock(
-            &reconnect_result("Taiwan VPS", ReconnectStatus::Success),
-            Some("🌐 解锁检测\n\nNetflix：✅ 台湾"),
-        );
-
-        assert!(text.contains("✅ 换 IP 成功"));
-        assert!(text.contains("Netflix：✅ 台湾"));
-    }
-
-    #[test]
     fn timer_batch_result_summarizes_success_unconfirmed_and_failed() {
         let batch = crate::reconnect::BatchReconnectResult {
             results: vec![
@@ -1501,23 +1412,6 @@ mod tests {
         assert!(!text.contains("NetworkError"));
         assert!(!text.contains("PreflightFailed"));
         assert!(!text.contains("changed=false"));
-    }
-
-    #[test]
-    fn timer_batch_unlock_section_attaches_only_to_matching_success_result() {
-        let batch = crate::reconnect::BatchReconnectResult {
-            results: vec![
-                reconnect_result("Taiwan VPS", ReconnectStatus::Success),
-                reconnect_result("Hong Kong VPS", ReconnectStatus::ApiRejected),
-            ],
-        };
-        let unlock_texts = vec![Some("🌐 解锁检测\n\nNetflix：✅ 台湾".to_string()), None];
-
-        let text = format_timer_batch_result_with_unlocks(&batch, &unlock_texts);
-
-        assert!(text.contains("📡 Taiwan VPS\n✅ 换 IP 成功"));
-        assert!(text.contains("Netflix：✅ 台湾"));
-        assert!(text.contains("📡 Hong Kong VPS\n❌ 换 IP 失败"));
     }
 
     #[test]
@@ -1580,17 +1474,6 @@ mod tests {
         assert!(!text.contains("997"));
         assert!(!text.contains("Success"));
         assert!(!text.contains("Boil API"));
-    }
-
-    #[test]
-    fn timer_retry_success_can_include_unlock_section() {
-        let text = format_timer_retry_success_with_unlock(
-            &reconnect_result("Taiwan VPS", ReconnectStatus::Success),
-            Some("🌐 解锁检测\n\nNetflix：✅ 台湾"),
-        );
-
-        assert!(text.contains("✅ 重试换 IP 成功"));
-        assert!(text.contains("Netflix：✅ 台湾"));
     }
 
     #[test]

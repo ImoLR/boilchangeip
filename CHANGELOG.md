@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.2.17 - 2026-08-22
+
+### 修复
+
+- 移除 v2.2.16 引入的换 IP 成功后自动 IPv4 解锁检测。
+- `install.sh` 和 `update.sh` 不再安装或更新 IPQuality 脚本及其依赖。
+- Timer、Retry 和手动 `/change` 成功流程恢复为 v2.2.15 行为，同时保留 cooldown 学习与等待逻辑。
+
 ## v2.2.16 - 2026-08-21
 
 ### 新增

@@ -8,7 +8,6 @@ mod server_manage;
 mod service;
 mod streaming;
 mod timer;
-mod unlock_check;
 
 use clap::{Parser, Subcommand};
 use std::sync::Arc;

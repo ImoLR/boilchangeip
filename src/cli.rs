@@ -1,11 +1,12 @@
 use std::net::IpAddr;
 
 use crate::{
-    boil::BoilClient,
     config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
     core::{check_ip_quality, check_reachable},
+    provider::ProviderClients,
     reconnect::{
-        reconnect_selected, BatchReconnectResult, ReconnectPolicy, ReconnectResult, ReconnectStatus,
+        reconnect_provider_selected, BatchReconnectResult, ReconnectPolicy, ReconnectResult,
+        ReconnectStatus,
     },
 };
 
@@ -50,13 +51,13 @@ pub async fn cmd_status(config: &AppConfig, server: Option<&str>, all: bool) -> 
     let selected = config
         .resolve_servers(selection)
         .map_err(with_server_hint(config))?;
-    let client = BoilClient::new()?;
+    let client = ProviderClients::new()?;
 
     println!("服务器状态\n");
     for server in selected_servers(selected) {
-        match client.get_ip(&server.token).await {
-            Ok(response) => {
-                println!("  {} ({})\n  IP: {}\n", server.name, server.id, response.ip);
+        match client.get_ip(server).await {
+            Ok(ip) => {
+                println!("  {} ({})\n  IP: {}\n", server.name, server.id, ip);
             }
             Err(error) => {
                 println!("  {} ({})\n  查询失败: {}\n", server.name, server.id, error);
@@ -72,15 +73,15 @@ pub async fn cmd_check(config: &AppConfig, server: Option<&str>, all: bool) -> a
     let selected = config
         .resolve_servers(selection)
         .map_err(with_server_hint(config))?;
-    let client = BoilClient::new()?;
+    let client = ProviderClients::new()?;
     let servers = selected_servers(selected);
 
     let mut ips = Vec::new();
     for server in &servers {
-        match client.get_ip(&server.token).await {
-            Ok(response) => {
-                ips.push(response.ip);
-                print_quality_for_server(server, response.ip).await;
+        match client.get_ip(server).await {
+            Ok(ip) => {
+                ips.push(ip);
+                print_quality_for_server(server, ip).await;
             }
             Err(error) => {
                 println!(
@@ -98,10 +99,11 @@ pub async fn cmd_check(config: &AppConfig, server: Option<&str>, all: bool) -> a
 pub async fn cmd_change(config: &AppConfig, server: Option<&str>, all: bool) -> anyhow::Result<()> {
     ensure_new_config_ready(config)?;
     let selection = selection_from_args(server, all)?;
-    let client = BoilClient::new()?;
-    let batch = reconnect_selected(&client, config, selection, &ReconnectPolicy::default())
-        .await
-        .map_err(with_server_hint(config))?;
+    let client = ProviderClients::new()?;
+    let batch =
+        reconnect_provider_selected(&client, config, selection, &ReconnectPolicy::default())
+            .await
+            .map_err(with_server_hint(config))?;
 
     print_batch_result(&batch);
     Ok(())
@@ -155,6 +157,12 @@ pub fn print_reconnect_result(result: &ReconnectResult) {
     }
     if let Some(uses_left) = result.uses_left {
         println!("  剩余次数: {uses_left}");
+    }
+    if result.dial_attempts > 0 {
+        println!("  拨号次数: {}", result.dial_attempts);
+    }
+    if let Some(count) = result.daily_dial_count {
+        println!("  今日已用: {count} / {}", crate::fachost::DAILY_DIAL_LIMIT);
     }
     if let Some(next_allowed_at) = result.next_allowed_at {
         println!("  下次允许时间: {next_allowed_at} (Unix)");
@@ -281,20 +289,23 @@ fn status_text(status: &ReconnectStatus) -> &'static str {
         ReconnectStatus::ApiRejected => "API 拒绝",
         ReconnectStatus::ChangeAcceptedButUnconfirmed => "已接受但未确认",
         ReconnectStatus::InvalidResponse => "响应无效",
+        ReconnectStatus::ProviderFailed => "Provider 执行失败",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SecretToken;
+    use crate::config::{SecretToken, ServerProvider};
 
     fn app_config() -> AppConfig {
         AppConfig {
             servers: vec![ServerConfig {
                 id: "hk-01".to_string(),
                 name: "Hong Kong 01".to_string(),
+                provider: ServerProvider::Boil,
                 token: SecretToken::from_test_value("hidden-token"),
+                fachost_seednet: None,
                 enabled: true,
                 address: None,
                 country: None,

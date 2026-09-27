@@ -177,7 +177,9 @@ async fn handle_name_step(
     next.servers.push(ServerConfig {
         id: server_id,
         name: name.to_string(),
+        provider: crate::config::ServerProvider::Boil,
         token: data.token,
+        fachost_seednet: None,
         enabled: true,
         address: Some(data.current_ip.clone()),
         country: Some(metadata.geo.country.clone()),
@@ -253,7 +255,7 @@ pub(super) fn next_server_id(config: &AppConfig) -> String {
 mod tests {
     use crate::{
         bot::test_support::app_config,
-        config::{AppConfig, SecretToken, ServerConfig},
+        config::{AppConfig, SecretToken, ServerConfig, ServerProvider},
     };
 
     #[test]
@@ -271,7 +273,9 @@ mod tests {
             servers: vec![ServerConfig {
                 id: "hk-01".to_string(),
                 name: "HK".to_string(),
+                provider: ServerProvider::Boil,
                 token: SecretToken::from_test_value("hidden-token"),
+                fachost_seednet: None,
                 enabled: true,
                 address: None,
                 country: None,

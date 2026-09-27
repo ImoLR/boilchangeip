@@ -18,7 +18,7 @@ const TG_PAIR_CODE_ENV: &str = "TG_PAIR_CODE";
 const TG_PAIR_EXPIRES_AT_ENV: &str = "TG_PAIR_EXPIRES_AT";
 const TG_PAIR_TTL_SECONDS: u64 = 300;
 
-#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SecretToken(String);
 
@@ -37,7 +37,7 @@ impl SecretToken {
         Self(value.to_string())
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
     }
 }
@@ -88,6 +88,22 @@ pub struct ServerTimerConfig {
     pub cron: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerProvider {
+    #[default]
+    Boil,
+    FachostSeednet,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FacHostSeednetConfig {
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub ssh_user: String,
+    pub ssh_key_path: PathBuf,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ChangeIpCooldownConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,7 +118,12 @@ pub struct ChangeIpCooldownConfig {
 pub struct ServerConfig {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub provider: ServerProvider,
+    #[serde(default, skip_serializing_if = "SecretToken::is_empty")]
     pub token: SecretToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fachost_seednet: Option<FacHostSeednetConfig>,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -445,16 +466,65 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
             "server id '{}' 的 name 不能为空",
             server.id
         );
-        anyhow::ensure!(
-            !server.token.is_empty(),
-            "server id '{}' 的 token 不能为空",
-            server.id
-        );
-        anyhow::ensure!(
-            !server.id.contains(server.token.expose_secret()),
-            "server id '{}' 不得包含 token",
-            server.id
-        );
+        match server.provider {
+            ServerProvider::Boil => {
+                anyhow::ensure!(
+                    !server.token.is_empty(),
+                    "server id '{}' 的 token 不能为空",
+                    server.id
+                );
+                anyhow::ensure!(
+                    !server.id.contains(server.token.expose_secret()),
+                    "server id '{}' 不得包含 token",
+                    server.id
+                );
+            }
+            ServerProvider::FachostSeednet => {
+                anyhow::ensure!(
+                    server.token.is_empty(),
+                    "server id '{}' 的 fachost_seednet 配置不得包含 Boil token",
+                    server.id
+                );
+                let fachost = server.fachost_seednet.as_ref().with_context(|| {
+                    format!("server id '{}' 缺少 fachost_seednet 配置", server.id)
+                })?;
+                anyhow::ensure!(
+                    !fachost.ssh_host.trim().is_empty(),
+                    "server id '{}' 的 SSH host 不能为空",
+                    server.id
+                );
+                anyhow::ensure!(
+                    fachost.ssh_host.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b':'
+                    }),
+                    "server id '{}' 的 SSH host 含非法字符",
+                    server.id
+                );
+                anyhow::ensure!(
+                    fachost.ssh_port > 0,
+                    "server id '{}' 的 SSH port 无效",
+                    server.id
+                );
+                anyhow::ensure!(
+                    !fachost.ssh_user.trim().is_empty(),
+                    "server id '{}' 的 SSH user 不能为空",
+                    server.id
+                );
+                anyhow::ensure!(
+                    fachost
+                        .ssh_user
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
+                    "server id '{}' 的 SSH user 含非法字符",
+                    server.id
+                );
+                anyhow::ensure!(
+                    fachost.ssh_key_path.is_absolute(),
+                    "server id '{}' 的 SSH key path 必须是绝对路径",
+                    server.id
+                );
+            }
+        }
         if let Some(timer) = &server.timer {
             validate_timer_config(timer)
                 .with_context(|| format!("server id '{}' 的 timer 配置无效", server.id))?;
@@ -1095,7 +1165,61 @@ mod tests {
     fn old_boil_servers_config_without_global_timer_still_loads() {
         let app = app_from_servers_json(ONE_SERVER).unwrap();
         assert_eq!(app.servers.len(), 1);
+        assert_eq!(app.servers[0].provider, ServerProvider::Boil);
         assert!(app.global_timer.is_none());
+    }
+
+    #[test]
+    fn fachost_seednet_config_loads_without_boil_token() {
+        let servers = r#"[
+            {
+                "id": "seednet-vds-1",
+                "name": "Seednet-VDS-1 Black Friday 2025",
+                "provider": "fachost_seednet",
+                "enabled": true,
+                "fachost_seednet": {
+                    "ssh_host": "seednet.example.com",
+                    "ssh_port": 22,
+                    "ssh_user": "root",
+                    "ssh_key_path": "/etc/boil/keys/seednet-vds-1"
+                }
+            }
+        ]"#;
+        let app = app_from_servers_json(servers).unwrap();
+        let server = &app.servers[0];
+        assert_eq!(server.provider, ServerProvider::FachostSeednet);
+        assert!(server.token.is_empty());
+        assert_eq!(
+            server
+                .fachost_seednet
+                .as_ref()
+                .map(|config| config.ssh_port),
+            Some(22)
+        );
+        let serialized = serde_json::to_string(server).unwrap();
+        assert!(!serialized.contains("\"token\""));
+    }
+
+    #[test]
+    fn fachost_seednet_rejects_boil_token_or_relative_key_path() {
+        let with_token = r#"[{
+            "id":"seednet","name":"Seednet","provider":"fachost_seednet",
+            "token":"must-not-be-used","enabled":true,
+            "fachost_seednet":{"ssh_host":"host","ssh_port":22,"ssh_user":"root","ssh_key_path":"/key"}
+        }]"#;
+        assert!(app_from_servers_json(with_token)
+            .unwrap_err()
+            .to_string()
+            .contains("不得包含 Boil token"));
+
+        let relative_key = r#"[{
+            "id":"seednet","name":"Seednet","provider":"fachost_seednet","enabled":true,
+            "fachost_seednet":{"ssh_host":"host","ssh_port":22,"ssh_user":"root","ssh_key_path":"relative-key"}
+        }]"#;
+        assert!(app_from_servers_json(relative_key)
+            .unwrap_err()
+            .to_string()
+            .contains("必须是绝对路径"));
     }
 
     #[test]

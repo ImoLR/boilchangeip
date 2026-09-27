@@ -8,7 +8,12 @@ use std::{
 
 use crate::{
     boil::{BoilApiError, BoilClient},
-    config::{AppConfig, ChangeIpCooldownConfig, ResolvedSelection, ServerConfig, ServerSelection},
+    config::{
+        AppConfig, ChangeIpCooldownConfig, ResolvedSelection, ServerConfig, ServerProvider,
+        ServerSelection,
+    },
+    fachost::FacHostReconnectPolicy,
+    provider::ProviderClients,
 };
 
 static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -49,6 +54,7 @@ pub enum ReconnectStatus {
     ApiRejected,
     ChangeAcceptedButUnconfirmed,
     InvalidResponse,
+    ProviderFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +69,8 @@ pub struct ReconnectResult {
     pub status: ReconnectStatus,
     pub message: Option<String>,
     pub poll_attempts: usize,
+    pub dial_attempts: usize,
+    pub daily_dial_count: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +115,7 @@ impl BatchReconnectResult {
     }
 }
 
+#[cfg(test)]
 pub async fn reconnect_one(
     client: &BoilClient,
     server: &ServerConfig,
@@ -115,6 +124,7 @@ pub async fn reconnect_one(
     reconnect_one_with_current_ip(client, server, policy, None).await
 }
 
+#[cfg(test)]
 pub async fn reconnect_one_with_current_ip(
     client: &BoilClient,
     server: &ServerConfig,
@@ -125,6 +135,7 @@ pub async fn reconnect_one_with_current_ip(
         .await
 }
 
+#[cfg(test)]
 pub async fn reconnect_one_with_current_ip_and_progress<F, Fut>(
     client: &BoilClient,
     server: &ServerConfig,
@@ -147,6 +158,7 @@ where
     .await
 }
 
+#[cfg(test)]
 pub async fn reconnect_one_with_current_ip_progress_and_cooldown<F, Fut>(
     client: &BoilClient,
     server: &ServerConfig,
@@ -208,6 +220,7 @@ where
     .await
 }
 
+#[cfg(test)]
 pub async fn reconnect_selected(
     client: &BoilClient,
     config: &AppConfig,
@@ -228,6 +241,159 @@ pub async fn reconnect_selected(
         }
     }
 
+    Ok(BatchReconnectResult { results })
+}
+
+pub async fn reconnect_provider_one_with_current_ip_and_progress<F, Fut>(
+    clients: &ProviderClients,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+    on_progress: F,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    reconnect_provider_one_with_current_ip_progress_cooldown_notify(
+        clients,
+        server,
+        policy,
+        current_ip,
+        ChangeIpCooldownMode::FailFast,
+        on_progress,
+        |_| async {},
+    )
+    .await
+}
+
+pub async fn reconnect_provider_one_with_current_ip_progress_cooldown_notify<F, Fut, C, CFut>(
+    clients: &ProviderClients,
+    server: &ServerConfig,
+    policy: &ReconnectPolicy,
+    current_ip: Option<IpAddr>,
+    cooldown_mode: ChangeIpCooldownMode,
+    mut on_progress: F,
+    on_cooldown: C,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+    C: FnMut(ReconnectCooldown) -> CFut,
+    CFut: Future<Output = ()>,
+{
+    match server.provider {
+        ServerProvider::Boil => {
+            reconnect_one_with_current_ip_progress_cooldown_notify(
+                clients.boil(),
+                server,
+                policy,
+                current_ip,
+                cooldown_mode,
+                on_progress,
+                on_cooldown,
+            )
+            .await
+        }
+        ServerProvider::FachostSeednet => {
+            if !server.enabled {
+                return base_result(
+                    server,
+                    ReconnectStatus::Disabled,
+                    Some("server is disabled"),
+                );
+            }
+            let config = match server.fachost_seednet.as_ref() {
+                Some(config) => config,
+                None => {
+                    return base_result(
+                        server,
+                        ReconnectStatus::InvalidResponse,
+                        Some("缺少 fachost_seednet Provider 配置"),
+                    )
+                }
+            };
+            let old_ip = match current_ip {
+                Some(ip) => ip,
+                None => match clients.get_ip(server).await {
+                    Ok(ip) => ip,
+                    Err(error) => {
+                        return base_result(
+                            server,
+                            ReconnectStatus::PreflightFailed,
+                            Some(&error.to_string()),
+                        )
+                    }
+                },
+            };
+
+            let lock = server_lock(&server.id);
+            let _server_guard = lock.lock().await;
+            on_progress(ReconnectProgress::VerifyingNewIp { old_ip }).await;
+            let _change_guard = CHANGE_IP_LOCK.lock().await;
+            let outcome = clients
+                .fachost_seednet()
+                .reconnect(config, old_ip, &FacHostReconnectPolicy::default())
+                .await;
+            let mut result = base_result(
+                server,
+                if outcome.changed {
+                    ReconnectStatus::Success
+                } else {
+                    ReconnectStatus::ProviderFailed
+                },
+                Some(&outcome.message),
+            );
+            result.old_ip = Some(outcome.old_ip);
+            result.new_ip = outcome.new_ip;
+            result.changed = outcome.changed;
+            result.poll_attempts = outcome.poll_attempts;
+            result.dial_attempts = outcome.dial_attempts;
+            result.daily_dial_count = outcome.daily_dial_count;
+            result.uses_left = outcome
+                .daily_dial_count
+                .map(|count| crate::fachost::DAILY_DIAL_LIMIT.saturating_sub(count));
+            result
+        }
+    }
+}
+
+pub async fn reconnect_provider_selected(
+    clients: &ProviderClients,
+    config: &AppConfig,
+    selection: ServerSelection<'_>,
+    policy: &ReconnectPolicy,
+) -> anyhow::Result<BatchReconnectResult> {
+    let selected = config.resolve_servers(selection)?;
+    let mut results = Vec::new();
+    match selected {
+        ResolvedSelection::One(server) => {
+            results.push(
+                reconnect_provider_one_with_current_ip_and_progress(
+                    clients,
+                    server,
+                    policy,
+                    None,
+                    |_| async {},
+                )
+                .await,
+            );
+        }
+        ResolvedSelection::All(servers) => {
+            for server in servers {
+                results.push(
+                    reconnect_provider_one_with_current_ip_and_progress(
+                        clients,
+                        server,
+                        policy,
+                        None,
+                        |_| async {},
+                    )
+                    .await,
+                );
+            }
+        }
+    }
     Ok(BatchReconnectResult { results })
 }
 
@@ -525,6 +691,8 @@ fn base_result(
         status,
         message: message.map(|value| redact_for_result(value, server)),
         poll_attempts: 0,
+        dial_attempts: 0,
+        daily_dial_count: None,
     }
 }
 
@@ -724,7 +892,7 @@ fn server_lock(server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SecretToken;
+    use crate::config::{SecretToken, ServerProvider};
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicUsize, Ordering},
@@ -917,7 +1085,9 @@ mod tests {
         ServerConfig {
             id: id.to_string(),
             name: format!("Server {id}"),
+            provider: ServerProvider::Boil,
             token: SecretToken::from_test_value(&test_credential()),
+            fachost_seednet: None,
             enabled,
             address: None,
             country: None,

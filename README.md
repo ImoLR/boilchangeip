@@ -75,6 +75,7 @@ BOIL_SERVERS='[
   {
     "id": "hk-01",
     "name": "Hong Kong 01",
+    "provider": "boil",
     "token": "replace-with-real-token",
     "enabled": true,
     "timer": {
@@ -85,6 +86,7 @@ BOIL_SERVERS='[
   {
     "id": "jp-01",
     "name": "Japan 01",
+    "provider": "boil",
     "token": "replace-with-real-token",
     "enabled": true
   }
@@ -117,6 +119,29 @@ cp config.env.example config.env
 - `--all` 按配置顺序执行，不并发调用 `changeIP`。
 - Token 不会进入日志、Telegram callback、结果结构或 Debug 输出。
 - `BOIL_GLOBAL_TIMER` 是独立的全局定时任务，不会覆盖每台 Server 自己的 `timer`。
+
+`provider` 未配置时默认使用 `boil`，因此旧版 `BOIL_SERVERS` 无需迁移。
+Seednet PPPoE 服务器可使用 `fachost_seednet` Provider；它不保存 Boil Token，
+而是通过专用 SSH key 在目标 VPS 内部查询公网 IPv4 并调用 PPPoE 接口：
+
+```json
+{
+  "id": "seednet-vds-1",
+  "name": "Seednet VPS",
+  "provider": "fachost_seednet",
+  "enabled": true,
+  "fachost_seednet": {
+    "ssh_host": "seednet.example.com",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key_path": "/etc/boil/keys/seednet-vds-1"
+  }
+}
+```
+
+`fachost_seednet` 每次 reconnect 最多拨号两轮；每轮最多确认 60 秒，最终只以
+公网 IPv4 是否变化为成功依据。两轮失败后停止，不进入通用 Timer Retry。
+主控机需要 OpenSSH client，目标 VPS 需要 `curl`；私钥权限必须为 `0600`。
 
 程序按以下顺序查找配置：
 
@@ -257,6 +282,7 @@ BOIL_GLOBAL_TIMER='{
 {
   "id": "hk-01",
   "name": "Hong Kong 01",
+  "provider": "boil",
   "token": "replace-with-real-token",
   "enabled": true,
   "timer": {

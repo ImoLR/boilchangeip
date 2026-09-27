@@ -7,11 +7,11 @@ use teloxide::{
 use tokio::sync::Mutex;
 
 use crate::{
-    boil::BoilClient,
     config::{AppConfig, ResolvedSelection, ServerConfig, ServerSelection},
     core::check_ip_quality,
+    provider::ProviderClients,
     reconnect::{
-        reconnect_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
+        reconnect_provider_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
         ReconnectResult, ReconnectStatus,
     },
 };
@@ -35,7 +35,7 @@ pub(super) async fn tg_check(
         None => return,
     };
 
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(e) => {
             let _ = bot
@@ -54,20 +54,20 @@ pub(super) async fn tg_check(
             .send_message(chat_id, format!("🔍 检测中: {}", html_escape(&server.name)))
             .await;
         record_sent_ui_message(chat_id, sent, ui_sessions).await;
-        let response = match client.get_ip(&server.token).await {
-            Ok(response) => response,
+        let ip = match client.get_ip(server).await {
+            Ok(ip) => ip,
             Err(e) => {
                 let _ = bot
                     .send_message(
                         chat_id,
-                        format!("❌ Token 查询失败: {}", html_escape(&e.to_string())),
+                        format!("❌ 当前 IP 查询失败: {}", html_escape(&e.to_string())),
                     )
                     .await;
                 continue;
             }
         };
 
-        let ip = response.ip.to_string();
+        let ip = ip.to_string();
         let text = match check_ip_quality(&ip).await {
             Some(q) => format!(
                 "📍 <b>{}</b>\nIP: <code>{}</code>\n地区: {} | ISP: {}\n类型: {} | CF 风险: {}",
@@ -170,9 +170,9 @@ pub(super) async fn show_change_confirmation(
     let message_id = sent.as_ref().ok().map(|message| message.id);
     record_sent_page_message(bot, chat_id, sent, UiPage::Change, ui_sessions).await;
 
-    let current_ip = match BoilClient::new() {
-        Ok(client) => match client.get_ip(&server.token).await {
-            Ok(response) => response.ip.to_string(),
+    let current_ip = match ProviderClients::new() {
+        Ok(client) => match client.get_ip(server).await {
+            Ok(ip) => ip.to_string(),
             Err(error) => {
                 log::warn!(
                     "Telegram /change 确认页查询当前 IP 失败: server_id={}: {error}",
@@ -251,7 +251,7 @@ pub(super) async fn confirm_and_change(
 
     let sent = bot.send_message(chat_id, "⏳ 开始换 IP，请稍候...").await;
     record_sent_page_message(bot, chat_id, sent, UiPage::Change, ui_sessions).await;
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(e) => {
             let _ = bot
@@ -266,7 +266,7 @@ pub(super) async fn confirm_and_change(
     record_sent_ui_message(chat_id, sent, ui_sessions).await;
     let progress_bot = bot.clone();
     let progress_ui_sessions = Arc::clone(ui_sessions);
-    let result = reconnect_one_with_current_ip_and_progress(
+    let result = reconnect_provider_one_with_current_ip_and_progress(
         &client,
         server,
         &ReconnectPolicy::default(),
@@ -341,6 +341,47 @@ async fn send_reconnect_result(
     result: &ReconnectResult,
     ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
+    if result.dial_attempts > 0 {
+        let mut lines = vec![format!(
+            "{} <b>{}</b> 换 IP {}",
+            if result.changed { "✅" } else { "❌" },
+            html_escape(&result.server_name),
+            if result.changed { "成功" } else { "失败" }
+        )];
+        lines.push(String::new());
+        if let Some(old_ip) = result.old_ip {
+            lines.push(format!("旧 IP：<code>{old_ip}</code>"));
+        }
+        lines.push(match result.new_ip {
+            Some(ip) => format!(
+                "{} IP：<code>{ip}</code>",
+                if result.changed { "新" } else { "当前" }
+            ),
+            None => "当前 IP：无法确认".to_string(),
+        });
+        lines.push(format!("拨号次数：{} 次", result.dial_attempts));
+        if let Some(count) = result.daily_dial_count {
+            lines.push(format!(
+                "今日已用：{count} / {}",
+                crate::fachost::DAILY_DIAL_LIMIT
+            ));
+            lines.push(format!(
+                "剩余：{}",
+                crate::fachost::DAILY_DIAL_LIMIT.saturating_sub(count)
+            ));
+        }
+        if !result.changed {
+            lines.push(String::new());
+            lines.push("⚠️ 已停止自动重试，请管理员处理".to_string());
+        }
+        let sent = bot
+            .send_message(chat_id, lines.join("\n"))
+            .parse_mode(ParseMode::Html)
+            .await;
+        record_sent_ui_message(chat_id, sent, ui_sessions).await;
+        return;
+    }
+
     if result.status == ReconnectStatus::RateLimited {
         let mut lines = vec!["⏳ 换 IP 频率限制中".to_string(), String::new()];
         lines.push(format!("📡 <b>{}</b>", html_escape(&result.server_name)));

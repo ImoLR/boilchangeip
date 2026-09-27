@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, SecretToken};
+use crate::config::{AppConfig, SecretToken, ServerProvider};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerAddressUpdate {
@@ -34,6 +34,10 @@ pub fn update_server_token(
     token: SecretToken,
 ) -> anyhow::Result<()> {
     let server = server_mut(config, server_id)?;
+    anyhow::ensure!(
+        server.provider == ServerProvider::Boil,
+        "只有 Boil Provider 支持修改 Token"
+    );
     server.token = token;
     Ok(())
 }
@@ -79,7 +83,7 @@ fn server_index(config: &AppConfig, server_id: &str) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SecretToken, ServerConfig, ServerTimerConfig};
+    use crate::config::{SecretToken, ServerConfig, ServerProvider, ServerTimerConfig};
 
     fn config() -> AppConfig {
         AppConfig {
@@ -87,7 +91,9 @@ mod tests {
                 ServerConfig {
                     id: "a".to_string(),
                     name: "A".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("old-token-a"),
+                    fachost_seednet: None,
                     enabled: true,
                     address: Some("a.example.com".to_string()),
                     country: Some("中国香港".to_string()),
@@ -101,7 +107,9 @@ mod tests {
                 ServerConfig {
                     id: "b".to_string(),
                     name: "B".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("old-token-b"),
+                    fachost_seednet: None,
                     enabled: true,
                     address: None,
                     country: None,

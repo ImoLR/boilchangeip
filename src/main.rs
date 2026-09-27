@@ -3,6 +3,8 @@ mod bot;
 mod cli;
 mod config;
 mod core;
+mod fachost;
+mod provider;
 mod reconnect;
 mod server_manage;
 mod service;

@@ -7,8 +7,8 @@ use teloxide::{
 use tokio::sync::Mutex;
 
 use crate::{
-    boil::BoilClient,
     config::AppConfig,
+    provider::ProviderClients,
     timer::{parse_hhmm, TimerManager, TimerStatus, TimerUpdate},
 };
 
@@ -183,10 +183,10 @@ pub(super) async fn apply_timer_change(
 }
 
 async fn query_timer_current_ips(config: &AppConfig) -> HashMap<String, String> {
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(error) => {
-            log::warn!("定时面板初始化 Boil API 客户端失败: {error}");
+            log::warn!("定时面板初始化 Provider 客户端失败: {error}");
             return config
                 .servers
                 .iter()
@@ -197,8 +197,8 @@ async fn query_timer_current_ips(config: &AppConfig) -> HashMap<String, String> 
 
     let mut current_ips = HashMap::new();
     for server in &config.servers {
-        let current_ip = match client.get_ip(&server.token).await {
-            Ok(response) => response.ip.to_string(),
+        let current_ip = match client.get_ip(server).await {
+            Ok(ip) => ip.to_string(),
             Err(error) => {
                 log::warn!("定时面板查询当前 IP 失败: server_id={}: {error}", server.id);
                 "查询失败".to_string()

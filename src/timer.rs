@@ -10,13 +10,13 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
 use crate::{
-    boil::BoilClient,
     config::{
-        load_app_config, save_app_config, AppConfig, SecretToken, ServerSelection,
+        load_app_config, save_app_config, AppConfig, ServerConfig, ServerSelection,
         ServerTimerConfig,
     },
+    provider::ProviderClients,
     reconnect::{
-        reconnect_one_with_current_ip_progress_cooldown_notify, BatchReconnectResult,
+        reconnect_provider_one_with_current_ip_progress_cooldown_notify, BatchReconnectResult,
         ChangeIpCooldownMode, ReconnectPolicy, ReconnectProgress, ReconnectStatus,
     },
 };
@@ -358,7 +358,7 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
         }
     };
 
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(e) => {
             log::error!("定时换 IP 初始化客户端失败: {e}");
@@ -371,16 +371,11 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
     let (progress, current_ip) = notify_timer_processing(config, &client, selected).await;
     if current_ip.is_none() {
         tg_notify(config, &timer_preflight_failed_message()).await;
-        schedule_timer_preflight_retry(
-            selected.id.clone(),
-            selected.name.clone(),
-            selected.token.clone(),
-            TimerRetrySource::SingleServer,
-        );
+        schedule_timer_preflight_retry(selected.clone(), TimerRetrySource::SingleServer);
         return;
     }
 
-    let result = reconnect_one_with_current_ip_progress_cooldown_notify(
+    let result = reconnect_provider_one_with_current_ip_progress_cooldown_notify(
         &client,
         selected,
         &ReconnectPolicy::default(),
@@ -426,7 +421,7 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
         }
     };
 
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(e) => {
             log::error!("全局定时换 IP 初始化客户端失败: {e}");
@@ -448,17 +443,12 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
         let (progress, current_ip) = notify_timer_processing(config, &client, server).await;
         if current_ip.is_none() {
             tg_notify(config, &timer_preflight_failed_message()).await;
-            schedule_timer_preflight_retry(
-                server.id.clone(),
-                server.name.clone(),
-                server.token.clone(),
-                TimerRetrySource::GlobalTimer,
-            );
+            schedule_timer_preflight_retry(server.clone(), TimerRetrySource::GlobalTimer);
             batch.results.push(timer_preflight_failed_result(server));
             continue;
         }
 
-        let result = reconnect_one_with_current_ip_progress_cooldown_notify(
+        let result = reconnect_provider_one_with_current_ip_progress_cooldown_notify(
             &client,
             server,
             &ReconnectPolicy::default(),
@@ -487,13 +477,13 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
 
 async fn notify_timer_processing(
     config: &AppConfig,
-    client: &BoilClient,
+    client: &ProviderClients,
     server: &crate::config::ServerConfig,
 ) -> (Option<TimerProgressMessage>, Option<std::net::IpAddr>) {
     let progress = tg_send(config, &format!("🔄 现在处理：{}", server.name)).await;
 
-    let current_ip = match client.get_ip(&server.token).await {
-        Ok(response) => Some(response.ip),
+    let current_ip = match client.get_ip(server).await {
+        Ok(ip) => Some(ip),
         Err(error) => {
             log::warn!(
                 "定时换 IP 查询当前 IP 失败: server_id={}: {error}",
@@ -520,12 +510,8 @@ impl TimerRetrySource {
     }
 }
 
-fn schedule_timer_preflight_retry(
-    server_id: String,
-    server_name: String,
-    original_token: SecretToken,
-    source: TimerRetrySource,
-) {
+fn schedule_timer_preflight_retry(server: ServerConfig, source: TimerRetrySource) {
+    let server_id = server.id.clone();
     let retry_key = timer_retry_key(&server_id, source);
     if !mark_timer_retry_pending(&retry_key) {
         log::info!("定时换 IP 重试已存在，跳过重复调度: server_id={server_id}");
@@ -533,17 +519,16 @@ fn schedule_timer_preflight_retry(
     }
 
     tokio::spawn(async move {
-        run_timer_preflight_retry(server_id, server_name, original_token, source, retry_key).await;
+        run_timer_preflight_retry(server, source, retry_key).await;
     });
 }
 
 async fn run_timer_preflight_retry(
-    server_id: String,
-    _server_name: String,
-    original_token: SecretToken,
+    original_server: ServerConfig,
     source: TimerRetrySource,
     retry_key: String,
 ) {
+    let server_id = original_server.id.clone();
     let _pending = TimerRetryPending::new(retry_key);
 
     for (index, delay) in TIMER_RETRY_DELAYS.iter().enumerate() {
@@ -559,8 +544,7 @@ async fn run_timer_preflight_retry(
             }
         };
 
-        let Some(server) =
-            retry_server_if_still_valid(&config, &server_id, &original_token, source).cloned()
+        let Some(server) = retry_server_if_still_valid(&config, &original_server, source).cloned()
         else {
             log::info!("定时换 IP 重试取消: server_id={server_id} 已变更或定时任务已关闭");
             return;
@@ -568,7 +552,7 @@ async fn run_timer_preflight_retry(
 
         tg_notify(&config, &timer_retry_start_message(attempt, &server.name)).await;
 
-        let client = match BoilClient::new() {
+        let client = match ProviderClients::new() {
             Ok(client) => client,
             Err(error) => {
                 log::error!("定时换 IP 重试初始化客户端失败: {error}");
@@ -576,8 +560,8 @@ async fn run_timer_preflight_retry(
             }
         };
 
-        let old_ip = match client.get_ip(&server.token).await {
-            Ok(response) => response.ip,
+        let old_ip = match client.get_ip(&server).await {
+            Ok(ip) => ip,
             Err(error) => {
                 log::warn!("定时换 IP 重试查询当前 IP 失败: server_id={server_id}: {error}");
                 tg_notify(&config, &timer_retry_get_ip_failed_message(attempt)).await;
@@ -589,7 +573,7 @@ async fn run_timer_preflight_retry(
         };
 
         let progress = tg_send(&config, &format!("🔄 现在处理：{}", server.name)).await;
-        let result = reconnect_one_with_current_ip_progress_cooldown_notify(
+        let result = reconnect_provider_one_with_current_ip_progress_cooldown_notify(
             &client,
             &server,
             &ReconnectPolicy::default(),
@@ -700,15 +684,17 @@ fn clear_timer_retry_pending(key: &str) {
 
 fn retry_server_if_still_valid<'a>(
     config: &'a AppConfig,
-    server_id: &str,
-    original_token: &SecretToken,
+    original_server: &ServerConfig,
     source: TimerRetrySource,
 ) -> Option<&'a crate::config::ServerConfig> {
     let server = config
         .servers
         .iter()
-        .find(|server| server.id == server_id && server.enabled)?;
-    if server.token.expose_secret() != original_token.expose_secret() {
+        .find(|server| server.id == original_server.id && server.enabled)?;
+    if server.provider != original_server.provider
+        || server.token != original_server.token
+        || server.fachost_seednet != original_server.fachost_seednet
+    {
         return None;
     }
 
@@ -739,6 +725,8 @@ fn timer_preflight_failed_result(
         status: ReconnectStatus::PreflightFailed,
         message: Some("换 IP 前查询当前 IP 失败，未发送换 IP 请求".to_string()),
         poll_attempts: 0,
+        dial_attempts: 0,
+        daily_dial_count: None,
     }
 }
 
@@ -898,8 +886,20 @@ fn append_timer_result_lines(lines: &mut Vec<String>, result: &crate::reconnect:
     if let Some(uses_left) = result.uses_left {
         lines.push(format!("剩余次数：{uses_left}"));
     }
+    if result.dial_attempts > 0 {
+        lines.push(format!("拨号次数：{} 次", result.dial_attempts));
+    }
+    if let Some(count) = result.daily_dial_count {
+        lines.push(format!(
+            "今日已用：{count} / {}",
+            crate::fachost::DAILY_DIAL_LIMIT
+        ));
+    }
     if result.status != ReconnectStatus::Success {
         lines.push(format!("原因：{}", timer_reason(result)));
+        if result.status == ReconnectStatus::ProviderFailed {
+            lines.push("⚠️ 已停止自动重试，请管理员处理".to_string());
+        }
     }
 }
 
@@ -931,6 +931,10 @@ fn timer_reason(result: &crate::reconnect::ReconnectResult) -> String {
             "查询新 IP 超时或暂时失败，请稍后使用 /status 查看".to_string()
         }
         ReconnectStatus::InvalidResponse => "Boil API 响应无效".to_string(),
+        ReconnectStatus::ProviderFailed => result
+            .message
+            .clone()
+            .unwrap_or_else(|| "Provider 换 IP 失败，已停止自动重试".to_string()),
     }
 }
 
@@ -966,7 +970,7 @@ async fn tg_send(config: &AppConfig, msg: &str) -> Option<TimerProgressMessage> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SecretToken, ServerConfig, ServerTimerConfig};
+    use crate::config::{SecretToken, ServerConfig, ServerProvider, ServerTimerConfig};
 
     fn app_config() -> AppConfig {
         AppConfig {
@@ -974,7 +978,9 @@ mod tests {
                 ServerConfig {
                     id: "a".to_string(),
                     name: "A".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("token-a"),
+                    fachost_seednet: None,
                     enabled: true,
                     address: None,
                     country: None,
@@ -988,7 +994,9 @@ mod tests {
                 ServerConfig {
                     id: "b".to_string(),
                     name: "B".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("token-b"),
+                    fachost_seednet: None,
                     enabled: false,
                     address: None,
                     country: None,
@@ -1014,7 +1022,9 @@ mod tests {
         ServerConfig {
             id: id.to_string(),
             name: format!("Server {id}"),
+            provider: ServerProvider::Boil,
             token: SecretToken::from_test_value(&format!("token-{id}")),
+            fachost_seednet: None,
             enabled: true,
             address: None,
             country: None,
@@ -1039,6 +1049,8 @@ mod tests {
             status,
             message: Some("Boil API 请求超时".to_string()),
             poll_attempts: 3,
+            dial_attempts: 0,
+            daily_dial_count: None,
         }
     }
 
@@ -1490,72 +1502,54 @@ mod tests {
 
     #[test]
     fn timer_retry_recheck_requires_server_token_and_timer_to_match() {
-        let original = SecretToken::from_test_value("token-a");
         let mut config = app_config();
+        let original = config.servers[0].clone();
 
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::SingleServer
-        )
-        .is_some());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::SingleServer)
+                .is_some()
+        );
 
         config.servers[0].enabled = false;
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::SingleServer
-        )
-        .is_none());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::SingleServer)
+                .is_none()
+        );
 
         config = app_config();
         config.servers[0].token = SecretToken::from_test_value("new-token-a");
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::SingleServer
-        )
-        .is_none());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::SingleServer)
+                .is_none()
+        );
 
         config = app_config();
         config.servers[0].timer.as_mut().unwrap().enabled = false;
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::SingleServer
-        )
-        .is_none());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::SingleServer)
+                .is_none()
+        );
     }
 
     #[test]
     fn timer_retry_recheck_uses_global_timer_for_global_retry() {
-        let original = SecretToken::from_test_value("token-a");
         let mut config = app_config();
+        let original = config.servers[0].clone();
         config.global_timer = Some(ServerTimerConfig {
             enabled: true,
             cron: Some("0 3 * * *".to_string()),
         });
         config.servers[0].timer = None;
 
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::GlobalTimer
-        )
-        .is_some());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::GlobalTimer)
+                .is_some()
+        );
 
         config.global_timer.as_mut().unwrap().enabled = false;
-        assert!(retry_server_if_still_valid(
-            &config,
-            "a",
-            &original,
-            TimerRetrySource::GlobalTimer
-        )
-        .is_none());
+        assert!(
+            retry_server_if_still_valid(&config, &original, TimerRetrySource::GlobalTimer)
+                .is_none()
+        );
     }
 }

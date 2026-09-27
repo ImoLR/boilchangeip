@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     boil::BoilClient,
-    config::{save_app_config, AppConfig, SecretToken},
+    config::{save_app_config, AppConfig, SecretToken, ServerProvider},
+    provider::ProviderClients,
     server_manage::{
         rename_server, update_server_address, update_server_token, ServerAddressUpdate,
     },
@@ -74,6 +75,19 @@ pub(super) async fn handle_server_edit_input(
         }
         ServerEditMode::Token { server_id } => {
             let _ = bot.delete_message(chat_id, message_id).await;
+            if config
+                .lock()
+                .await
+                .servers
+                .iter()
+                .find(|server| server.id == server_id)
+                .is_some_and(|server| server.provider != ServerProvider::Boil)
+            {
+                let _ = bot
+                    .send_message(chat_id, "❌ 这台服务器不使用 Boil Token")
+                    .await;
+                return true;
+            }
             let token = match SecretToken::new(text.trim().to_string()) {
                 Ok(token) => token,
                 Err(error) => {
@@ -170,23 +184,29 @@ pub(super) async fn show_server_edit_menu(
             return;
         }
     };
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("✏️ 修改名称", format!("server_edit_name:{server_id}")),
-            InlineKeyboardButton::callback(
-                "🌍 修改地址",
-                format!("server_edit_address:{server_id}"),
-            ),
-        ],
-        vec![
+    let mut rows = vec![vec![
+        InlineKeyboardButton::callback("✏️ 修改名称", format!("server_edit_name:{server_id}")),
+        InlineKeyboardButton::callback("🌍 修改地址", format!("server_edit_address:{server_id}")),
+    ]];
+    if server.provider == ServerProvider::Boil {
+        rows.push(vec![
             InlineKeyboardButton::callback(
                 "🔑 修改 Token",
                 format!("server_edit_token:{server_id}"),
             ),
             InlineKeyboardButton::callback("🔍 重新验证", format!("server_revalidate:{server_id}")),
-        ],
-        vec![InlineKeyboardButton::callback("⬅️ 返回", "menu:servers")],
-    ]);
+        ]);
+    } else {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "🔍 重新验证",
+            format!("server_revalidate:{server_id}"),
+        )]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "⬅️ 返回",
+        "menu:servers",
+    )]);
+    let keyboard = InlineKeyboardMarkup::new(rows);
     let _ = bot
         .send_message(
             chat_id,
@@ -215,13 +235,12 @@ pub(super) async fn revalidate_server(
             return;
         }
     };
-    let token = server.token.clone();
     let address = server
         .address
         .clone()
         .or_else(|| server.resolved_ip.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(error) => {
             let _ = bot
@@ -233,19 +252,27 @@ pub(super) async fn revalidate_server(
     let _ = bot
         .send_message(chat_id, "⚙️ 正在查询当前 IP，请稍候…")
         .await;
-    if let Err(error) = client.get_ip(&token).await {
-        let _ = bot
-            .send_message(
-                chat_id,
-                format!(
-                    "❌ 验证失败: {}",
-                    html_escape(&short_safe_error(&error.to_string()))
-                ),
-            )
-            .await;
-        return;
-    }
-    let metadata = detect_address_metadata(&address).await;
+    let current_ip = match client.get_ip(server).await {
+        Ok(ip) => ip,
+        Err(error) => {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    format!(
+                        "❌ 验证失败: {}",
+                        html_escape(&short_safe_error(&error.to_string()))
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+    let metadata_source = if server.provider == ServerProvider::FachostSeednet {
+        current_ip.to_string()
+    } else {
+        address.clone()
+    };
+    let metadata = detect_address_metadata(&metadata_source).await;
     let mut next = current;
     if let Err(error) = update_server_address(
         &mut next,
@@ -254,7 +281,9 @@ pub(super) async fn revalidate_server(
             address,
             country: metadata.geo.country,
             flag: metadata.geo.flag,
-            resolved_ip: metadata.resolved_ip,
+            resolved_ip: metadata
+                .resolved_ip
+                .or_else(|| Some(current_ip.to_string())),
         },
     ) {
         let _ = bot

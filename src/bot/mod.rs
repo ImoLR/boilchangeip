@@ -67,7 +67,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use crate::config::{AppConfig, PairingCode, SecretToken, ServerConfig, ServerTimerConfig};
+    use crate::config::{
+        AppConfig, PairingCode, SecretToken, ServerConfig, ServerProvider, ServerTimerConfig,
+    };
 
     pub(super) fn app_config() -> AppConfig {
         AppConfig {
@@ -75,7 +77,9 @@ pub(super) mod test_support {
                 ServerConfig {
                     id: "hk-01".to_string(),
                     name: "Hong Kong 01".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("hidden-token-a"),
+                    fachost_seednet: None,
                     enabled: true,
                     address: Some("203.0.113.10".to_string()),
                     country: Some("中国香港".to_string()),
@@ -89,7 +93,9 @@ pub(super) mod test_support {
                 ServerConfig {
                     id: "jp_02".to_string(),
                     name: "Japan 02".to_string(),
+                    provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("hidden-token-b"),
+                    fachost_seednet: None,
                     enabled: true,
                     address: Some("jp.example.com".to_string()),
                     country: Some("日本".to_string()),

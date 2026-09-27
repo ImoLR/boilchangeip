@@ -4,8 +4,8 @@ use teloxide::{prelude::*, types::ParseMode};
 use tokio::sync::Mutex;
 
 use crate::{
-    boil::BoilClient,
     config::{AppConfig, ServerConfig},
+    provider::ProviderClients,
     server_manage::{move_server_down, move_server_up},
     timer::TimerManager,
 };
@@ -33,10 +33,10 @@ pub(super) async fn show_servers(
         return;
     }
 
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => Some(client),
         Err(error) => {
-            log::warn!("服务器列表初始化 Boil API 客户端失败: {error}");
+            log::warn!("服务器列表初始化 Provider 客户端失败: {error}");
             None
         }
     };
@@ -65,8 +65,8 @@ pub(super) async fn show_servers(
         };
 
         let current_ip = match &client {
-            Some(client) => match client.get_ip(&server.token).await {
-                Ok(response) => response.ip.to_string(),
+            Some(client) => match client.get_ip(server).await {
+                Ok(ip) => ip.to_string(),
                 Err(error) => {
                     log::warn!(
                         "服务器列表查询当前 IP 失败: server_id={}: {error}",
@@ -124,6 +124,8 @@ pub(super) async fn move_server(
 mod tests {
     use super::*;
     use crate::bot::test_support::app_config;
+    use crate::config::{FacHostSeednetConfig, SecretToken, ServerProvider};
+    use std::path::PathBuf;
 
     #[test]
     fn server_card_has_no_action_buttons_or_missing_address_text() {
@@ -140,5 +142,30 @@ mod tests {
         assert!(!card.contains("删除"));
         assert!(!card.contains("hidden-token"));
         assert!(!card.contains("hk-01"));
+    }
+
+    #[test]
+    fn server_card_supports_fachost_without_token_or_internal_id() {
+        let mut config = app_config();
+        let server = &mut config.servers[0];
+        server.id = "seednet-vds-1".to_string();
+        server.name = "Seednet-VDS-1 Black Friday 2025".to_string();
+        server.provider = ServerProvider::FachostSeednet;
+        server.token = SecretToken::default();
+        server.fachost_seednet = Some(FacHostSeednetConfig {
+            ssh_host: "seednet.example.com".to_string(),
+            ssh_port: 22,
+            ssh_user: "root".to_string(),
+            ssh_key_path: PathBuf::from("/etc/boil/keys/seednet-vds-1"),
+        });
+        server.country = Some("中国台湾".to_string());
+        server.flag = Some("🇹🇼".to_string());
+
+        let card = format_server_card(server, "112.104.136.174");
+        assert!(card.contains("Seednet-VDS-1 Black Friday 2025"));
+        assert!(card.contains("🇹🇼 中国台湾"));
+        assert!(card.contains("当前 IP：112.104.136.174"));
+        assert!(!card.contains("seednet-vds-1"));
+        assert!(!card.contains("token"));
     }
 }

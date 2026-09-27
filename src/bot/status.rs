@@ -6,8 +6,8 @@ use teloxide::{prelude::*, types::ParseMode};
 use tokio::sync::Mutex;
 
 use crate::{
-    boil::BoilClient,
     config::{AppConfig, ServerConfig},
+    provider::ProviderClients,
     timer::parse_hhmm,
 };
 
@@ -31,7 +31,7 @@ pub(super) async fn tg_status(
         None => return,
     };
 
-    let client = match BoilClient::new() {
+    let client = match ProviderClients::new() {
         Ok(client) => client,
         Err(e) => {
             let _ = bot
@@ -45,12 +45,8 @@ pub(super) async fn tg_status(
         .await;
 
     for (index, server) in selected_servers(selected).into_iter().enumerate() {
-        let (status, detail, current_ip) = match client.get_ip(&server.token).await {
-            Ok(response) => (
-                StatusQueryState::Normal,
-                None,
-                Some(response.ip.to_string()),
-            ),
+        let (status, detail, current_ip) = match client.get_ip(server).await {
+            Ok(ip) => (StatusQueryState::Normal, None, Some(ip.to_string())),
             Err(e) => (
                 StatusQueryState::VerificationFailed,
                 Some(short_safe_error(&e.to_string())),

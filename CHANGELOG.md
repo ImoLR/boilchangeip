@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.2.18 - 2026-09-27
+
+### 新增
+
+- 新增 `fachost_seednet` Provider，通过专用 SSH key 在目标 VPS 内查询真实公网 IPv4，并从内网调用 PPPoE 重拨接口。
+- FACHost reconnect 每轮只发送一次拨号请求，随后重新建立 SSH 连接确认公网 IP；每轮最多 60 秒、最多两轮，绝不自动发起第三轮。
+- Telegram `/servers`、`/status`、手动换 IP、CLI 和 Timer 统一支持 Boil 与 FACHost Server。
+- FACHost 拨号响应中的 `dial_count` 可用于展示当日已用次数和按每日 5 次上限计算的剩余次数。
+
+### 兼容性与安全
+
+- 旧 `BOIL_SERVERS` 未配置 `provider` 时继续默认使用 `boil`，无需迁移。
+- FACHost 两轮确认失败后停止，不进入通用 Timer Retry；SSH 断连、超时或响应丢失只进入 IP 确认阶段，不会立即重发拨号请求。
+- FACHost 配置不保存 Boil Token 或 SSH 明文密码，私钥仅保存在主控机的受限路径中。
+
 ## v2.2.17 - 2026-08-22
 
 ### 修复

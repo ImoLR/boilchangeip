@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.2.19 - 2026-09-30
+
+### 修复
+
+- FACHost `/re-pppoe` 返回 HTTP 成功、`status=success`、`changed=true` 和有效新公网 IPv4 后，立即记录厂商确认结果并禁止再次拨号。
+- FACHost 每轮网络恢复确认窗口从 60 秒延长到 120 秒，按 5 秒间隔和 deadline 轮询；仅在结果未知或明确失败且整轮未发现 IP 变化时才允许第二轮。
+- FACHost reconnect 继续硬性限制最多两轮；厂商已确认但网络尚未恢复时返回待确认状态，不再误报换 IP 失败。
+- Telegram、Timer 和 CLI 将本次 reconnect 轮数显示为“本次拨号尝试”，并将接口 `dial_count` 单独显示为“接口拨号计数”，不再解释为每日 5 次额度。
+- 增加 FACHost 每轮拨号、结构化响应、确认轮询、deadline 和最终尝试次数的安全日志，不记录 SSH 凭据或原始响应正文。
+
 ## v2.2.18 - 2026-09-27
 
 ### 新增

@@ -726,7 +726,7 @@ fn timer_preflight_failed_result(
         message: Some("换 IP 前查询当前 IP 失败，未发送换 IP 请求".to_string()),
         poll_attempts: 0,
         dial_attempts: 0,
-        daily_dial_count: None,
+        provider_dial_count: None,
     }
 }
 
@@ -829,9 +829,15 @@ struct TimerProgressMessage {
 async fn update_timer_progress(
     progress: Option<TimerProgressMessage>,
     server_name: String,
-    _event: ReconnectProgress,
+    event: ReconnectProgress,
 ) {
-    edit_timer_progress(progress, &format!("🔄 现在处理：{server_name}")).await;
+    let message = match event {
+        ReconnectProgress::VerifyingNewIp { .. } => format!("🔄 现在处理：{server_name}"),
+        ReconnectProgress::ProviderConfirmedRedial { old_ip, new_ip } => format!(
+            "✅ 拨号成功\n\n📡 {server_name}\n\n旧 IP：{old_ip}\n新 IP：{new_ip}\n\n⏳ 正在等待网络恢复…"
+        ),
+    };
+    edit_timer_progress(progress, &message).await;
 }
 
 async fn edit_timer_progress(progress: Option<TimerProgressMessage>, msg: &str) {
@@ -887,13 +893,10 @@ fn append_timer_result_lines(lines: &mut Vec<String>, result: &crate::reconnect:
         lines.push(format!("剩余次数：{uses_left}"));
     }
     if result.dial_attempts > 0 {
-        lines.push(format!("拨号次数：{} 次", result.dial_attempts));
+        lines.push(format!("本次拨号尝试：{} 次", result.dial_attempts));
     }
-    if let Some(count) = result.daily_dial_count {
-        lines.push(format!(
-            "今日已用：{count} / {}",
-            crate::fachost::DAILY_DIAL_LIMIT
-        ));
+    if let Some(count) = result.provider_dial_count {
+        lines.push(format!("接口拨号计数：{count}"));
     }
     if result.status != ReconnectStatus::Success {
         lines.push(format!("原因：{}", timer_reason(result)));
@@ -927,6 +930,10 @@ fn timer_reason(result: &crate::reconnect::ReconnectResult) -> String {
             .message
             .clone()
             .unwrap_or_else(|| "Boil API 拒绝请求".to_string()),
+        ReconnectStatus::ChangeAcceptedButUnconfirmed if result.dial_attempts > 0 => result
+            .message
+            .clone()
+            .unwrap_or_else(|| "FACHost 已明确返回换 IP 成功，但暂时无法确认网络恢复".to_string()),
         ReconnectStatus::ChangeAcceptedButUnconfirmed => {
             "查询新 IP 超时或暂时失败，请稍后使用 /status 查看".to_string()
         }
@@ -1050,7 +1057,7 @@ mod tests {
             message: Some("Boil API 请求超时".to_string()),
             poll_attempts: 3,
             dial_attempts: 0,
-            daily_dial_count: None,
+            provider_dial_count: None,
         }
     }
 
@@ -1398,6 +1405,22 @@ mod tests {
         assert!(!text.contains("Success"));
         assert!(!text.contains("changed=false"));
         assert!(!text.contains("1785100089"));
+    }
+
+    #[test]
+    fn timer_fachost_result_labels_attempt_and_provider_counts_separately() {
+        let mut result = reconnect_result("Seednet VPS", ReconnectStatus::Success);
+        result.uses_left = None;
+        result.dial_attempts = 2;
+        result.provider_dial_count = Some(9);
+
+        let text = format_timer_result(&result);
+
+        assert!(text.contains("本次拨号尝试：2 次"));
+        assert!(text.contains("接口拨号计数：9"));
+        assert!(!text.contains("拨号次数："));
+        assert!(!text.contains("今日已用"));
+        assert!(!text.contains("/ 5"));
     }
 
     #[test]

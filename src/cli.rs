@@ -159,10 +159,10 @@ pub fn print_reconnect_result(result: &ReconnectResult) {
         println!("  剩余次数: {uses_left}");
     }
     if result.dial_attempts > 0 {
-        println!("  拨号次数: {}", result.dial_attempts);
+        println!("  本次拨号尝试: {}", result.dial_attempts);
     }
-    if let Some(count) = result.daily_dial_count {
-        println!("  今日已用: {count} / {}", crate::fachost::DAILY_DIAL_LIMIT);
+    if let Some(count) = result.provider_dial_count {
+        println!("  接口拨号计数: {count}");
     }
     if let Some(next_allowed_at) = result.next_allowed_at {
         println!("  下次允许时间: {next_allowed_at} (Unix)");

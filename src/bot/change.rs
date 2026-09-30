@@ -266,6 +266,7 @@ pub(super) async fn confirm_and_change(
     record_sent_ui_message(chat_id, sent, ui_sessions).await;
     let progress_bot = bot.clone();
     let progress_ui_sessions = Arc::clone(ui_sessions);
+    let progress_server_name = server.name.clone();
     let result = reconnect_provider_one_with_current_ip_and_progress(
         &client,
         server,
@@ -274,10 +275,22 @@ pub(super) async fn confirm_and_change(
         move |progress| {
             let bot = progress_bot.clone();
             let ui_sessions = Arc::clone(&progress_ui_sessions);
+            let server_name = progress_server_name.clone();
             async move {
                 match progress {
                     ReconnectProgress::VerifyingNewIp { .. } => {
                         let sent = bot.send_message(chat_id, "⚙️ 正在查询新 IP，请稍候…").await;
+                        record_sent_ui_message(chat_id, sent, &ui_sessions).await;
+                    }
+                    ReconnectProgress::ProviderConfirmedRedial { old_ip, new_ip } => {
+                        let message = format!(
+                            "✅ 拨号成功\n\n📡 <b>{}</b>\n\n旧 IP：<code>{old_ip}</code>\n新 IP：<code>{new_ip}</code>\n\n⏳ 正在等待网络恢复…",
+                            html_escape(&server_name)
+                        );
+                        let sent = bot
+                            .send_message(chat_id, message)
+                            .parse_mode(ParseMode::Html)
+                            .await;
                         record_sent_ui_message(chat_id, sent, &ui_sessions).await;
                     }
                 }
@@ -342,40 +355,8 @@ async fn send_reconnect_result(
     ui_sessions: &Arc<Mutex<UiSessionStore>>,
 ) {
     if result.dial_attempts > 0 {
-        let mut lines = vec![format!(
-            "{} <b>{}</b> 换 IP {}",
-            if result.changed { "✅" } else { "❌" },
-            html_escape(&result.server_name),
-            if result.changed { "成功" } else { "失败" }
-        )];
-        lines.push(String::new());
-        if let Some(old_ip) = result.old_ip {
-            lines.push(format!("旧 IP：<code>{old_ip}</code>"));
-        }
-        lines.push(match result.new_ip {
-            Some(ip) => format!(
-                "{} IP：<code>{ip}</code>",
-                if result.changed { "新" } else { "当前" }
-            ),
-            None => "当前 IP：无法确认".to_string(),
-        });
-        lines.push(format!("拨号次数：{} 次", result.dial_attempts));
-        if let Some(count) = result.daily_dial_count {
-            lines.push(format!(
-                "今日已用：{count} / {}",
-                crate::fachost::DAILY_DIAL_LIMIT
-            ));
-            lines.push(format!(
-                "剩余：{}",
-                crate::fachost::DAILY_DIAL_LIMIT.saturating_sub(count)
-            ));
-        }
-        if !result.changed {
-            lines.push(String::new());
-            lines.push("⚠️ 已停止自动重试，请管理员处理".to_string());
-        }
         let sent = bot
-            .send_message(chat_id, lines.join("\n"))
+            .send_message(chat_id, format_dial_reconnect_result(result))
             .parse_mode(ParseMode::Html)
             .await;
         record_sent_ui_message(chat_id, sent, ui_sessions).await;
@@ -428,6 +409,40 @@ async fn send_reconnect_result(
     record_sent_ui_message(chat_id, sent, ui_sessions).await;
 }
 
+fn format_dial_reconnect_result(result: &ReconnectResult) -> String {
+    let (icon, status_text) = match result.status {
+        ReconnectStatus::Success => ("✅", "换 IP 成功"),
+        ReconnectStatus::ChangeAcceptedButUnconfirmed => {
+            ("⚠️", "已完成拨号，但暂时无法确认网络恢复")
+        }
+        _ => ("❌", "换 IP 失败"),
+    };
+    let mut lines = vec![format!(
+        "{icon} <b>{}</b> {status_text}",
+        html_escape(&result.server_name),
+    )];
+    lines.push(String::new());
+    if let Some(old_ip) = result.old_ip {
+        lines.push(format!("旧 IP：<code>{old_ip}</code>"));
+    }
+    lines.push(match result.new_ip {
+        Some(ip) => format!("新 IP：<code>{ip}</code>"),
+        None => "新 IP：无法确认".to_string(),
+    });
+    lines.push(format!("本次拨号尝试：{} 次", result.dial_attempts));
+    if let Some(count) = result.provider_dial_count {
+        lines.push(format!("接口拨号计数：{count}"));
+    }
+    if result.status == ReconnectStatus::ChangeAcceptedButUnconfirmed {
+        lines.push(String::new());
+        lines.push("请稍后查看状态".to_string());
+    } else if result.status == ReconnectStatus::ProviderFailed {
+        lines.push(String::new());
+        lines.push("⚠️ 已停止自动重试，请管理员处理".to_string());
+    }
+    lines.join("\n")
+}
+
 pub(super) fn selection_from_tg_arg(arg: &str) -> ServerSelection<'_> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
@@ -441,5 +456,48 @@ pub(super) fn selected_servers(selected: ResolvedSelection<'_>) -> Vec<&ServerCo
     match selected {
         ResolvedSelection::One(server) => vec![server],
         ResolvedSelection::All(servers) => servers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fachost_result(status: ReconnectStatus) -> ReconnectResult {
+        ReconnectResult {
+            server_id: "seednet-1".to_string(),
+            server_name: "Seednet VPS".to_string(),
+            old_ip: Some("8.8.8.8".parse().unwrap()),
+            new_ip: Some("8.8.4.4".parse().unwrap()),
+            changed: status == ReconnectStatus::Success,
+            uses_left: None,
+            next_allowed_at: None,
+            status,
+            message: None,
+            poll_attempts: 24,
+            dial_attempts: 1,
+            provider_dial_count: Some(7),
+        }
+    }
+
+    #[test]
+    fn fachost_result_distinguishes_attempts_from_provider_counter() {
+        let text = format_dial_reconnect_result(&fachost_result(ReconnectStatus::Success));
+        assert!(text.contains("本次拨号尝试：1 次"));
+        assert!(text.contains("接口拨号计数：7"));
+        assert!(!text.contains("拨号次数："));
+        assert!(!text.contains("今日已用"));
+        assert!(!text.contains("/ 5"));
+    }
+
+    #[test]
+    fn fachost_confirmed_but_unreachable_is_not_reported_as_failure() {
+        let text = format_dial_reconnect_result(&fachost_result(
+            ReconnectStatus::ChangeAcceptedButUnconfirmed,
+        ));
+        assert!(text.contains("⚠️ <b>Seednet VPS</b> 已完成拨号，但暂时无法确认网络恢复"));
+        assert!(text.contains("请稍后查看状态"));
+        assert!(!text.contains("换 IP 失败"));
+        assert!(!text.contains("已停止自动重试"));
     }
 }

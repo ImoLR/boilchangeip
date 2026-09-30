@@ -70,12 +70,13 @@ pub struct ReconnectResult {
     pub message: Option<String>,
     pub poll_attempts: usize,
     pub dial_attempts: usize,
-    pub daily_dial_count: Option<u32>,
+    pub provider_dial_count: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconnectProgress {
     VerifyingNewIp { old_ip: IpAddr },
+    ProviderConfirmedRedial { old_ip: IpAddr, new_ip: IpAddr },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,15 +334,20 @@ where
             let _change_guard = CHANGE_IP_LOCK.lock().await;
             let outcome = clients
                 .fachost_seednet()
-                .reconnect(config, old_ip, &FacHostReconnectPolicy::default())
+                .reconnect(
+                    config,
+                    &server.id,
+                    &server.name,
+                    old_ip,
+                    &FacHostReconnectPolicy::default(),
+                    |old_ip, new_ip| {
+                        on_progress(ReconnectProgress::ProviderConfirmedRedial { old_ip, new_ip })
+                    },
+                )
                 .await;
             let mut result = base_result(
                 server,
-                if outcome.changed {
-                    ReconnectStatus::Success
-                } else {
-                    ReconnectStatus::ProviderFailed
-                },
+                fachost_reconnect_status(outcome.changed, outcome.provider_confirmed_success),
                 Some(&outcome.message),
             );
             result.old_ip = Some(outcome.old_ip);
@@ -349,12 +355,19 @@ where
             result.changed = outcome.changed;
             result.poll_attempts = outcome.poll_attempts;
             result.dial_attempts = outcome.dial_attempts;
-            result.daily_dial_count = outcome.daily_dial_count;
-            result.uses_left = outcome
-                .daily_dial_count
-                .map(|count| crate::fachost::DAILY_DIAL_LIMIT.saturating_sub(count));
+            result.provider_dial_count = outcome.provider_dial_count;
             result
         }
+    }
+}
+
+fn fachost_reconnect_status(changed: bool, provider_confirmed_success: bool) -> ReconnectStatus {
+    if changed {
+        ReconnectStatus::Success
+    } else if provider_confirmed_success {
+        ReconnectStatus::ChangeAcceptedButUnconfirmed
+    } else {
+        ReconnectStatus::ProviderFailed
     }
 }
 
@@ -692,7 +705,7 @@ fn base_result(
         message: message.map(|value| redact_for_result(value, server)),
         poll_attempts: 0,
         dial_attempts: 0,
-        daily_dial_count: None,
+        provider_dial_count: None,
     }
 }
 
@@ -1757,5 +1770,21 @@ mod tests {
 
         assert_eq!(result.status, ReconnectStatus::Success);
         assert_eq!(result.next_allowed_at, None);
+    }
+
+    #[test]
+    fn fachost_provider_confirmation_is_unconfirmed_instead_of_failed() {
+        assert_eq!(
+            fachost_reconnect_status(false, true),
+            ReconnectStatus::ChangeAcceptedButUnconfirmed
+        );
+        assert_eq!(
+            fachost_reconnect_status(false, false),
+            ReconnectStatus::ProviderFailed
+        );
+        assert_eq!(
+            fachost_reconnect_status(true, false),
+            ReconnectStatus::Success
+        );
     }
 }

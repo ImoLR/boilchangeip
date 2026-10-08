@@ -152,6 +152,7 @@ pub(super) async fn handle_command(
                     msg.chat.id,
                     &config_snapshot,
                     &task_shared.ui_sessions,
+                    &task_shared.server_geo_cache,
                 )
                 .await;
             });

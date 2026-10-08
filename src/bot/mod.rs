@@ -43,6 +43,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         ui_sessions: Arc::new(Mutex::new(UiSessionStore::default())),
         server_wizards: Arc::new(Mutex::new(ServerWizardStore::default())),
         server_edits: Arc::new(Mutex::new(ServerEditStore::default())),
+        server_geo_cache: Default::default(),
         busy: Arc::new(BotBusyStore::default()),
     };
 

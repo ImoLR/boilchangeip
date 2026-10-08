@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use teloxide::{prelude::*, types::ParseMode};
 use tokio::sync::Mutex;
@@ -11,9 +11,12 @@ use crate::{
 };
 
 use super::{
-    formatting::{format_server_card, html_escape},
+    formatting::{
+        detect_address_metadata, format_server_card, format_server_display_parts, html_escape,
+        server_geo_label, AddressMetadata, GeoLabel,
+    },
     server_edit::save_config_and_reload,
-    state::{UiPage, UiSessionStore},
+    state::{ServerGeoCache, UiPage, UiSessionStore},
     timer_ui::{record_page_message, record_ui_message},
 };
 
@@ -22,6 +25,7 @@ pub(super) async fn show_servers(
     chat_id: ChatId,
     config: &AppConfig,
     ui_sessions: &Arc<Mutex<UiSessionStore>>,
+    geo_cache: &ServerGeoCache,
 ) {
     if config.servers.is_empty() {
         let sent = bot
@@ -66,25 +70,108 @@ pub(super) async fn show_servers(
 
         let current_ip = match &client {
             Some(client) => match client.get_ip(server).await {
-                Ok(ip) => ip.to_string(),
+                Ok(ip) => Some(ip.to_string()),
                 Err(error) => {
                     log::warn!(
                         "服务器列表查询当前 IP 失败: server_id={}: {error}",
                         server.id
                     );
-                    "查询失败".to_string()
+                    None
                 }
             },
-            None => "查询失败".to_string(),
+            None => None,
         };
 
         if let Some(message_id) = message_id {
+            let text = match current_ip {
+                Some(current_ip) => {
+                    let geo = resolve_current_geo(server, &current_ip, geo_cache).await;
+                    format_server_display_parts(&server.name, &current_ip, &geo)
+                }
+                None => format_server_card(server, "查询失败"),
+            };
             let _ = bot
-                .edit_message_text(chat_id, message_id, format_server_card(server, &current_ip))
+                .edit_message_text(chat_id, message_id, text)
                 .parse_mode(ParseMode::Html)
                 .await;
         }
     }
+}
+
+async fn resolve_current_geo(
+    server: &ServerConfig,
+    current_ip: &str,
+    geo_cache: &ServerGeoCache,
+) -> GeoLabel {
+    resolve_current_geo_with(server, current_ip, geo_cache, |ip| async move {
+        detect_address_metadata(&ip).await
+    })
+    .await
+}
+
+async fn resolve_current_geo_with<F, Fut>(
+    server: &ServerConfig,
+    current_ip: &str,
+    geo_cache: &ServerGeoCache,
+    lookup: F,
+) -> GeoLabel
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = AddressMetadata>,
+{
+    if let Some(geo) = configured_geo_for_current_ip(server, current_ip) {
+        return geo;
+    }
+
+    if let Some(geo) = runtime_geo_for_current_ip(server, current_ip, geo_cache).await {
+        return geo;
+    }
+
+    let mut detected = lookup(current_ip.to_string()).await;
+    if detected.geo.is_unknown() {
+        log::warn!(
+            "服务器列表 GEO 查询失败，沿用已保存地区: server_id={}, current_ip={current_ip}",
+            server.id
+        );
+        return server_geo_label(server);
+    }
+
+    detected.resolved_ip = Some(current_ip.to_string());
+    let geo = detected.geo.clone();
+    geo_cache.lock().await.insert(server.id.clone(), detected);
+    geo
+}
+
+fn configured_geo_for_current_ip(server: &ServerConfig, current_ip: &str) -> Option<GeoLabel> {
+    if server.resolved_ip.as_deref() != Some(current_ip) {
+        return None;
+    }
+    complete_server_geo(server)
+}
+
+async fn runtime_geo_for_current_ip(
+    server: &ServerConfig,
+    current_ip: &str,
+    geo_cache: &ServerGeoCache,
+) -> Option<GeoLabel> {
+    let cache = geo_cache.lock().await;
+    let metadata = cache.get(&server.id)?;
+    if metadata.resolved_ip.as_deref() != Some(current_ip) || metadata.geo.is_unknown() {
+        return None;
+    }
+    Some(metadata.geo.clone())
+}
+
+fn complete_server_geo(server: &ServerConfig) -> Option<GeoLabel> {
+    let flag = server.flag.as_deref()?.trim();
+    let country = server.country.as_deref()?.trim();
+    if flag.is_empty() || country.is_empty() {
+        return None;
+    }
+    Some(GeoLabel {
+        flag: flag.to_string(),
+        country: country.to_string(),
+    })
 }
 
 pub(super) fn find_configured_server<'a>(
@@ -126,6 +213,7 @@ mod tests {
     use crate::bot::test_support::app_config;
     use crate::config::{FacHostSeednetConfig, SecretToken, ServerProvider};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn server_card_has_no_action_buttons_or_missing_address_text() {
@@ -167,5 +255,76 @@ mod tests {
         assert!(card.contains("当前 IP：112.104.136.174"));
         assert!(!card.contains("seednet-vds-1"));
         assert!(!card.contains("token"));
+    }
+
+    #[tokio::test]
+    async fn current_ip_uses_matching_configured_geo_without_lookup() {
+        let mut config = app_config();
+        let server = &mut config.servers[0];
+        server.resolved_ip = Some("203.0.113.10".to_string());
+        let cache: ServerGeoCache = Default::default();
+        let calls = AtomicUsize::new(0);
+
+        let geo = resolve_current_geo_with(server, "203.0.113.10", &cache, |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            AddressMetadata {
+                geo: GeoLabel::unknown(),
+                resolved_ip: None,
+            }
+        })
+        .await;
+
+        assert_eq!(geo.country, "中国香港");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn changed_ip_is_looked_up_once_then_uses_runtime_cache() {
+        let config = app_config();
+        let server = &config.servers[0];
+        let cache: ServerGeoCache = Default::default();
+        let calls = AtomicUsize::new(0);
+
+        let first = resolve_current_geo_with(server, "198.51.100.20", &cache, |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            AddressMetadata {
+                geo: GeoLabel {
+                    flag: "🇹🇼".to_string(),
+                    country: "中国台湾".to_string(),
+                },
+                resolved_ip: Some("198.51.100.20".to_string()),
+            }
+        })
+        .await;
+        let second = resolve_current_geo_with(server, "198.51.100.20", &cache, |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            AddressMetadata {
+                geo: GeoLabel::unknown(),
+                resolved_ip: None,
+            }
+        })
+        .await;
+
+        assert_eq!(first.country, "中国台湾");
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_geo_lookup_falls_back_without_caching_unknown() {
+        let config = app_config();
+        let server = &config.servers[0];
+        let cache: ServerGeoCache = Default::default();
+
+        let geo = resolve_current_geo_with(server, "198.51.100.20", &cache, |_| async {
+            AddressMetadata {
+                geo: GeoLabel::unknown(),
+                resolved_ip: Some("198.51.100.20".to_string()),
+            }
+        })
+        .await;
+
+        assert_eq!(geo.country, "中国香港");
+        assert!(cache.lock().await.is_empty());
     }
 }

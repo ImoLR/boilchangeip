@@ -2,6 +2,7 @@ use std::time::Duration;
 
 pub struct IpQuality {
     pub country: String,
+    pub country_code: String,
     pub isp: String,
     pub is_proxy: bool,
     pub is_hosting: bool,
@@ -27,7 +28,8 @@ impl IpQuality {
 }
 
 pub async fn check_ip_quality(ip: &str) -> Option<IpQuality> {
-    let url = format!("http://ip-api.com/json/{ip}?fields=status,country,isp,proxy,hosting");
+    let url =
+        format!("http://ip-api.com/json/{ip}?fields=status,country,countryCode,isp,proxy,hosting");
     let resp: serde_json::Value = reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_secs(8))
@@ -43,6 +45,7 @@ pub async fn check_ip_quality(ip: &str) -> Option<IpQuality> {
     }
     Some(IpQuality {
         country: resp["country"].as_str().unwrap_or("未知").to_string(),
+        country_code: resp["countryCode"].as_str().unwrap_or("").to_string(),
         isp: resp["isp"].as_str().unwrap_or("未知").to_string(),
         is_proxy: resp["proxy"].as_bool().unwrap_or(false),
         is_hosting: resp["hosting"].as_bool().unwrap_or(false),

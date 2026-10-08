@@ -90,6 +90,7 @@ pub(super) async fn handle_callback(
                     chat_id,
                     &config_snapshot,
                     &task_shared.ui_sessions,
+                    &task_shared.server_geo_cache,
                 )
                 .await;
             });

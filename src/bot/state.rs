@@ -14,6 +14,8 @@ use crate::{
     timer::TimerManager,
 };
 
+use super::formatting::AddressMetadata;
+
 pub(super) const CONFIRM_TTL: Duration = Duration::from_secs(120);
 pub(super) const TIMER_INPUT_TTL: Duration = Duration::from_secs(300);
 pub(super) const SERVER_WIZARD_TTL: Duration = Duration::from_secs(900);
@@ -118,6 +120,8 @@ pub(super) struct BotBusyStore {
     busy_chats: StdMutex<HashSet<ChatId>>,
 }
 
+pub(super) type ServerGeoCache = Arc<Mutex<HashMap<String, AddressMetadata>>>;
+
 pub(super) struct BotBusyGuard {
     chat_id: ChatId,
     busy_chats: Arc<BotBusyStore>,
@@ -132,6 +136,7 @@ pub(super) struct BotShared {
     pub(super) ui_sessions: Arc<Mutex<UiSessionStore>>,
     pub(super) server_wizards: Arc<Mutex<ServerWizardStore>>,
     pub(super) server_edits: Arc<Mutex<ServerEditStore>>,
+    pub(super) server_geo_cache: ServerGeoCache,
     pub(super) busy: Arc<BotBusyStore>,
 }
 

@@ -25,6 +25,10 @@ impl GeoLabel {
     pub(super) fn display(&self) -> String {
         format!("{} {}", self.flag, self.country)
     }
+
+    pub(super) fn is_unknown(&self) -> bool {
+        self == &Self::unknown()
+    }
 }
 
 pub(super) fn format_server_card(server: &ServerConfig, current_ip: &str) -> String {
@@ -106,7 +110,7 @@ pub(super) async fn detect_address_metadata(address: &str) -> AddressMetadata {
     let ip_string = ip.to_string();
     let geo = check_ip_quality(&ip_string)
         .await
-        .map(|quality| geo_from_country(&quality.country))
+        .map(|quality| geo_from_country(&quality.country, &quality.country_code))
         .unwrap_or_else(GeoLabel::unknown);
 
     AddressMetadata {
@@ -133,21 +137,34 @@ async fn resolve_address_ip(address: &str) -> Option<IpAddr> {
     .flatten()
 }
 
-fn geo_from_country(country: &str) -> GeoLabel {
+fn geo_from_country(country: &str, country_code: &str) -> GeoLabel {
     let normalized = country.trim();
-    let (flag, country) = match normalized {
-        "Japan" | "日本" => ("🇯🇵", "日本"),
-        "Singapore" | "新加坡" => ("🇸🇬", "新加坡"),
-        "Hong Kong" | "Hong Kong SAR" | "香港" | "中国香港" => ("🇭🇰", "中国香港"),
-        "United States" | "美国" => ("🇺🇸", "美国"),
-        "Taiwan" | "台湾" | "中国台湾" => ("🇹🇼", "中国台湾"),
+    let (known_flag, country) = match normalized {
+        "Japan" | "日本" => (Some("🇯🇵"), "日本"),
+        "Singapore" | "新加坡" => (Some("🇸🇬"), "新加坡"),
+        "Hong Kong" | "Hong Kong SAR" | "香港" | "中国香港" => (Some("🇭🇰"), "中国香港"),
+        "United States" | "美国" => (Some("🇺🇸"), "美国"),
+        "Taiwan" | "台湾" | "中国台湾" => (Some("🇹🇼"), "中国台湾"),
         "" => return GeoLabel::unknown(),
-        value => ("🌐", value),
+        value => (None, value),
     };
     GeoLabel {
-        flag: flag.to_string(),
+        flag: known_flag
+            .map(str::to_string)
+            .or_else(|| country_code_flag(country_code))
+            .unwrap_or_else(|| "🌐".to_string()),
         country: country.to_string(),
     }
+}
+
+fn country_code_flag(country_code: &str) -> Option<String> {
+    let code = country_code.trim().to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return None;
+    }
+    code.bytes()
+        .map(|byte| char::from_u32(0x1f1e6 + u32::from(byte - b'A')))
+        .collect()
 }
 
 pub(super) fn short_safe_error(error: &str) -> String {
@@ -181,5 +198,21 @@ mod tests {
         assert!(!text.contains("hk-01"));
         assert!(!text.contains("hidden-token"));
         assert!(!text.contains("Server:"));
+    }
+
+    #[test]
+    fn geo_uses_country_code_flag_for_unmapped_country() {
+        let geo = geo_from_country("Germany", "de");
+
+        assert_eq!(geo.flag, "🇩🇪");
+        assert_eq!(geo.country, "Germany");
+    }
+
+    #[test]
+    fn geo_keeps_known_localized_country_label() {
+        let geo = geo_from_country("Taiwan", "TW");
+
+        assert_eq!(geo.flag, "🇹🇼");
+        assert_eq!(geo.country, "中国台湾");
     }
 }

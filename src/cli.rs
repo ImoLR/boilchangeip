@@ -10,10 +10,7 @@ use crate::{
     },
 };
 
-pub fn selection_from_args<'a>(
-    server: Option<&'a str>,
-    all: bool,
-) -> anyhow::Result<ServerSelection<'a>> {
+pub fn selection_from_args(server: Option<&str>, all: bool) -> anyhow::Result<ServerSelection<'_>> {
     anyhow::ensure!(!(server.is_some() && all), "--server 和 --all 不能同时使用");
 
     Ok(match (server, all) {
@@ -192,7 +189,7 @@ fn ensure_new_config_ready(config: &AppConfig) -> anyhow::Result<()> {
     anyhow::bail!("缺少 BOIL_SERVERS 配置，请从 Boil 面板获取新版 Token 后配置。")
 }
 
-fn with_server_hint<'a>(config: &'a AppConfig) -> impl FnOnce(anyhow::Error) -> anyhow::Error + 'a {
+fn with_server_hint(config: &AppConfig) -> impl FnOnce(anyhow::Error) -> anyhow::Error + '_ {
     move |error| {
         let enabled = config
             .servers
@@ -306,6 +303,7 @@ mod tests {
                 provider: ServerProvider::Boil,
                 token: SecretToken::from_test_value("hidden-token"),
                 fachost_seednet: None,
+                pqs: None,
                 enabled: true,
                 address: None,
                 country: None,

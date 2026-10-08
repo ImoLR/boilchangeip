@@ -694,6 +694,7 @@ fn retry_server_if_still_valid<'a>(
     if server.provider != original_server.provider
         || server.token != original_server.token
         || server.fachost_seednet != original_server.fachost_seednet
+        || server.pqs != original_server.pqs
     {
         return None;
     }
@@ -988,6 +989,7 @@ mod tests {
                     provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("token-a"),
                     fachost_seednet: None,
+                    pqs: None,
                     enabled: true,
                     address: None,
                     country: None,
@@ -1004,6 +1006,7 @@ mod tests {
                     provider: ServerProvider::Boil,
                     token: SecretToken::from_test_value("token-b"),
                     fachost_seednet: None,
+                    pqs: None,
                     enabled: false,
                     address: None,
                     country: None,
@@ -1032,6 +1035,7 @@ mod tests {
             provider: ServerProvider::Boil,
             token: SecretToken::from_test_value(&format!("token-{id}")),
             fachost_seednet: None,
+            pqs: None,
             enabled: true,
             address: None,
             country: None,

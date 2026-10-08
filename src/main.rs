@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod core;
 mod fachost;
+mod pqs;
 mod provider;
 mod reconnect;
 mod server_manage;

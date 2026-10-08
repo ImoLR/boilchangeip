@@ -139,9 +139,31 @@ Seednet PPPoE 服务器可使用 `fachost_seednet` Provider；它不保存 Boil 
 }
 ```
 
-`fachost_seednet` 每次 reconnect 最多拨号两轮；每轮最多确认 60 秒，最终只以
+`fachost_seednet` 每次 reconnect 最多拨号两轮；每轮最多确认 120 秒，最终只以
 公网 IPv4 是否变化为成功依据。两轮失败后停止，不进入通用 Timer Retry。
 主控机需要 OpenSSH client，目标 VPS 需要 `curl`；私钥权限必须为 `0600`。
+
+PQS 动态 IP 产品使用 `pqs` Provider。PQS Token 来自产品页“生成 API”后显示的
+查询/更换 URL 最后一段；配置中只保存 Token，不保存完整 URL，也不需要网站账号、
+密码、邮箱验证码或端口检测：
+
+```json
+{
+  "id": "pqs-13425",
+  "name": "PQS TW 动态Hinet 555",
+  "provider": "pqs",
+  "enabled": true,
+  "pqs": {
+    "token": "replace-with-pqs-api-token"
+  }
+}
+```
+
+`pqs` 换 IP 前先查询一次旧公网 IPv4，更换接口每轮只提交一次，然后分别等待
+5、10、15 秒查询新 IP（即提交后的约第 5、15、30 秒）。只有查询到不同的有效
+公网 IPv4 才判定成功。首次未确认时保留待确认状态并进入至少 30 分钟冷却；下次
+触发会先查询，若上次请求已经生效则不会重复提交，仍未变化才允许第二次提交。
+第二次仍未确认后停止自动重试。接口响应不明确时也不会在冷却期内重复提交。
 
 程序按以下顺序查找配置：
 

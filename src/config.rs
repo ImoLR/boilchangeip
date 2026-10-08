@@ -4,6 +4,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use teloxide::prelude::*;
@@ -94,6 +95,7 @@ pub enum ServerProvider {
     #[default]
     Boil,
     FachostSeednet,
+    Pqs,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -102,6 +104,19 @@ pub struct FacHostSeednetConfig {
     pub ssh_port: u16,
     pub ssh_user: String,
     pub ssh_key_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PqsConfig {
+    pub token: SecretToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changeip_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_changeip_available_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_old_ip: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_attempts: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -124,6 +139,8 @@ pub struct ServerConfig {
     pub token: SecretToken,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fachost_seednet: Option<FacHostSeednetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pqs: Option<PqsConfig>,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -263,11 +280,53 @@ pub fn persist_change_ip_cooldown(cooldown: &ChangeIpCooldownConfig) -> anyhow::
     save_app_config(&config)
 }
 
+#[cfg(not(test))]
+pub fn persist_pqs_reconnect_state(
+    server_id: &str,
+    last_changeip_at: Option<i64>,
+    next_changeip_available_at: Option<i64>,
+    pending_old_ip: Option<IpAddr>,
+    pending_attempts: Option<u8>,
+) -> anyhow::Result<()> {
+    let mut config = load_app_config()?;
+    let server = config
+        .servers
+        .iter_mut()
+        .find(|server| server.id == server_id)
+        .with_context(|| format!("未找到 PQS server id: {server_id}"))?;
+    anyhow::ensure!(
+        server.provider == ServerProvider::Pqs,
+        "server id '{server_id}' 不是 PQS Provider"
+    );
+    let pqs = server
+        .pqs
+        .as_mut()
+        .with_context(|| format!("server id '{server_id}' 缺少 pqs 配置"))?;
+    pqs.last_changeip_at = last_changeip_at;
+    pqs.next_changeip_available_at = next_changeip_available_at;
+    pqs.pending_old_ip = pending_old_ip;
+    pqs.pending_attempts = pending_attempts;
+    save_app_config_to_path_inner(&config, &config_path(), false)
+}
+
 pub(crate) fn save_app_config_to_path(
     config: &AppConfig,
     path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    validate_servers(&config.servers)?;
+    save_app_config_to_path_inner(config, path, true)
+}
+
+fn save_app_config_to_path_inner(
+    config: &AppConfig,
+    path: &std::path::Path,
+    preserve_existing_pqs_state: bool,
+) -> anyhow::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut servers = config.servers.clone();
+    if preserve_existing_pqs_state {
+        merge_existing_pqs_runtime_state(&existing, &mut servers);
+    }
+    validate_servers(&servers)?;
     if let Some(timer) = &config.global_timer {
         validate_timer_config(timer).context("BOIL_GLOBAL_TIMER 配置无效")?;
     }
@@ -275,8 +334,7 @@ pub(crate) fn save_app_config_to_path(
         validate_change_ip_cooldown(cooldown).context("BOIL_CHANGEIP_COOLDOWN 配置无效")?;
     }
 
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let servers_json = serde_json::to_string_pretty(&config.servers)?;
+    let servers_json = serde_json::to_string_pretty(&servers)?;
     let servers_line = format!("{BOIL_SERVERS_ENV}={}", shell_single_quote(&servers_json));
     let global_timer_line = match &config.global_timer {
         Some(timer) => {
@@ -410,6 +468,45 @@ pub(crate) fn save_app_config_to_path(
     Ok(())
 }
 
+fn merge_existing_pqs_runtime_state(existing: &str, servers: &mut [ServerConfig]) {
+    let Ok(vars) = parse_config_env_content(existing) else {
+        return;
+    };
+    let Some(existing_servers_json) = vars
+        .iter()
+        .find_map(|(key, value)| (key.as_str() == BOIL_SERVERS_ENV).then_some(value))
+    else {
+        return;
+    };
+    let Ok(existing_servers) = serde_json::from_str::<Vec<ServerConfig>>(existing_servers_json)
+    else {
+        return;
+    };
+
+    for server in servers {
+        if server.provider != ServerProvider::Pqs {
+            continue;
+        }
+        let Some(pqs) = server.pqs.as_mut() else {
+            continue;
+        };
+        let Some(existing_pqs) = existing_servers
+            .iter()
+            .find(|existing_server| {
+                existing_server.id == server.id && existing_server.provider == ServerProvider::Pqs
+            })
+            .and_then(|existing_server| existing_server.pqs.as_ref())
+            .filter(|existing_pqs| existing_pqs.token == pqs.token)
+        else {
+            continue;
+        };
+        pqs.last_changeip_at = existing_pqs.last_changeip_at;
+        pqs.next_changeip_available_at = existing_pqs.next_changeip_available_at;
+        pqs.pending_old_ip = existing_pqs.pending_old_ip;
+        pqs.pending_attempts = existing_pqs.pending_attempts;
+    }
+}
+
 #[cfg(unix)]
 fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -478,6 +575,11 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                     "server id '{}' 不得包含 token",
                     server.id
                 );
+                anyhow::ensure!(
+                    server.pqs.is_none(),
+                    "server id '{}' 的 Boil 配置不得包含 pqs 配置",
+                    server.id
+                );
             }
             ServerProvider::FachostSeednet => {
                 anyhow::ensure!(
@@ -521,6 +623,50 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                 anyhow::ensure!(
                     fachost.ssh_key_path.is_absolute(),
                     "server id '{}' 的 SSH key path 必须是绝对路径",
+                    server.id
+                );
+                anyhow::ensure!(
+                    server.pqs.is_none(),
+                    "server id '{}' 的 fachost_seednet 配置不得包含 pqs 配置",
+                    server.id
+                );
+            }
+            ServerProvider::Pqs => {
+                anyhow::ensure!(
+                    server.token.is_empty(),
+                    "server id '{}' 的 pqs 配置不得包含 Boil token",
+                    server.id
+                );
+                anyhow::ensure!(
+                    server.fachost_seednet.is_none(),
+                    "server id '{}' 的 pqs 配置不得包含 fachost_seednet 配置",
+                    server.id
+                );
+                let pqs = server
+                    .pqs
+                    .as_ref()
+                    .with_context(|| format!("server id '{}' 缺少 pqs 配置", server.id))?;
+                anyhow::ensure!(
+                    !pqs.token.is_empty(),
+                    "server id '{}' 的 PQS token 不能为空",
+                    server.id
+                );
+                anyhow::ensure!(
+                    !server.id.contains(pqs.token.expose_secret())
+                        && !server.name.contains(pqs.token.expose_secret()),
+                    "server id '{}' 的 id/name 不得包含 PQS token",
+                    server.id
+                );
+                if let Some(attempts) = pqs.pending_attempts {
+                    anyhow::ensure!(
+                        (1..=2).contains(&attempts),
+                        "server id '{}' 的 PQS pending_attempts 无效",
+                        server.id
+                    );
+                }
+                anyhow::ensure!(
+                    pqs.pending_old_ip.is_some() == pqs.pending_attempts.is_some(),
+                    "server id '{}' 的 PQS pending 状态不完整",
                     server.id
                 );
             }
@@ -1223,6 +1369,57 @@ mod tests {
     }
 
     #[test]
+    fn pqs_config_loads_with_redacted_provider_token() {
+        let servers = r#"[
+            {
+                "id": "pqs-13425",
+                "name": "PQS TW 动态Hinet 555",
+                "provider": "pqs",
+                "enabled": true,
+                "pqs": {
+                    "token": "pqs-secret-token"
+                }
+            }
+        ]"#;
+        let app = app_from_servers_json(servers).unwrap();
+        let server = &app.servers[0];
+        assert_eq!(server.provider, ServerProvider::Pqs);
+        assert!(server.token.is_empty());
+        assert_eq!(
+            server
+                .pqs
+                .as_ref()
+                .map(|config| config.token.expose_secret()),
+            Some("pqs-secret-token")
+        );
+        assert!(!format!("{app:?}").contains("pqs-secret-token"));
+        assert!(!format!("{server:?}").contains("pqs-secret-token"));
+    }
+
+    #[test]
+    fn pqs_rejects_boil_token_and_incomplete_pending_state() {
+        let with_boil_token = r#"[{
+            "id":"pqs-1","name":"PQS","provider":"pqs",
+            "token":"must-not-be-used","enabled":true,
+            "pqs":{"token":"pqs-secret-token"}
+        }]"#;
+        let error = app_from_servers_json(with_boil_token)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不得包含 Boil token"));
+        assert!(!error.contains("pqs-secret-token"));
+
+        let incomplete_pending = r#"[{
+            "id":"pqs-1","name":"PQS","provider":"pqs","enabled":true,
+            "pqs":{"token":"pqs-secret-token","pending_old_ip":"36.232.26.187"}
+        }]"#;
+        assert!(app_from_servers_json(incomplete_pending)
+            .unwrap_err()
+            .to_string()
+            .contains("pending 状态不完整"));
+    }
+
+    #[test]
     fn multiline_config_keeps_tg_fields_after_boil_servers() {
         let content = format!(
             "BOIL_SERVERS={}\nTG_TOKEN='telegram-token'\nTG_CHAT_ID='12345'\n",
@@ -1374,6 +1571,61 @@ mod tests {
         assert!(saved.contains("BOIL_CHANGEIP_COOLDOWN='"));
         assert!(saved.contains("\"cooldown_seconds\": 63"));
         assert!(saved.contains("TG_TOKEN='keep'"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_config_save_preserves_pqs_runtime_cooldown_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "boilchangeip-config-pqs-state-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.env");
+        let persisted = r#"[{
+            "id":"pqs-13425","name":"Old Name","provider":"pqs","enabled":true,
+            "pqs":{
+                "token":"pqs-secret-token",
+                "last_changeip_at":100,
+                "next_changeip_available_at":1903,
+                "pending_old_ip":"36.232.26.187",
+                "pending_attempts":1
+            }
+        }]"#;
+        std::fs::write(
+            &path,
+            format!("BOIL_SERVERS={}\n", shell_single_quote(persisted)),
+        )
+        .unwrap();
+
+        let mut app = app_from_servers_json(
+            r#"[{
+                "id":"pqs-13425","name":"PQS TW 动态Hinet 555",
+                "provider":"pqs","enabled":true,
+                "pqs":{"token":"pqs-secret-token"}
+            }]"#,
+        )
+        .unwrap();
+        app.servers[0].country = Some("中国台湾".to_string());
+        save_app_config_to_path(&app, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let vars = parse_config_env_content(&saved).unwrap();
+        let servers_json = vars
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == BOIL_SERVERS_ENV).then_some(value))
+            .unwrap();
+        let servers: Vec<ServerConfig> = serde_json::from_str(servers_json).unwrap();
+        let server = &servers[0];
+        assert_eq!(server.name, "PQS TW 动态Hinet 555");
+        assert_eq!(server.country.as_deref(), Some("中国台湾"));
+        let pqs = server.pqs.as_ref().unwrap();
+        assert_eq!(pqs.last_changeip_at, Some(100));
+        assert_eq!(pqs.next_changeip_available_at, Some(1903));
+        assert_eq!(pqs.pending_old_ip, Some("36.232.26.187".parse().unwrap()));
+        assert_eq!(pqs.pending_attempts, Some(1));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

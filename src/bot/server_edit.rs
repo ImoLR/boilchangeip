@@ -267,7 +267,7 @@ pub(super) async fn revalidate_server(
             return;
         }
     };
-    let metadata_source = if server.provider == ServerProvider::FachostSeednet {
+    let metadata_source = if server.provider != ServerProvider::Boil {
         current_ip.to_string()
     } else {
         address.clone()

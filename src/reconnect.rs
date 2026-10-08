@@ -13,6 +13,7 @@ use crate::{
         ServerSelection,
     },
     fachost::FacHostReconnectPolicy,
+    pqs::PqsError,
     provider::ProviderClients,
 };
 
@@ -20,6 +21,7 @@ static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>
     OnceLock::new();
 static CHANGE_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CHANGE_IP_COOLDOWN: OnceLock<Mutex<ChangeIpCooldownState>> = OnceLock::new();
+static PQS_RECONNECT_STATES: OnceLock<Mutex<HashMap<String, PqsReconnectEntry>>> = OnceLock::new();
 
 const SUCCESS_MESSAGE: &str = "换 IP 已完成";
 const UNCONFIRMED_MESSAGE: &str =
@@ -27,6 +29,38 @@ const UNCONFIRMED_MESSAGE: &str =
 const CHANGE_RESPONSE_UNCONFIRMED_MESSAGE: &str =
     "换 IP 请求已发出，但 Boil API 响应暂时无法确认，正在查询最终 IP。";
 const CHANGE_IP_COOLDOWN_SAFETY_MARGIN: Duration = Duration::from_secs(3);
+const PQS_CHANGE_INTERVAL_WITH_MARGIN: Duration = Duration::from_secs(30 * 60 + 3);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PqsReconnectPolicy {
+    confirmation_delays: [Duration; 3],
+}
+
+impl Default for PqsReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            confirmation_delays: [
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(15),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PqsReconnectState {
+    last_changeip_at: Option<i64>,
+    next_changeip_available_at: Option<i64>,
+    pending_old_ip: Option<IpAddr>,
+    pending_attempts: Option<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PqsReconnectEntry {
+    token: crate::config::SecretToken,
+    state: PqsReconnectState,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconnectPolicy {
@@ -358,7 +392,225 @@ where
             result.provider_dial_count = outcome.provider_dial_count;
             result
         }
+        ServerProvider::Pqs => {
+            reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+                clients,
+                server,
+                current_ip,
+                cooldown_mode,
+                &PqsReconnectPolicy::default(),
+                on_progress,
+                on_cooldown,
+            )
+            .await
+        }
     }
+}
+
+async fn reconnect_pqs_one_with_current_ip_progress_cooldown_notify<F, Fut, C, CFut>(
+    clients: &ProviderClients,
+    server: &ServerConfig,
+    current_ip: Option<IpAddr>,
+    cooldown_mode: ChangeIpCooldownMode,
+    policy: &PqsReconnectPolicy,
+    mut on_progress: F,
+    mut on_cooldown: C,
+) -> ReconnectResult
+where
+    F: FnMut(ReconnectProgress) -> Fut,
+    Fut: Future<Output = ()>,
+    C: FnMut(ReconnectCooldown) -> CFut,
+    CFut: Future<Output = ()>,
+{
+    if !server.enabled {
+        return base_result(
+            server,
+            ReconnectStatus::Disabled,
+            Some("server is disabled"),
+        );
+    }
+    if server.pqs.is_none() {
+        return base_result(
+            server,
+            ReconnectStatus::InvalidResponse,
+            Some("缺少 pqs Provider 配置"),
+        );
+    }
+
+    let lock = server_lock(&server.id);
+    let _server_guard = lock.lock().await;
+    let mut observed_ip = match current_ip {
+        Some(ip) => ip,
+        None => match clients.get_ip(server).await {
+            Ok(ip) => ip,
+            Err(error) => {
+                return base_result(
+                    server,
+                    ReconnectStatus::PreflightFailed,
+                    Some(&error.to_string()),
+                )
+            }
+        },
+    };
+
+    loop {
+        let state = pqs_reconnect_state(server);
+        if let Some(previous_old_ip) = state.pending_old_ip {
+            if observed_ip != previous_old_ip {
+                clear_pqs_pending_state(server);
+                let mut result = base_result(
+                    server,
+                    ReconnectStatus::Success,
+                    Some("已确认上一次 PQS 换 IP 请求生效，本次未重复提交"),
+                );
+                result.old_ip = Some(previous_old_ip);
+                result.new_ip = Some(observed_ip);
+                result.changed = true;
+                result.next_allowed_at = state.next_changeip_available_at;
+                return result;
+            }
+        }
+
+        let now = unix_now();
+        let Some(available_at) = state
+            .next_changeip_available_at
+            .filter(|available_at| *available_at > now)
+        else {
+            break;
+        };
+        let cooldown = ReconnectCooldown {
+            remaining: Duration::from_secs(available_at.saturating_sub(now) as u64),
+            available_at,
+        };
+        match cooldown_mode {
+            ChangeIpCooldownMode::FailFast => {
+                let mut result = base_result(
+                    server,
+                    ReconnectStatus::RateLimited,
+                    Some(&manual_cooldown_message(cooldown.remaining)),
+                );
+                result.old_ip = Some(observed_ip);
+                result.next_allowed_at = Some(available_at);
+                return result;
+            }
+            ChangeIpCooldownMode::Wait => {
+                on_cooldown(cooldown).await;
+                tokio::time::sleep(cooldown.remaining).await;
+                observed_ip = match clients.get_ip(server).await {
+                    Ok(ip) => ip,
+                    Err(error) => {
+                        let mut result = base_result(
+                            server,
+                            ReconnectStatus::PreflightFailed,
+                            Some(&error.to_string()),
+                        );
+                        result.old_ip = Some(observed_ip);
+                        return result;
+                    }
+                };
+            }
+        }
+    }
+
+    let previous_state = pqs_reconnect_state(server);
+    let attempt_number = if previous_state.pending_old_ip == Some(observed_ip) {
+        previous_state
+            .pending_attempts
+            .unwrap_or(1)
+            .saturating_add(1)
+            .min(2)
+    } else {
+        1
+    };
+
+    let _change_guard = CHANGE_IP_LOCK.lock().await;
+    let request_at = unix_now();
+    let next_allowed_at =
+        request_at.saturating_add(duration_secs_i64(PQS_CHANGE_INTERVAL_WITH_MARGIN));
+    if let Err(error) = record_pqs_change_attempt(
+        server,
+        request_at,
+        next_allowed_at,
+        observed_ip,
+        attempt_number,
+    ) {
+        let mut result = base_result(
+            server,
+            ReconnectStatus::ProviderFailed,
+            Some(&format!(
+                "无法安全保存 PQS 冷却状态，未发送换 IP 请求: {error}"
+            )),
+        );
+        result.old_ip = Some(observed_ip);
+        return result;
+    }
+
+    let change_result = clients.pqs().change_ip(server.pqs.as_ref().unwrap()).await;
+    drop(_change_guard);
+
+    let mut result = base_result(
+        server,
+        ReconnectStatus::ChangeAcceptedButUnconfirmed,
+        Some("PQS 换 IP 请求已提交，正在确认新的公网 IPv4"),
+    );
+    result.old_ip = Some(observed_ip);
+    result.next_allowed_at = Some(next_allowed_at);
+    result.dial_attempts = 1;
+
+    if let Err(error) = change_result {
+        if error.is_definite_rejection() {
+            clear_pqs_pending_state(server);
+            result.status = match error {
+                PqsError::RateLimited => ReconnectStatus::RateLimited,
+                _ => ReconnectStatus::ApiRejected,
+            };
+            result.message = Some(error.to_string());
+            return result;
+        }
+        result.message =
+            Some("PQS 更换接口响应无法确认；请求可能已经生效，仅查询结果且不重复提交".to_string());
+    }
+
+    on_progress(ReconnectProgress::VerifyingNewIp {
+        old_ip: observed_ip,
+    })
+    .await;
+
+    for (index, delay) in policy.confirmation_delays.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
+        result.poll_attempts = index + 1;
+        match clients.get_ip(server).await {
+            Ok(ip) if ip != observed_ip => {
+                clear_pqs_pending_state(server);
+                result.new_ip = Some(ip);
+                result.changed = true;
+                result.status = ReconnectStatus::Success;
+                result.message = Some(SUCCESS_MESSAGE.to_string());
+                return result;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::debug!(
+                    "PQS 换 IP 后验证暂时失败: server_id={} attempt={}: {}",
+                    result.server_id,
+                    index + 1,
+                    redact_for_result(&error.to_string(), server)
+                );
+            }
+        }
+    }
+
+    if attempt_number >= 2 {
+        clear_pqs_pending_state(server);
+        result.status = ReconnectStatus::ProviderFailed;
+        result.message = Some("PQS 第二次换 IP 后仍未确认新 IP，已停止自动重试".to_string());
+    } else {
+        result.message = Some(
+            "PQS 换 IP 已提交但暂未确认；30 分钟后再次触发时会先查询，确认未变化才允许第二次提交"
+                .to_string(),
+        );
+    }
+    result
 }
 
 fn fachost_reconnect_status(changed: bool, provider_confirmed_success: bool) -> ReconnectStatus {
@@ -688,6 +940,109 @@ where
     }
 }
 
+fn pqs_reconnect_states() -> &'static Mutex<HashMap<String, PqsReconnectEntry>> {
+    PQS_RECONNECT_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pqs_reconnect_state(server: &ServerConfig) -> PqsReconnectState {
+    let Some(pqs) = server.pqs.as_ref() else {
+        return PqsReconnectState::default();
+    };
+    let configured = PqsReconnectState {
+        last_changeip_at: pqs.last_changeip_at,
+        next_changeip_available_at: pqs.next_changeip_available_at,
+        pending_old_ip: pqs.pending_old_ip,
+        pending_attempts: pqs.pending_attempts,
+    };
+    let mut states = pqs_reconnect_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = states
+        .entry(server.id.clone())
+        .or_insert_with(|| PqsReconnectEntry {
+            token: pqs.token.clone(),
+            state: configured,
+        });
+    if entry.token != pqs.token {
+        *entry = PqsReconnectEntry {
+            token: pqs.token.clone(),
+            state: configured,
+        };
+    }
+    entry.state
+}
+
+fn record_pqs_change_attempt(
+    server: &ServerConfig,
+    request_at: i64,
+    next_allowed_at: i64,
+    old_ip: IpAddr,
+    attempt_number: u8,
+) -> anyhow::Result<()> {
+    let state = PqsReconnectState {
+        last_changeip_at: Some(request_at),
+        next_changeip_available_at: Some(next_allowed_at),
+        pending_old_ip: Some(old_ip),
+        pending_attempts: Some(attempt_number),
+    };
+    persist_pqs_reconnect_state(server, state)?;
+    pqs_reconnect_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            server.id.clone(),
+            PqsReconnectEntry {
+                token: server.pqs.as_ref().unwrap().token.clone(),
+                state,
+            },
+        );
+    Ok(())
+}
+
+fn clear_pqs_pending_state(server: &ServerConfig) {
+    let mut state = pqs_reconnect_state(server);
+    state.pending_old_ip = None;
+    state.pending_attempts = None;
+    if let Err(error) = persist_pqs_reconnect_state(server, state) {
+        log::warn!(
+            "PQS reconnect state persistence failed: server_id={}: {error}",
+            server.id
+        );
+    }
+    pqs_reconnect_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            server.id.clone(),
+            PqsReconnectEntry {
+                token: server.pqs.as_ref().unwrap().token.clone(),
+                state,
+            },
+        );
+}
+
+#[cfg(not(test))]
+fn persist_pqs_reconnect_state(
+    server: &ServerConfig,
+    state: PqsReconnectState,
+) -> anyhow::Result<()> {
+    crate::config::persist_pqs_reconnect_state(
+        &server.id,
+        state.last_changeip_at,
+        state.next_changeip_available_at,
+        state.pending_old_ip,
+        state.pending_attempts,
+    )
+}
+
+#[cfg(test)]
+fn persist_pqs_reconnect_state(
+    _server: &ServerConfig,
+    _state: PqsReconnectState,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn base_result(
     server: &ServerConfig,
     status: ReconnectStatus,
@@ -710,12 +1065,20 @@ fn base_result(
 }
 
 fn redact_for_result(value: &str, server: &ServerConfig) -> String {
-    let token = server.token.expose_secret();
-    if token.is_empty() {
-        value.to_string()
-    } else {
-        value.replace(token, "<redacted>")
+    let mut redacted = value.to_string();
+    for token in [
+        server.token.expose_secret(),
+        server
+            .pqs
+            .as_ref()
+            .map(|config| config.token.expose_secret())
+            .unwrap_or_default(),
+    ] {
+        if !token.is_empty() {
+            redacted = redacted.replace(token, "<redacted>");
+        }
     }
+    redacted
 }
 
 fn preflight_error_status(error: &BoilApiError) -> ReconnectStatus {
@@ -905,7 +1268,7 @@ fn server_lock(server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SecretToken, ServerProvider};
+    use crate::config::{PqsConfig, SecretToken, ServerProvider};
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicUsize, Ordering},
@@ -1101,10 +1464,34 @@ mod tests {
             provider: ServerProvider::Boil,
             token: SecretToken::from_test_value(&test_credential()),
             fachost_seednet: None,
+            pqs: None,
             enabled,
             address: None,
             country: None,
             flag: None,
+            resolved_ip: None,
+            timer: None,
+        }
+    }
+
+    fn pqs_server(id: &str) -> ServerConfig {
+        ServerConfig {
+            id: id.to_string(),
+            name: "PQS TW 动态Hinet 555".to_string(),
+            provider: ServerProvider::Pqs,
+            token: SecretToken::default(),
+            fachost_seednet: None,
+            pqs: Some(PqsConfig {
+                token: SecretToken::from_test_value("pqs-hidden-token"),
+                last_changeip_at: None,
+                next_changeip_available_at: None,
+                pending_old_ip: None,
+                pending_attempts: None,
+            }),
+            enabled: true,
+            address: None,
+            country: Some("中国台湾".to_string()),
+            flag: Some("🇹🇼".to_string()),
             resolved_ip: None,
             timer: None,
         }
@@ -1129,6 +1516,19 @@ mod tests {
             poll_interval: Duration::ZERO,
             max_poll_attempts: attempts,
         }
+    }
+
+    fn pqs_policy() -> PqsReconnectPolicy {
+        PqsReconnectPolicy {
+            confirmation_delays: [Duration::ZERO; 3],
+        }
+    }
+
+    fn pqs_change_count(mock: &MockServer) -> usize {
+        mock.records()
+            .iter()
+            .filter(|path| path.starts_with("/ipch/"))
+            .count()
     }
 
     fn test_credential() -> String {
@@ -1266,6 +1666,215 @@ mod tests {
             manual_cooldown_message(hit.remaining),
             "⏳ 换 IP 频率限制中\n\n预计 59 秒后可再次换 IP"
         );
+    }
+
+    #[tokio::test]
+    async fn pqs_submits_once_and_confirms_with_three_read_only_queries() {
+        let mock = MockServer::start(vec![
+            ip("36.232.26.187"),
+            response(200, "Success"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.188"),
+        ])
+        .await;
+        let clients = ProviderClients::with_pqs_api_base_url(&mock.base_url).unwrap();
+        let server = pqs_server("pqs-success");
+
+        let result = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert_eq!(result.old_ip, Some("36.232.26.187".parse().unwrap()));
+        assert_eq!(result.new_ip, Some("36.232.26.188".parse().unwrap()));
+        assert_eq!(result.poll_attempts, 3);
+        assert_eq!(result.dial_attempts, 1);
+        assert_eq!(pqs_change_count(&mock), 1);
+        assert_eq!(mock.records().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn pqs_unconfirmed_first_attempt_is_cooled_down_without_immediate_redial() {
+        let mock = MockServer::start(vec![
+            ip("36.232.26.187"),
+            response(200, "Success"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+        ])
+        .await;
+        let clients = ProviderClients::with_pqs_api_base_url(&mock.base_url).unwrap();
+        let server = pqs_server("pqs-cooldown");
+
+        let first = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+        let second = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            Some("36.232.26.187".parse().unwrap()),
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+
+        assert_eq!(first.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
+        assert_eq!(first.poll_attempts, 3);
+        assert_eq!(second.status, ReconnectStatus::RateLimited);
+        assert_eq!(pqs_change_count(&mock), 1);
+        assert_eq!(mock.records().len(), 5);
+        assert!(second.next_allowed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn pqs_late_change_is_detected_before_delayed_second_attempt() {
+        let mock = MockServer::start(vec![
+            ip("36.232.26.187"),
+            response(200, "Success"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.188"),
+        ])
+        .await;
+        let clients = ProviderClients::with_pqs_api_base_url(&mock.base_url).unwrap();
+        let server = pqs_server("pqs-late-success");
+
+        let first = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+        {
+            let mut states = pqs_reconnect_states()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states
+                .get_mut(&server.id)
+                .unwrap()
+                .state
+                .next_changeip_available_at = Some(unix_now().saturating_sub(1));
+        }
+        let second = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+
+        assert_eq!(first.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
+        assert_eq!(second.status, ReconnectStatus::Success);
+        assert_eq!(second.dial_attempts, 0);
+        assert_eq!(second.old_ip, Some("36.232.26.187".parse().unwrap()));
+        assert_eq!(second.new_ip, Some("36.232.26.188".parse().unwrap()));
+        assert_eq!(pqs_change_count(&mock), 1);
+        assert_eq!(mock.records().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn pqs_second_attempt_waits_for_cooldown_and_then_stops() {
+        let mock = MockServer::start(vec![
+            ip("36.232.26.187"),
+            response(200, "Success"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            response(200, "Success"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+            ip("36.232.26.187"),
+        ])
+        .await;
+        let clients = ProviderClients::with_pqs_api_base_url(&mock.base_url).unwrap();
+        let server = pqs_server("pqs-second-attempt");
+
+        let first = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+        {
+            let mut states = pqs_reconnect_states()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states
+                .get_mut(&server.id)
+                .unwrap()
+                .state
+                .next_changeip_available_at = Some(unix_now().saturating_sub(1));
+        }
+        let second = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+
+        assert_eq!(first.status, ReconnectStatus::ChangeAcceptedButUnconfirmed);
+        assert_eq!(second.status, ReconnectStatus::ProviderFailed);
+        assert_eq!(second.dial_attempts, 1);
+        assert_eq!(pqs_change_count(&mock), 2);
+        assert_eq!(mock.records().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn pqs_ambiguous_change_response_is_polled_without_repeat_submission() {
+        let mock =
+            MockServer::start(vec![ip("36.232.26.187"), disconnect(), ip("36.232.26.188")]).await;
+        let clients = ProviderClients::with_pqs_api_base_url(&mock.base_url).unwrap();
+        let server = pqs_server("pqs-ambiguous");
+
+        let result = reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
+            &clients,
+            &server,
+            None,
+            ChangeIpCooldownMode::FailFast,
+            &pqs_policy(),
+            |_| async {},
+            |_| async {},
+        )
+        .await;
+
+        assert_eq!(result.status, ReconnectStatus::Success);
+        assert_eq!(pqs_change_count(&mock), 1);
+        assert_eq!(mock.records().len(), 3);
+        assert!(!format!("{result:?}").contains("pqs-hidden-token"));
     }
 
     #[tokio::test]

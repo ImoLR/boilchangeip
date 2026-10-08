@@ -4,17 +4,20 @@ use crate::{
     boil::BoilClient,
     config::{ServerConfig, ServerProvider},
     fachost::{FacHostError, FacHostSeednetClient},
+    pqs::{PqsClient, PqsError},
 };
 
 pub struct ProviderClients {
     boil: BoilClient,
     fachost_seednet: FacHostSeednetClient,
+    pqs: PqsClient,
 }
 
 #[derive(Debug)]
 pub enum ProviderError {
     Boil(crate::boil::BoilApiError),
     FacHost(FacHostError),
+    Pqs(PqsError),
     InvalidConfiguration(&'static str),
 }
 
@@ -23,6 +26,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             Self::Boil(error) => error.fmt(f),
             Self::FacHost(error) => error.fmt(f),
+            Self::Pqs(error) => error.fmt(f),
             Self::InvalidConfiguration(message) => f.write_str(message),
         }
     }
@@ -35,6 +39,7 @@ impl ProviderClients {
         Ok(Self {
             boil: BoilClient::new()?,
             fachost_seednet: FacHostSeednetClient,
+            pqs: PqsClient::new()?,
         })
     }
 
@@ -59,6 +64,15 @@ impl ProviderClients {
                     .await
                     .map_err(ProviderError::FacHost)
             }
+            ServerProvider::Pqs => {
+                let config = server
+                    .pqs
+                    .as_ref()
+                    .ok_or(ProviderError::InvalidConfiguration(
+                        "缺少 pqs Provider 配置",
+                    ))?;
+                self.pqs.get_ip(config).await.map_err(ProviderError::Pqs)
+            }
         }
     }
 
@@ -68,5 +82,18 @@ impl ProviderClients {
 
     pub(crate) fn fachost_seednet(&self) -> &FacHostSeednetClient {
         &self.fachost_seednet
+    }
+
+    pub(crate) fn pqs(&self) -> &PqsClient {
+        &self.pqs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pqs_api_base_url(api_base_url: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            boil: BoilClient::new()?,
+            fachost_seednet: FacHostSeednetClient,
+            pqs: PqsClient::with_api_base_url(api_base_url)?,
+        })
     }
 }

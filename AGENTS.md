@@ -10,8 +10,10 @@ Default to read-only analysis until the requested change is understood.
 
 - Never call the real Boil reconnect API.
 - Never run any command or code path that may consume real IP change quota.
-- Never automatically start, enable, restart, stop, or install systemd services.
-- Never modify `config.env`.
+- Do not start, enable, restart, stop, or install systemd services unless the
+  user explicitly authorizes the exact host, service, and action.
+- Do not modify a real `config.env` unless the user explicitly authorizes the
+  exact host and configuration change.
 - Follow the explicit-authorization requirements in the Git Policy below.
 - Never install dependencies unless the user explicitly asks for it.
 - Never start the application unless the user explicitly asks for it and the
@@ -76,7 +78,13 @@ Do not execute them against the real Boil service.
 
 ## Configuration Policy
 
-Do not modify `config.env`.
+Do not modify a real `config.env` without explicit user authorization for the
+exact host and requested configuration change. If the requested work needs such
+a change, explain that it is protected and ask for authorization before writing.
+
+After authorization, back up the file, preserve unrelated settings and file
+permissions, validate the resulting configuration before restarting anything,
+and never print credentials or tokens.
 
 Allowed configuration-related files include examples, documentation, and test
 fixtures, provided they do not contain real secrets.
@@ -86,9 +94,12 @@ messages, commits, or documentation examples.
 
 ## Systemd Policy
 
-Do not run commands that install, enable, disable, restart, or stop services.
+Do not run commands that install, enable, disable, restart, or stop services
+without explicit user authorization for the exact host, service, and action. If
+the requested work needs such an operation, explain that it is protected and ask
+for authorization before proceeding.
 
-Forbidden examples:
+Protected examples that require explicit authorization:
 
 - `boil service install`
 - `boil service uninstall`
@@ -98,6 +109,11 @@ Forbidden examples:
 
 Reviewing `service.rs` or install scripts is allowed. Editing them is allowed
 only after analysis and, for new features, an approved design.
+
+After authorization, confirm the target host and service read-only before the
+operation, preserve existing configuration, and perform read-only acceptance
+checks afterward. Authorization is scoped to the requested operation and does
+not permit real reconnect or quota-consuming tests.
 
 ## Git Policy
 

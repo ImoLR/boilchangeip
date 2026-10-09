@@ -12,7 +12,7 @@ use crate::config::AppConfig;
 use super::{
     change::{tg_change, tg_check},
     pairing::handle_pair_command,
-    server_edit::handle_server_edit_input,
+    server_edit::{handle_server_edit_input, show_token_server_picker},
     server_list::show_servers,
     server_wizard::{handle_add_server_input, start_add_server_wizard},
     state::{BotShared, UiPage, UiSessionStore},
@@ -41,6 +41,8 @@ pub(super) enum Command {
     Servers,
     #[command(description = "添加服务器 Token")]
     Addserver,
+    #[command(description = "修改服务器 Token")]
+    Edittoken,
     #[command(description = "配对 Telegram Bot")]
     Pair(String),
 }
@@ -160,6 +162,10 @@ pub(super) async fn handle_command(
         Command::Addserver => {
             start_add_server_wizard(&bot, msg.chat.id, &shared.server_wizards).await
         }
+        Command::Edittoken => {
+            let config_snapshot = shared.config.lock().await.clone();
+            show_token_server_picker(&bot, msg.chat.id, &config_snapshot).await;
+        }
         Command::Pair(_) => unreachable!("pair command is handled before authorization"),
     }
     Ok(())
@@ -257,6 +263,7 @@ fn bot_command_specs() -> &'static [(&'static str, &'static str)] {
         ("timer", "管理定时换 IP"),
         ("servers", "查看服务器列表"),
         ("addserver", "添加服务器 Token"),
+        ("edittoken", "修改服务器 Token"),
         ("help", "查看使用帮助"),
     ]
 }
@@ -267,6 +274,10 @@ pub(super) fn start_menu_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("➕ 添加服务器", "menu:addserver"),
             InlineKeyboardButton::callback("🖥 服务器列表", "menu:servers"),
         ],
+        vec![InlineKeyboardButton::callback(
+            "🔑 修改 Token",
+            "menu:edittoken",
+        )],
         vec![
             InlineKeyboardButton::callback("📊 查看状态", "menu:status"),
             InlineKeyboardButton::callback("🔄 更换 IP", "menu:change"),
@@ -348,6 +359,7 @@ mod tests {
                 "timer",
                 "servers",
                 "addserver",
+                "edittoken",
                 "help"
             ]
         );
@@ -395,6 +407,10 @@ mod tests {
             Ok(Command::Addserver)
         ));
         assert!(matches!(
+            Command::parse("/edittoken", ""),
+            Ok(Command::Edittoken)
+        ));
+        assert!(matches!(
             Command::parse("/pair TEST-CODE", ""),
             Ok(Command::Pair(code)) if code == "TEST-CODE"
         ));
@@ -420,6 +436,8 @@ mod tests {
 
         assert!(debug.contains("➕ 添加服务器"));
         assert!(debug.contains("🖥 服务器列表"));
+        assert!(debug.contains("🔑 修改 Token"));
+        assert!(debug.contains("menu:edittoken"));
         assert!(debug.contains("📊 查看状态"));
         assert!(debug.contains("🔄 更换 IP"));
         assert!(debug.contains("⏰ 定时换 IP"));

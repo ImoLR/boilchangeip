@@ -171,6 +171,37 @@ pub(super) async fn save_config_and_reload(
     let _ = bot.send_message(chat_id, success).await;
 }
 
+pub(super) fn token_server_picker_keyboard(config: &AppConfig) -> Option<InlineKeyboardMarkup> {
+    let rows: Vec<Vec<InlineKeyboardButton>> = config
+        .servers
+        .iter()
+        .filter(|server| server.provider == ServerProvider::Boil)
+        .map(|server| {
+            vec![InlineKeyboardButton::callback(
+                format!("🔑 {}", server.name),
+                format!("server_edit_token:{}", server.id),
+            )]
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(InlineKeyboardMarkup::new(rows))
+}
+
+pub(super) async fn show_token_server_picker(bot: &Bot, chat_id: ChatId, config: &AppConfig) {
+    let Some(keyboard) = token_server_picker_keyboard(config) else {
+        let _ = bot
+            .send_message(chat_id, "没有使用 Boil Token 的服务器")
+            .await;
+        return;
+    };
+    let _ = bot
+        .send_message(chat_id, "请选择要修改 Token 的服务器：")
+        .reply_markup(keyboard)
+        .await;
+}
+
 pub(super) async fn show_server_edit_menu(
     bot: &Bot,
     chat_id: ChatId,
@@ -292,4 +323,32 @@ pub(super) async fn revalidate_server(
         return;
     }
     save_config_and_reload(bot, chat_id, config, timer, next, "✅ 服务器已重新验证").await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bot::test_support::app_config;
+
+    #[test]
+    fn token_picker_lists_only_boil_servers_without_tokens() {
+        let mut config = app_config();
+        config.servers[1].provider = ServerProvider::Pqs;
+
+        let debug = format!("{:?}", token_server_picker_keyboard(&config).unwrap());
+
+        assert!(debug.contains("server_edit_token:hk-01"));
+        assert!(!debug.contains("server_edit_token:jp_02"));
+        assert!(!debug.contains("hidden-token"));
+    }
+
+    #[test]
+    fn token_picker_is_empty_without_boil_servers() {
+        let mut config = app_config();
+        for server in &mut config.servers {
+            server.provider = ServerProvider::Pqs;
+        }
+
+        assert!(token_server_picker_keyboard(&config).is_none());
+    }
 }

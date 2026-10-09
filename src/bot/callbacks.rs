@@ -9,7 +9,7 @@ use super::{
     commands::send_help,
     pairing::is_authorized_callback_chat,
     server_delete::{delete_server_from_config, show_server_delete_confirmation},
-    server_edit::{revalidate_server, show_server_edit_menu},
+    server_edit::{revalidate_server, show_server_edit_menu, show_token_server_picker},
     server_list::{move_server, show_servers},
     server_wizard::start_add_server_wizard,
     state::{BotShared, ServerEditMode, TimerInputMode},
@@ -23,6 +23,7 @@ use super::{
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CallbackAction<'a> {
     MenuAddServer,
+    MenuEditToken,
     MenuServers,
     MenuStatus,
     MenuChange,
@@ -78,6 +79,10 @@ pub(super) async fn handle_callback(
     match parse_callback(data) {
         CallbackAction::MenuAddServer => {
             start_add_server_wizard(&bot, chat_id, &shared.server_wizards).await;
+        }
+        CallbackAction::MenuEditToken => {
+            let config_snapshot = shared.config.lock().await.clone();
+            show_token_server_picker(&bot, chat_id, &config_snapshot).await;
         }
         CallbackAction::MenuServers => {
             let task_shared = shared.clone();
@@ -449,6 +454,7 @@ pub(super) fn parse_callback(data: &str) -> CallbackAction<'_> {
 
     match data {
         "menu:addserver" => return CallbackAction::MenuAddServer,
+        "menu:edittoken" => return CallbackAction::MenuEditToken,
         "menu:servers" => return CallbackAction::MenuServers,
         "menu:status" => return CallbackAction::MenuStatus,
         "menu:change" => return CallbackAction::MenuChange,
@@ -552,6 +558,18 @@ mod tests {
                 server_id: "hk-01",
                 nonce: "nonce-value"
             }
+        );
+    }
+
+    #[test]
+    fn edit_token_menu_callback_is_routable() {
+        assert_eq!(
+            parse_callback("menu:edittoken"),
+            CallbackAction::MenuEditToken
+        );
+        assert_eq!(
+            parse_callback("server_edit_token:hk-01"),
+            CallbackAction::ServerEditToken("hk-01")
         );
     }
 

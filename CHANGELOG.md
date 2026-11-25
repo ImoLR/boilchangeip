@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.2.23 - 2026-11-25
+
+### 新增
+
+- 新增 `tcscloud_seednet` Provider：通过专用 SSH key 在 Tcscloud 动态 IP VPS 内部调用厂商 `getip` / `changeip` 接口，支持 Telegram 查 IP / 手动换 IP、`/status` 和全局定时换 IP。
+- 换 IP 在 VPS 上分离启动（SSH 会因 IP 变化断开），等待 30 秒后每 10 秒查询一次，最长 5 分钟；只以查到不同的有效公网 IPv4 作为成功依据。窗口结束时 VPS 可达且仍是旧 IP 才最多再换一次；不可达只报告未确认。
+- 确认窗口内不占用全局换 IP 锁，其他服务器的换 IP 不会被阻塞。
+
+### 安全
+
+- `tcscloud_seednet` 的 SSH 主机密钥固定在专用 known_hosts（`StrictHostKeyChecking=yes`、`HostKeyAlias`、忽略 ssh_config），旧 IP 被分配给别人时不会连到陌生机器执行命令；远程命令为固定常量，配置不能注入命令。
+
 ## v2.2.22 - 2026-10-09
 
 ### 新增

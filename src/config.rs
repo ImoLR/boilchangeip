@@ -96,6 +96,7 @@ pub enum ServerProvider {
     Boil,
     FachostSeednet,
     Pqs,
+    TcscloudSeednet,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -104,6 +105,28 @@ pub struct FacHostSeednetConfig {
     pub ssh_port: u16,
     pub ssh_user: String,
     pub ssh_key_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TcscloudSeednetConfig {
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub ssh_user: String,
+    pub ssh_key_path: PathBuf,
+    /// Dedicated known_hosts file with the pinned host key (strict checking, never accept-new).
+    pub known_hosts_path: PathBuf,
+    /// Name the pinned key is stored under; defaults to `ssh_host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_alias: Option<String>,
+}
+
+impl TcscloudSeednetConfig {
+    pub fn host_key_alias(&self) -> &str {
+        self.host_key_alias
+            .as_deref()
+            .filter(|alias| !alias.trim().is_empty())
+            .unwrap_or(&self.ssh_host)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -141,6 +164,8 @@ pub struct ServerConfig {
     pub fachost_seednet: Option<FacHostSeednetConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pqs: Option<PqsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcscloud_seednet: Option<TcscloudSeednetConfig>,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -580,6 +605,7 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                     "server id '{}' 的 Boil 配置不得包含 pqs 配置",
                     server.id
                 );
+                ensure_no_tcscloud_config(server)?;
             }
             ServerProvider::FachostSeednet => {
                 anyhow::ensure!(
@@ -630,6 +656,7 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                     "server id '{}' 的 fachost_seednet 配置不得包含 pqs 配置",
                     server.id
                 );
+                ensure_no_tcscloud_config(server)?;
             }
             ServerProvider::Pqs => {
                 anyhow::ensure!(
@@ -669,7 +696,9 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                     "server id '{}' 的 PQS pending 状态不完整",
                     server.id
                 );
+                ensure_no_tcscloud_config(server)?;
             }
+            ServerProvider::TcscloudSeednet => validate_tcscloud_server(server)?,
         }
         if let Some(timer) = &server.timer {
             validate_timer_config(timer)
@@ -678,6 +707,90 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
         anyhow::ensure!(ids.insert(&server.id), "server id '{}' 重复", server.id);
     }
 
+    Ok(())
+}
+
+fn ensure_no_tcscloud_config(server: &ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        server.tcscloud_seednet.is_none(),
+        "server id '{}' 只有 tcscloud_seednet Provider 可以包含 tcscloud_seednet 配置",
+        server.id
+    );
+    Ok(())
+}
+
+fn is_safe_ssh_host(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.starts_with('-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b':'
+        })
+}
+
+fn validate_tcscloud_server(server: &ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        server.token.is_empty(),
+        "server id '{}' 的 tcscloud_seednet 配置不得包含 Boil token",
+        server.id
+    );
+    anyhow::ensure!(
+        server.fachost_seednet.is_none() && server.pqs.is_none(),
+        "server id '{}' 的 tcscloud_seednet 配置不得包含其他 Provider 配置",
+        server.id
+    );
+    let tcs = server
+        .tcscloud_seednet
+        .as_ref()
+        .with_context(|| format!("server id '{}' 缺少 tcscloud_seednet 配置", server.id))?;
+    anyhow::ensure!(
+        is_safe_ssh_host(&tcs.ssh_host),
+        "server id '{}' 的 SSH host 为空或含非法字符",
+        server.id
+    );
+    anyhow::ensure!(
+        tcs.ssh_port > 0,
+        "server id '{}' 的 SSH port 无效",
+        server.id
+    );
+    anyhow::ensure!(
+        !tcs.ssh_user.trim().is_empty()
+            && !tcs.ssh_user.starts_with('-')
+            && tcs
+                .ssh_user
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
+        "server id '{}' 的 SSH user 为空或含非法字符",
+        server.id
+    );
+    anyhow::ensure!(
+        tcs.ssh_key_path.is_absolute(),
+        "server id '{}' 的 SSH key path 必须是绝对路径",
+        server.id
+    );
+    anyhow::ensure!(
+        tcs.known_hosts_path.is_absolute(),
+        "server id '{}' 的 known_hosts path 必须是绝对路径",
+        server.id
+    );
+    // ssh splits UserKnownHostsFile on whitespace and expands `%` tokens in both paths.
+    anyhow::ensure!(
+        [&tcs.ssh_key_path, &tcs.known_hosts_path]
+            .iter()
+            .all(|path| {
+                path.to_str().is_some_and(|value| {
+                    !value.contains(char::is_whitespace) && !value.contains('%')
+                })
+            }),
+        "server id '{}' 的 SSH key / known_hosts path 不得包含空白或 %",
+        server.id
+    );
+    if let Some(alias) = &tcs.host_key_alias {
+        anyhow::ensure!(
+            is_safe_ssh_host(alias),
+            "server id '{}' 的 host_key_alias 为空或含非法字符",
+            server.id
+        );
+    }
     Ok(())
 }
 
@@ -1366,6 +1479,133 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("必须是绝对路径"));
+    }
+
+    const TCS_SERVER: &str = r#"[
+        {
+            "id": "tcs-seednet-1",
+            "name": "Tcscloud Seednet",
+            "provider": "tcscloud_seednet",
+            "enabled": true,
+            "address": "tcsseednet.example.com",
+            "tcscloud_seednet": {
+                "ssh_host": "tcsseednet.example.com",
+                "ssh_port": 22,
+                "ssh_user": "root",
+                "ssh_key_path": "/etc/boil/keys/tcs-seednet-1",
+                "known_hosts_path": "/etc/boil/keys/tcs-seednet-1.known_hosts"
+            }
+        }
+    ]"#;
+
+    #[test]
+    fn tcscloud_seednet_config_loads_and_round_trips() {
+        let app = app_from_servers_json(TCS_SERVER).unwrap();
+        let server = &app.servers[0];
+        assert_eq!(server.provider, ServerProvider::TcscloudSeednet);
+        assert!(server.token.is_empty());
+        let tcs = server.tcscloud_seednet.as_ref().unwrap();
+        assert_eq!(tcs.ssh_port, 22);
+        assert_eq!(tcs.host_key_alias(), "tcsseednet.example.com");
+        let serialized = serde_json::to_string(server).unwrap();
+        assert!(serialized.contains("\"provider\":\"tcscloud_seednet\""));
+        assert!(!serialized.contains("\"token\""));
+        assert!(!serialized.contains("host_key_alias"));
+        let reparsed: ServerConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(&reparsed, server);
+    }
+
+    #[test]
+    fn tcscloud_seednet_host_key_alias_overrides_host() {
+        let servers = TCS_SERVER.replace(
+            "\"ssh_port\": 22,",
+            "\"ssh_port\": 22, \"host_key_alias\": \"pinned.example.com\",",
+        );
+        let app = app_from_servers_json(&servers).unwrap();
+        let tcs = app.servers[0].tcscloud_seednet.as_ref().unwrap();
+        assert_eq!(tcs.host_key_alias(), "pinned.example.com");
+    }
+
+    #[test]
+    fn tcscloud_seednet_rejects_unsafe_or_incomplete_config() {
+        let cases = [
+            (
+                TCS_SERVER.replace(
+                    "\"enabled\": true,",
+                    "\"enabled\": true, \"token\": \"must-not-be-used\",",
+                ),
+                "不得包含 Boil token",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"/etc/boil/keys/tcs-seednet-1.known_hosts\"",
+                    "\"relative.known_hosts\"",
+                ),
+                "known_hosts path 必须是绝对路径",
+            ),
+            (
+                TCS_SERVER.replace("\"/etc/boil/keys/tcs-seednet-1\",", "\"relative-key\","),
+                "SSH key path 必须是绝对路径",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"/etc/boil/keys/tcs-seednet-1.known_hosts\"",
+                    "\"/etc/boil/keys/a b.known_hosts\"",
+                ),
+                "不得包含空白或 %",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"/etc/boil/keys/tcs-seednet-1\",",
+                    "\"/etc/boil/keys/%h\",",
+                ),
+                "不得包含空白或 %",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"ssh_host\": \"tcsseednet.example.com\"",
+                    "\"ssh_host\": \"-oProxyCommand\"",
+                ),
+                "SSH host 为空或含非法字符",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"ssh_host\": \"tcsseednet.example.com\"",
+                    "\"ssh_host\": \"host;reboot\"",
+                ),
+                "SSH host 为空或含非法字符",
+            ),
+            (
+                TCS_SERVER.replace("\"ssh_user\": \"root\"", "\"ssh_user\": \"-l\""),
+                "SSH user 为空或含非法字符",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"ssh_port\": 22,",
+                    "\"ssh_port\": 22, \"host_key_alias\": \"bad alias\",",
+                ),
+                "host_key_alias 为空或含非法字符",
+            ),
+            (
+                TCS_SERVER.replace(
+                    "\"provider\": \"tcscloud_seednet\",",
+                    "\"provider\": \"boil\", \"token\": \"boil-secret-value\",",
+                ),
+                "只有 tcscloud_seednet Provider 可以包含 tcscloud_seednet 配置",
+            ),
+        ];
+        for (servers, expected) in cases {
+            let error = app_from_servers_json(&servers).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        let missing = r#"[{
+            "id":"tcs","name":"Tcs","provider":"tcscloud_seednet","enabled":true
+        }]"#;
+        assert!(app_from_servers_json(missing)
+            .unwrap_err()
+            .to_string()
+            .contains("缺少 tcscloud_seednet 配置"));
     }
 
     #[test]

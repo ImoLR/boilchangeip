@@ -451,7 +451,7 @@ async fn run_ssh(
     String::from_utf8(output.stdout).map_err(|_| FacHostError::InvalidResponse)
 }
 
-fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+pub(crate) fn is_public_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
     !ip.is_private()
         && !ip.is_loopback()

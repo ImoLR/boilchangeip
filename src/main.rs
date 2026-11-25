@@ -10,6 +10,7 @@ mod reconnect;
 mod server_manage;
 mod service;
 mod streaming;
+mod tcscloud;
 mod timer;
 
 use clap::{Parser, Subcommand};

@@ -303,6 +303,7 @@ mod tests {
                 provider: ServerProvider::Boil,
                 token: SecretToken::from_test_value("hidden-token"),
                 fachost_seednet: None,
+                tcscloud_seednet: None,
                 pqs: None,
                 enabled: true,
                 address: None,

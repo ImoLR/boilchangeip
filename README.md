@@ -165,6 +165,38 @@ PQS 动态 IP 产品使用 `pqs` Provider。PQS Token 来自产品页“生成 A
 触发会先查询，若上次请求已经生效则不会重复提交，仍未变化才允许第二次提交。
 第二次仍未确认后停止自动重试。接口响应不明确时也不会在冷却期内重复提交。
 
+Tcscloud 动态 IP 产品使用 `tcscloud_seednet` Provider。厂商的查询/更换接口
+（`http://ipapi.tcscloud.net:8002/getip`、`/changeip`）只能在 VPS 内部访问，
+因此和 `fachost_seednet` 一样通过专用 SSH key 执行固定命令；不同的是主机密钥
+必须固定在专用 known_hosts 中（`StrictHostKeyChecking=yes`，不会 accept-new）：
+
+```json
+{
+  "id": "tcs-seednet-1",
+  "name": "Tcscloud Seednet",
+  "provider": "tcscloud_seednet",
+  "enabled": true,
+  "tcscloud_seednet": {
+    "ssh_host": "tcsseednet.example.com",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key_path": "/etc/boil/keys/tcs-seednet-1",
+    "known_hosts_path": "/etc/boil/keys/tcs-seednet-1.known_hosts"
+  }
+}
+```
+
+`known_hosts_path` 里的条目以 `host_key_alias`（可选，默认等于 `ssh_host`）为主机名，
+例如 `tcsseednet.example.com ssh-ed25519 AAAA...`。旧 IP 换掉后几分钟内会分配给别的
+客户，DNS 未更新时连到的是陌生机器，主机密钥不匹配只视为"尚未就绪"。
+
+查询 IP 时在同一个 SSH 会话里同时读取厂商 `getip` 和公网出口（ipify / icanhazip）：
+厂商返回空 `ip` 表示正在切换；两者都有时以公网出口为准。换 IP 时在 VPS 上用
+`setsid nohup` 分离启动 `changeip`（SSH 会因 IP 变化断开），等待 30 秒后每 10 秒
+查询一次，最长 5 分钟；只有查到不同的有效公网 IPv4 才判定成功，期间 SSH 失败一律
+继续等待。窗口结束时若 VPS 可达且仍是旧 IP，最多再换一次；VPS 不可达时报告
+"未确认"，不会重复换 IP。确认窗口内不占用全局换 IP 锁，其他服务器不受影响。
+
 程序按以下顺序查找配置：
 
 1. `/etc/boil/config.env`

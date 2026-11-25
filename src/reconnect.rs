@@ -15,6 +15,7 @@ use crate::{
     fachost::FacHostReconnectPolicy,
     pqs::PqsError,
     provider::ProviderClients,
+    tcscloud::{TcscloudReconnectOutcome, TcscloudReconnectPolicy},
 };
 
 static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -392,6 +393,66 @@ where
             result.provider_dial_count = outcome.provider_dial_count;
             result
         }
+        ServerProvider::TcscloudSeednet => {
+            if !server.enabled {
+                return base_result(
+                    server,
+                    ReconnectStatus::Disabled,
+                    Some("server is disabled"),
+                );
+            }
+            let config = match server.tcscloud_seednet.as_ref() {
+                Some(config) => config,
+                None => {
+                    return base_result(
+                        server,
+                        ReconnectStatus::InvalidResponse,
+                        Some("缺少 tcscloud_seednet Provider 配置"),
+                    )
+                }
+            };
+            let old_ip = match current_ip {
+                Some(ip) => ip,
+                None => match clients.get_ip(server).await {
+                    Ok(ip) => ip,
+                    Err(error) => {
+                        return base_result(
+                            server,
+                            ReconnectStatus::PreflightFailed,
+                            Some(&error.to_string()),
+                        )
+                    }
+                },
+            };
+
+            let lock = server_lock(&server.id);
+            let _server_guard = lock.lock().await;
+            on_progress(ReconnectProgress::VerifyingNewIp { old_ip }).await;
+            // CHANGE_IP_LOCK is held only while the change is started, not for the 5-minute
+            // confirmation window, so other servers are not blocked.
+            let outcome = clients
+                .tcscloud_seednet()
+                .reconnect(
+                    config,
+                    &server.id,
+                    &server.name,
+                    old_ip,
+                    &TcscloudReconnectPolicy::default(),
+                    &CHANGE_IP_LOCK,
+                )
+                .await;
+            let mut result = base_result(
+                server,
+                tcscloud_reconnect_status(&outcome),
+                Some(&outcome.message),
+            );
+            result.old_ip = Some(outcome.old_ip);
+            result.new_ip = outcome.new_ip;
+            result.changed = outcome.changed;
+            result.poll_attempts = outcome.poll_attempts;
+            result.dial_attempts = outcome.dial_attempts;
+            result
+        }
         ServerProvider::Pqs => {
             reconnect_pqs_one_with_current_ip_progress_cooldown_notify(
                 clients,
@@ -611,6 +672,16 @@ where
         );
     }
     result
+}
+
+fn tcscloud_reconnect_status(outcome: &TcscloudReconnectOutcome) -> ReconnectStatus {
+    if outcome.changed {
+        ReconnectStatus::Success
+    } else if outcome.change_requested && !outcome.ip_unchanged {
+        ReconnectStatus::ChangeAcceptedButUnconfirmed
+    } else {
+        ReconnectStatus::ProviderFailed
+    }
 }
 
 fn fachost_reconnect_status(changed: bool, provider_confirmed_success: bool) -> ReconnectStatus {
@@ -1464,6 +1535,7 @@ mod tests {
             provider: ServerProvider::Boil,
             token: SecretToken::from_test_value(&test_credential()),
             fachost_seednet: None,
+            tcscloud_seednet: None,
             pqs: None,
             enabled,
             address: None,
@@ -1481,6 +1553,7 @@ mod tests {
             provider: ServerProvider::Pqs,
             token: SecretToken::default(),
             fachost_seednet: None,
+            tcscloud_seednet: None,
             pqs: Some(PqsConfig {
                 token: SecretToken::from_test_value("pqs-hidden-token"),
                 last_changeip_at: None,
@@ -2395,5 +2468,73 @@ mod tests {
             fachost_reconnect_status(true, false),
             ReconnectStatus::Success
         );
+    }
+
+    fn tcscloud_outcome(
+        changed: bool,
+        change_requested: bool,
+        ip_unchanged: bool,
+    ) -> crate::tcscloud::TcscloudReconnectOutcome {
+        crate::tcscloud::TcscloudReconnectOutcome {
+            old_ip: "175.182.177.190".parse().unwrap(),
+            new_ip: None,
+            changed,
+            change_requested,
+            ip_unchanged,
+            dial_attempts: 1,
+            poll_attempts: 1,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn tcscloud_status_distinguishes_unconfirmed_from_failed() {
+        assert_eq!(
+            tcscloud_reconnect_status(&tcscloud_outcome(true, true, false)),
+            ReconnectStatus::Success
+        );
+        assert_eq!(
+            tcscloud_reconnect_status(&tcscloud_outcome(false, true, false)),
+            ReconnectStatus::ChangeAcceptedButUnconfirmed
+        );
+        assert_eq!(
+            tcscloud_reconnect_status(&tcscloud_outcome(false, true, true)),
+            ReconnectStatus::ProviderFailed
+        );
+        assert_eq!(
+            tcscloud_reconnect_status(&tcscloud_outcome(false, false, false)),
+            ReconnectStatus::ProviderFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn tcscloud_disabled_or_unconfigured_server_never_reaches_ssh() {
+        let clients = ProviderClients::new().unwrap();
+        let mut server = server("tcs-seednet-1", true);
+        server.name = "Tcscloud Seednet".to_string();
+        server.token = SecretToken::default();
+        server.provider = ServerProvider::TcscloudSeednet;
+        server.enabled = false;
+        let result = reconnect_provider_one_with_current_ip_and_progress(
+            &clients,
+            &server,
+            &ReconnectPolicy::default(),
+            Some("175.182.177.190".parse().unwrap()),
+            |_| async {},
+        )
+        .await;
+        assert_eq!(result.status, ReconnectStatus::Disabled);
+
+        server.enabled = true;
+        let result = reconnect_provider_one_with_current_ip_and_progress(
+            &clients,
+            &server,
+            &ReconnectPolicy::default(),
+            Some("175.182.177.190".parse().unwrap()),
+            |_| async {},
+        )
+        .await;
+        assert_eq!(result.status, ReconnectStatus::InvalidResponse);
+        assert_eq!(result.dial_attempts, 0);
     }
 }

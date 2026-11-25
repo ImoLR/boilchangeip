@@ -5,12 +5,14 @@ use crate::{
     config::{ServerConfig, ServerProvider},
     fachost::{FacHostError, FacHostSeednetClient},
     pqs::{PqsClient, PqsError},
+    tcscloud::{TcscloudError, TcscloudSeednetClient},
 };
 
 pub struct ProviderClients {
     boil: BoilClient,
     fachost_seednet: FacHostSeednetClient,
     pqs: PqsClient,
+    tcscloud_seednet: TcscloudSeednetClient,
 }
 
 #[derive(Debug)]
@@ -18,6 +20,7 @@ pub enum ProviderError {
     Boil(crate::boil::BoilApiError),
     FacHost(FacHostError),
     Pqs(PqsError),
+    Tcscloud(TcscloudError),
     InvalidConfiguration(&'static str),
 }
 
@@ -27,6 +30,7 @@ impl std::fmt::Display for ProviderError {
             Self::Boil(error) => error.fmt(f),
             Self::FacHost(error) => error.fmt(f),
             Self::Pqs(error) => error.fmt(f),
+            Self::Tcscloud(error) => error.fmt(f),
             Self::InvalidConfiguration(message) => f.write_str(message),
         }
     }
@@ -40,6 +44,7 @@ impl ProviderClients {
             boil: BoilClient::new()?,
             fachost_seednet: FacHostSeednetClient,
             pqs: PqsClient::new()?,
+            tcscloud_seednet: TcscloudSeednetClient,
         })
     }
 
@@ -73,6 +78,19 @@ impl ProviderClients {
                     ))?;
                 self.pqs.get_ip(config).await.map_err(ProviderError::Pqs)
             }
+            ServerProvider::TcscloudSeednet => {
+                let config =
+                    server
+                        .tcscloud_seednet
+                        .as_ref()
+                        .ok_or(ProviderError::InvalidConfiguration(
+                            "缺少 tcscloud_seednet Provider 配置",
+                        ))?;
+                self.tcscloud_seednet
+                    .get_ip(config)
+                    .await
+                    .map_err(ProviderError::Tcscloud)
+            }
         }
     }
 
@@ -88,12 +106,17 @@ impl ProviderClients {
         &self.pqs
     }
 
+    pub(crate) fn tcscloud_seednet(&self) -> &TcscloudSeednetClient {
+        &self.tcscloud_seednet
+    }
+
     #[cfg(test)]
     pub(crate) fn with_pqs_api_base_url(api_base_url: &str) -> anyhow::Result<Self> {
         Ok(Self {
             boil: BoilClient::new()?,
             fachost_seednet: FacHostSeednetClient,
             pqs: PqsClient::with_api_base_url(api_base_url)?,
+            tcscloud_seednet: TcscloudSeednetClient,
         })
     }
 }

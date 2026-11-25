@@ -105,6 +105,22 @@ pub struct FacHostSeednetConfig {
     pub ssh_port: u16,
     pub ssh_user: String,
     pub ssh_key_path: PathBuf,
+    /// Optional dedicated known_hosts file with the pinned host key. When set, SSH uses strict
+    /// checking (a mismatch = "not ready yet"); when unset the legacy accept-new behaviour stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts_path: Option<PathBuf>,
+    /// Name the pinned key is stored under; defaults to `ssh_host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_alias: Option<String>,
+}
+
+impl FacHostSeednetConfig {
+    pub fn host_key_alias(&self) -> &str {
+        self.host_key_alias
+            .as_deref()
+            .filter(|alias| !alias.trim().is_empty())
+            .unwrap_or(&self.ssh_host)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -651,6 +667,32 @@ fn validate_servers(servers: &[ServerConfig]) -> anyhow::Result<()> {
                     "server id '{}' 的 SSH key path 必须是绝对路径",
                     server.id
                 );
+                if let Some(known_hosts_path) = &fachost.known_hosts_path {
+                    anyhow::ensure!(
+                        known_hosts_path.is_absolute(),
+                        "server id '{}' 的 known_hosts path 必须是绝对路径",
+                        server.id
+                    );
+                    // ssh splits UserKnownHostsFile on whitespace and expands `%` tokens.
+                    anyhow::ensure!(
+                        [&fachost.ssh_key_path, known_hosts_path]
+                            .iter()
+                            .all(|path| {
+                                path.to_str().is_some_and(|value| {
+                                    !value.contains(char::is_whitespace) && !value.contains('%')
+                                })
+                            }),
+                        "server id '{}' 的 SSH key / known_hosts path 不得包含空白或 %",
+                        server.id
+                    );
+                }
+                if let Some(alias) = &fachost.host_key_alias {
+                    anyhow::ensure!(
+                        is_safe_ssh_host(alias),
+                        "server id '{}' 的 host_key_alias 为空或含非法字符",
+                        server.id
+                    );
+                }
                 anyhow::ensure!(
                     server.pqs.is_none(),
                     "server id '{}' 的 fachost_seednet 配置不得包含 pqs 配置",
@@ -1455,8 +1497,56 @@ mod tests {
                 .map(|config| config.ssh_port),
             Some(22)
         );
+        assert_eq!(
+            server
+                .fachost_seednet
+                .as_ref()
+                .and_then(|config| config.known_hosts_path.clone()),
+            None
+        );
         let serialized = serde_json::to_string(server).unwrap();
         assert!(!serialized.contains("\"token\""));
+        assert!(!serialized.contains("known_hosts_path"));
+    }
+
+    #[test]
+    fn fachost_seednet_pinned_host_key_config_loads_and_validates() {
+        let servers = r#"[{
+            "id":"seednet-vds-1","name":"Seednet","provider":"fachost_seednet","enabled":true,
+            "fachost_seednet":{"ssh_host":"facseednet.example.com","ssh_port":22,"ssh_user":"root",
+                "ssh_key_path":"/etc/boil/keys/seednet-vds-1",
+                "known_hosts_path":"/etc/boil/keys/seednet-vds-1.known_hosts"}
+        }]"#;
+        let app = app_from_servers_json(servers).unwrap();
+        let fachost = app.servers[0].fachost_seednet.as_ref().unwrap();
+        assert_eq!(
+            fachost.known_hosts_path.as_deref(),
+            Some(std::path::Path::new(
+                "/etc/boil/keys/seednet-vds-1.known_hosts"
+            ))
+        );
+        assert_eq!(fachost.host_key_alias(), "facseednet.example.com");
+        let serialized = serde_json::to_string(&app.servers[0]).unwrap();
+        assert!(serialized.contains("seednet-vds-1.known_hosts"));
+
+        for (bad, expected) in [
+            (
+                r#""known_hosts_path":"relative.known_hosts""#,
+                "known_hosts path 必须是绝对路径",
+            ),
+            (
+                r#""known_hosts_path":"/etc/boil/a b.known_hosts""#,
+                "不得包含空白或 %",
+            ),
+            (r#""host_key_alias":"-oProxyCommand""#, "host_key_alias"),
+        ] {
+            let json = format!(
+                r#"[{{"id":"seednet","name":"Seednet","provider":"fachost_seednet","enabled":true,
+                "fachost_seednet":{{"ssh_host":"host","ssh_port":22,"ssh_user":"root","ssh_key_path":"/key",{bad}}}}}]"#
+            );
+            let error = app_from_servers_json(&json).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

@@ -134,13 +134,27 @@ Seednet PPPoE 服务器可使用 `fachost_seednet` Provider；它不保存 Boil 
     "ssh_host": "seednet.example.com",
     "ssh_port": 22,
     "ssh_user": "root",
-    "ssh_key_path": "/etc/boil/keys/seednet-vds-1"
+    "ssh_key_path": "/etc/boil/keys/seednet-vds-1",
+    "known_hosts_path": "/etc/boil/keys/seednet-vds-1.known_hosts"
   }
 }
 ```
 
-`fachost_seednet` 每次 reconnect 最多拨号两轮；每轮最多确认 120 秒，最终只以
-公网 IPv4 是否变化为成功依据。两轮失败后停止，不进入通用 Timer Retry。
+`fachost_seednet` 每次 reconnect 最多拨号两轮，只以公网 IPv4 是否变化为成功依据：
+
+- 第 1 轮：发一次 `/re-pppoe`，之后每 10 秒查询一次，最长 5 分钟。
+- 窗口结束时 VPS 可达且仍是旧 IP（确实没换）：后台等 25 分钟，先再查一次；
+  已变化 = 成功，仍是旧 IP 才发第 2 次重拨（同样 5 分钟确认），查不到则不重拨。
+- 窗口内一直查不到（DDNS / 解析缓存未更新，结果未知）：不重拨，后台 25 分钟后
+  再查一次并报告最终结果。
+- 首条结果为「待确认」并注明结果另行通知；后台跟进完成后再发一条结果（定时任务发到
+  通知频道，Telegram 手动换 IP 发回原聊天，CLI 前台等待）。等待期间不占用全局换 IP
+  锁，也不阻塞定时任务处理下一台服务器；daemon 重启会丢弃尚未执行的跟进。
+
+`known_hosts_path`（可选，建议配置）是固定主机密钥的专用 known_hosts，格式同
+`tcscloud_seednet`（`<ssh_host 或 host_key_alias> ssh-ed25519 AAAA...`）。配置后使用
+`StrictHostKeyChecking=yes`、`HostKeyAlias` 并忽略 ssh_config；换 IP 后域名还指向
+已分给别人的旧 IP 时会拒绝连接，只视为「尚未就绪」。不配置则保持 `accept-new`。
 主控机需要 OpenSSH client，目标 VPS 需要 `curl`；私钥权限必须为 `0600`。
 
 PQS 动态 IP 产品使用 `pqs` Provider。PQS Token 来自产品页“生成 API”后显示的

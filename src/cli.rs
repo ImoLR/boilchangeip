@@ -5,8 +5,8 @@ use crate::{
     core::{check_ip_quality, check_reachable},
     provider::ProviderClients,
     reconnect::{
-        reconnect_provider_selected, BatchReconnectResult, ReconnectPolicy, ReconnectResult,
-        ReconnectStatus,
+        reconnect_provider_selected, run_provider_follow_up, BatchReconnectResult, ReconnectPolicy,
+        ReconnectResult, ReconnectStatus,
     },
 };
 
@@ -103,6 +103,22 @@ pub async fn cmd_change(config: &AppConfig, server: Option<&str>, all: bool) -> 
             .map_err(with_server_hint(config))?;
 
     print_batch_result(&batch);
+    for result in batch.results {
+        let Some(follow_up) = result.follow_up else {
+            continue;
+        };
+        let Some(server) = config.servers.iter().find(|s| s.id == result.server_id) else {
+            continue;
+        };
+        println!(
+            "{} ({}) 等待后续确认（按设定等待后再查询 / 重拨）...\n",
+            server.name, server.id
+        );
+        if let Some(final_result) = run_provider_follow_up(server, follow_up).await {
+            println!("后续确认结果:\n");
+            print_reconnect_result(&final_result);
+        }
+    }
     Ok(())
 }
 

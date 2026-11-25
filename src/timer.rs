@@ -16,8 +16,9 @@ use crate::{
     },
     provider::ProviderClients,
     reconnect::{
-        reconnect_provider_one_with_current_ip_progress_cooldown_notify, BatchReconnectResult,
-        ChangeIpCooldownMode, ReconnectPolicy, ReconnectProgress, ReconnectStatus,
+        reconnect_provider_one_with_current_ip_progress_cooldown_notify, spawn_provider_follow_up,
+        BatchReconnectResult, ChangeIpCooldownMode, ReconnectPolicy, ReconnectProgress,
+        ReconnectResult, ReconnectStatus,
     },
 };
 
@@ -398,6 +399,7 @@ async fn run_auto_change_locked(config: &AppConfig, server_id: &str) {
     );
 
     let message = format_timer_result(&result);
+    schedule_timer_follow_up(config, selected, result);
     tg_notify(config, &message).await;
 }
 
@@ -463,6 +465,10 @@ async fn run_auto_change_all_locked(config: &AppConfig) {
             },
         )
         .await;
+        let mut result = result;
+        if let Some(follow_up) = result.follow_up.take() {
+            spawn_timer_follow_up(config, server, follow_up);
+        }
         batch.results.push(result);
     }
 
@@ -595,6 +601,7 @@ async fn run_timer_preflight_retry(
         } else {
             tg_notify(&config, &format_timer_result(&result)).await;
         }
+        schedule_timer_follow_up(&config, &server, result);
         return;
     }
 }
@@ -729,6 +736,7 @@ fn timer_preflight_failed_result(
         poll_attempts: 0,
         dial_attempts: 0,
         provider_dial_count: None,
+        follow_up: None,
     }
 }
 
@@ -858,6 +866,35 @@ where
 {
     let _guard = TIMER_RUN_LOCK.lock().await;
     future.await
+}
+
+/// FACHost late check / second redial: runs in the background (the timer loop and the global
+/// change lock are not held) and reports its result as a separate message.
+fn schedule_timer_follow_up(
+    config: &AppConfig,
+    server: &ServerConfig,
+    mut result: ReconnectResult,
+) {
+    if let Some(follow_up) = result.follow_up.take() {
+        spawn_timer_follow_up(config, server, follow_up);
+    }
+}
+
+fn spawn_timer_follow_up(
+    config: &AppConfig,
+    server: &ServerConfig,
+    follow_up: crate::reconnect::ProviderFollowUp,
+) {
+    let notify_config = config.clone();
+    spawn_provider_follow_up(server.clone(), follow_up, move |result| async move {
+        tg_notify(&notify_config, &format_timer_follow_up_result(&result)).await;
+    });
+}
+
+fn format_timer_follow_up_result(result: &ReconnectResult) -> String {
+    let mut lines = vec!["⏰ 定时换 IP 结果更新".to_string(), String::new()];
+    append_timer_result_lines(&mut lines, result);
+    lines.join("\n")
 }
 
 fn format_timer_result(result: &crate::reconnect::ReconnectResult) -> String {
@@ -1066,7 +1103,27 @@ mod tests {
             poll_attempts: 3,
             dial_attempts: 0,
             provider_dial_count: None,
+            follow_up: None,
         }
+    }
+
+    #[test]
+    fn follow_up_result_is_a_separate_update_message() {
+        let mut result = reconnect_result("Seednet", ReconnectStatus::Success);
+        result.dial_attempts = 2;
+        let text = format_timer_follow_up_result(&result);
+        assert!(text.starts_with("⏰ 定时换 IP 结果更新"));
+        assert!(text.contains("✅ 换 IP 成功"));
+        assert!(text.contains("旧 IP：42.1.1.1"));
+        assert!(text.contains("新 IP：42.1.1.2"));
+        assert!(text.contains("本次拨号尝试：2 次"));
+
+        let mut failed = reconnect_result("Seednet", ReconnectStatus::ProviderFailed);
+        failed.dial_attempts = 2;
+        failed.message = Some("已换 IP 2 次，公网 IP 仍未变化，已停止自动重试".to_string());
+        let text = format_timer_follow_up_result(&failed);
+        assert!(text.contains("❌ 换 IP 失败"));
+        assert!(text.contains("原因：已换 IP 2 次，公网 IP 仍未变化"));
     }
 
     #[test]

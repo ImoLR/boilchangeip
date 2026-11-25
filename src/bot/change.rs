@@ -11,8 +11,8 @@ use crate::{
     core::check_ip_quality,
     provider::ProviderClients,
     reconnect::{
-        reconnect_provider_one_with_current_ip_and_progress, ReconnectPolicy, ReconnectProgress,
-        ReconnectResult, ReconnectStatus,
+        reconnect_provider_one_with_current_ip_and_progress, spawn_provider_follow_up,
+        ReconnectPolicy, ReconnectProgress, ReconnectResult, ReconnectStatus,
     },
 };
 
@@ -299,6 +299,23 @@ pub(super) async fn confirm_and_change(
     )
     .await;
     send_reconnect_result(bot, chat_id, &result, ui_sessions).await;
+    let mut result = result;
+    if let Some(follow_up) = result.follow_up.take() {
+        // FACHost late check / second redial: background, reported as a separate message.
+        let follow_up_bot = bot.clone();
+        spawn_provider_follow_up(server.clone(), follow_up, move |result| async move {
+            let _ = follow_up_bot
+                .send_message(
+                    chat_id,
+                    format!(
+                        "🔔 换 IP 结果更新\n\n{}",
+                        format_dial_reconnect_result(&result)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await;
+        });
+    }
 }
 
 pub(super) async fn resolve_for_tg<'a>(
@@ -435,7 +452,11 @@ fn format_dial_reconnect_result(result: &ReconnectResult) -> String {
     }
     if result.status == ReconnectStatus::ChangeAcceptedButUnconfirmed {
         lines.push(String::new());
-        lines.push("请稍后查看状态".to_string());
+        match (&result.follow_up, &result.message) {
+            // A follow-up is pending: say when the result will come.
+            (Some(_), Some(message)) => lines.push(html_escape(message)),
+            _ => lines.push("请稍后查看状态".to_string()),
+        }
     } else if result.status == ReconnectStatus::ProviderFailed {
         lines.push(String::new());
         lines.push("⚠️ 已停止自动重试，请管理员处理".to_string());
@@ -477,6 +498,7 @@ mod tests {
             poll_attempts: 24,
             dial_attempts: 1,
             provider_dial_count: Some(7),
+            follow_up: None,
         }
     }
 
@@ -499,5 +521,32 @@ mod tests {
         assert!(text.contains("请稍后查看状态"));
         assert!(!text.contains("换 IP 失败"));
         assert!(!text.contains("已停止自动重试"));
+    }
+
+    #[test]
+    fn fachost_pending_follow_up_says_when_the_result_comes() {
+        let mut result = fachost_result(ReconnectStatus::ChangeAcceptedButUnconfirmed);
+        result.message = Some(
+            "第 1 次换 IP 后 5 分钟公网 IP 仍未变化，25 分钟后自动再换一次，结果另行通知"
+                .to_string(),
+        );
+        result.follow_up = Some(crate::reconnect::ProviderFollowUp::for_test(
+            crate::fachost::FacHostReconnectOutcome {
+                old_ip: "8.8.8.8".parse().unwrap(),
+                new_ip: None,
+                changed: false,
+                provider_confirmed_success: false,
+                change_requested: true,
+                ip_unchanged: true,
+                dial_attempts: 1,
+                poll_attempts: 30,
+                provider_dial_count: None,
+                follow_up: Some(crate::fachost::FacHostFollowUpKind::Redial),
+                message: String::new(),
+            },
+        ));
+        let text = format_dial_reconnect_result(&result);
+        assert!(text.contains("25 分钟后自动再换一次，结果另行通知"));
+        assert!(!text.contains("请稍后查看状态"));
     }
 }

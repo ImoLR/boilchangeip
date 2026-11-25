@@ -12,7 +12,7 @@ use crate::{
         AppConfig, ChangeIpCooldownConfig, ResolvedSelection, ServerConfig, ServerProvider,
         ServerSelection,
     },
-    fachost::FacHostReconnectPolicy,
+    fachost::{FacHostReconnectOutcome, FacHostReconnectPolicy, FacHostSeednetClient},
     pqs::PqsError,
     provider::ProviderClients,
     tcscloud::{TcscloudReconnectOutcome, TcscloudReconnectPolicy},
@@ -23,6 +23,10 @@ static SERVER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>
 static CHANGE_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CHANGE_IP_COOLDOWN: OnceLock<Mutex<ChangeIpCooldownState>> = OnceLock::new();
 static PQS_RECONNECT_STATES: OnceLock<Mutex<HashMap<String, PqsReconnectEntry>>> = OnceLock::new();
+/// Latest FACHost reconnect generation per server; an older pending follow-up is superseded.
+static FACHOST_GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static FACHOST_GENERATION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 const SUCCESS_MESSAGE: &str = "换 IP 已完成";
 const UNCONFIRMED_MESSAGE: &str =
@@ -106,6 +110,25 @@ pub struct ReconnectResult {
     pub poll_attempts: usize,
     pub dial_attempts: usize,
     pub provider_dial_count: Option<u32>,
+    /// Background follow-up the caller must run (FACHost late check / second redial). The
+    /// immediate result is "unconfirmed" and the follow-up result is reported separately.
+    pub follow_up: Option<ProviderFollowUp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderFollowUp {
+    outcome: FacHostReconnectOutcome,
+    generation: u64,
+}
+
+#[cfg(test)]
+impl ProviderFollowUp {
+    pub(crate) fn for_test(outcome: FacHostReconnectOutcome) -> Self {
+        Self {
+            outcome,
+            generation: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,8 +388,11 @@ where
 
             let lock = server_lock(&server.id);
             let _server_guard = lock.lock().await;
+            // Any new change supersedes a still-pending follow-up of this server.
+            let generation = next_fachost_generation(&server.id);
             on_progress(ReconnectProgress::VerifyingNewIp { old_ip }).await;
-            let _change_guard = CHANGE_IP_LOCK.lock().await;
+            // CHANGE_IP_LOCK is held only while /re-pppoe is sent, not for the confirmation
+            // window; a late check / second redial runs later as a background follow-up.
             let outcome = clients
                 .fachost_seednet()
                 .reconnect(
@@ -375,22 +401,19 @@ where
                     &server.name,
                     old_ip,
                     &FacHostReconnectPolicy::default(),
+                    &CHANGE_IP_LOCK,
                     |old_ip, new_ip| {
                         on_progress(ReconnectProgress::ProviderConfirmedRedial { old_ip, new_ip })
                     },
                 )
                 .await;
-            let mut result = base_result(
-                server,
-                fachost_reconnect_status(outcome.changed, outcome.provider_confirmed_success),
-                Some(&outcome.message),
-            );
-            result.old_ip = Some(outcome.old_ip);
-            result.new_ip = outcome.new_ip;
-            result.changed = outcome.changed;
-            result.poll_attempts = outcome.poll_attempts;
-            result.dial_attempts = outcome.dial_attempts;
-            result.provider_dial_count = outcome.provider_dial_count;
+            let mut result = fachost_result(server, &outcome);
+            if outcome.follow_up.is_some() {
+                result.follow_up = Some(ProviderFollowUp {
+                    outcome,
+                    generation,
+                });
+            }
             result
         }
         ServerProvider::TcscloudSeednet => {
@@ -684,14 +707,101 @@ fn tcscloud_reconnect_status(outcome: &TcscloudReconnectOutcome) -> ReconnectSta
     }
 }
 
-fn fachost_reconnect_status(changed: bool, provider_confirmed_success: bool) -> ReconnectStatus {
-    if changed {
+fn fachost_reconnect_status(outcome: &FacHostReconnectOutcome) -> ReconnectStatus {
+    if outcome.changed {
         ReconnectStatus::Success
-    } else if provider_confirmed_success {
+    } else if outcome.follow_up.is_some() {
+        ReconnectStatus::ChangeAcceptedButUnconfirmed
+    } else if outcome.ip_unchanged {
+        ReconnectStatus::ProviderFailed
+    } else if outcome.change_requested || outcome.provider_confirmed_success {
         ReconnectStatus::ChangeAcceptedButUnconfirmed
     } else {
         ReconnectStatus::ProviderFailed
     }
+}
+
+fn fachost_result(server: &ServerConfig, outcome: &FacHostReconnectOutcome) -> ReconnectResult {
+    let mut result = base_result(
+        server,
+        fachost_reconnect_status(outcome),
+        Some(&outcome.message),
+    );
+    result.old_ip = Some(outcome.old_ip);
+    result.new_ip = outcome.new_ip;
+    result.changed = outcome.changed;
+    result.poll_attempts = outcome.poll_attempts;
+    result.dial_attempts = outcome.dial_attempts;
+    result.provider_dial_count = outcome.provider_dial_count;
+    result
+}
+
+fn fachost_generations() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+    FACHOST_GENERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn next_fachost_generation(server_id: &str) -> u64 {
+    let generation =
+        FACHOST_GENERATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    fachost_generations().insert(server_id.to_string(), generation);
+    generation
+}
+
+fn fachost_generation_is_current(server_id: &str, generation: u64) -> bool {
+    fachost_generations().get(server_id) == Some(&generation)
+}
+
+/// Runs a pending follow-up to completion (waits first). `None` = superseded by a newer change of
+/// the same server, or the server is no longer a FACHost server; nothing to report then.
+pub async fn run_provider_follow_up(
+    server: &ServerConfig,
+    follow_up: ProviderFollowUp,
+) -> Option<ReconnectResult> {
+    let config = server.fachost_seednet.as_ref()?;
+    let server_id = server.id.clone();
+    let generation = follow_up.generation;
+    let lock = server_lock(&server.id);
+    let outcome = FacHostSeednetClient
+        .follow_up(
+            config,
+            &server.id,
+            &server.name,
+            follow_up.outcome,
+            &FacHostReconnectPolicy::default(),
+            &CHANGE_IP_LOCK,
+            &lock,
+            || fachost_generation_is_current(&server_id, generation),
+        )
+        .await?;
+    let result = fachost_result(server, &outcome);
+    log::warn!(
+        "FACHost follow-up finished: server_id={} status={:?} changed={} dial_attempts={} new_ip={:?}",
+        server.id,
+        result.status,
+        result.changed,
+        result.dial_attempts,
+        result.new_ip,
+    );
+    Some(result)
+}
+
+/// Spawns `run_provider_follow_up` in the background and hands its result to `notify`.
+pub fn spawn_provider_follow_up<N, NFut>(
+    server: ServerConfig,
+    follow_up: ProviderFollowUp,
+    notify: N,
+) where
+    N: FnOnce(ReconnectResult) -> NFut + Send + 'static,
+    NFut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Some(result) = run_provider_follow_up(&server, follow_up).await {
+            notify(result).await;
+        }
+    });
 }
 
 pub async fn reconnect_provider_selected(
@@ -1132,6 +1242,7 @@ fn base_result(
         poll_attempts: 0,
         dial_attempts: 0,
         provider_dial_count: None,
+        follow_up: None,
     }
 }
 
@@ -2456,18 +2567,65 @@ mod tests {
 
     #[test]
     fn fachost_provider_confirmation_is_unconfirmed_instead_of_failed() {
+        let base = FacHostReconnectOutcome {
+            old_ip: "8.8.8.8".parse().unwrap(),
+            new_ip: None,
+            changed: false,
+            provider_confirmed_success: false,
+            change_requested: true,
+            ip_unchanged: false,
+            dial_attempts: 1,
+            poll_attempts: 30,
+            provider_dial_count: None,
+            follow_up: None,
+            message: String::new(),
+        };
+        let status = |patch: fn(&mut FacHostReconnectOutcome)| {
+            let mut outcome = base.clone();
+            patch(&mut outcome);
+            fachost_reconnect_status(&outcome)
+        };
         assert_eq!(
-            fachost_reconnect_status(false, true),
+            status(|o| o.provider_confirmed_success = true),
             ReconnectStatus::ChangeAcceptedButUnconfirmed
         );
+        // Redial sent, outcome unknown (never reachable) = unconfirmed, not failed.
         assert_eq!(
-            fachost_reconnect_status(false, false),
+            status(|_| {}),
+            ReconnectStatus::ChangeAcceptedButUnconfirmed
+        );
+        // Pending follow-up (late check or second redial) = unconfirmed for now.
+        assert_eq!(
+            status(|o| {
+                o.ip_unchanged = true;
+                o.follow_up = Some(crate::fachost::FacHostFollowUpKind::Redial);
+            }),
+            ReconnectStatus::ChangeAcceptedButUnconfirmed
+        );
+        // Confirmed still on the old IP after all rounds = failed.
+        assert_eq!(
+            status(|o| {
+                o.ip_unchanged = true;
+                o.dial_attempts = 2;
+            }),
             ReconnectStatus::ProviderFailed
         );
+        // Redial could not be started = failed.
         assert_eq!(
-            fachost_reconnect_status(true, false),
-            ReconnectStatus::Success
+            status(|o| o.change_requested = false),
+            ReconnectStatus::ProviderFailed
         );
+        assert_eq!(status(|o| o.changed = true), ReconnectStatus::Success);
+    }
+
+    #[test]
+    fn newer_fachost_change_supersedes_pending_follow_up() {
+        let first = next_fachost_generation("fachost-gen-test");
+        assert!(fachost_generation_is_current("fachost-gen-test", first));
+        let second = next_fachost_generation("fachost-gen-test");
+        assert!(!fachost_generation_is_current("fachost-gen-test", first));
+        assert!(fachost_generation_is_current("fachost-gen-test", second));
+        assert!(!fachost_generation_is_current("other-server", second));
     }
 
     fn tcscloud_outcome(

@@ -245,6 +245,8 @@ mod tests {
             ssh_port: 22,
             ssh_user: "root".to_string(),
             ssh_key_path: PathBuf::from("/etc/boil/keys/seednet-vds-1"),
+            known_hosts_path: None,
+            host_key_alias: None,
         });
         server.country = Some("中国台湾".to_string());
         server.flag = Some("🇹🇼".to_string());
